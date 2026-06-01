@@ -1,0 +1,66 @@
+/**
+ * @file    callouts.h
+ * @brief   Voice-callout ids, embedded-clip manifest, and AGL->id mapping.
+ *
+ * @details The spoken clips are raw 16 kHz mono s16le PCM embedded into flash
+ *          via EMBED_FILES (see main/CMakeLists.txt). Because the clip set is
+ *          GLOBBED, some clips may be absent at build time; the manifest reports
+ *          {NULL,0} for those so the audio engine skips them gracefully.
+ *
+ *          A separate "calibration error" chirp is emitted at boot when no
+ *          ground reference could be established.
+ */
+#ifndef LIDARAGL_CALLOUTS_H
+#define LIDARAGL_CALLOUTS_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+/**
+ * @brief Callout clip identifiers.
+ *
+ * @note Ordered low-to-high altitude. The SF30/C never requests the 300/400/500
+ *       ids (they're not in its profile); the SF30/D requests all of them.
+ */
+typedef enum {
+    CO_TEN = 0,
+    CO_TWENTY,
+    CO_THIRTY,
+    CO_FORTY,
+    CO_FIFTY,
+    CO_ONE_HUNDRED,
+    CO_TWO_HUNDRED,
+    CO_THREE_HUNDRED,
+    CO_FOUR_HUNDRED,
+    CO_FIVE_HUNDRED,
+    CO_COUNT
+} callout_id_t;
+
+/** A resolved embedded clip. pcm == NULL / len_bytes == 0 means "not present". */
+typedef struct {
+    const uint8_t *pcm;        /**< Pointer to embedded raw s16le PCM, or NULL.  */
+    size_t         len_bytes;  /**< Length in bytes (0 if absent).               */
+    const char    *name;       /**< Human/log label, e.g. "fifty".               */
+} clip_t;
+
+/**
+ * @brief Resolve a callout id to its embedded clip.
+ * @param id  Callout id.
+ * @return    Pointer to a (possibly absent) clip descriptor; never NULL itself.
+ */
+const clip_t *callout_clip(callout_id_t id);
+
+/**
+ * @brief The calibration-error chirp clip (also embedded; may be absent).
+ * @return Pointer to the chirp descriptor; never NULL itself.
+ */
+const clip_t *callout_chirp(void);
+
+/**
+ * @brief Map a callout HEIGHT in feet to its clip id.
+ * @param ft  Callout height (10,20,30,40,50,100,200,300,400,500).
+ * @return    The matching id, or CO_COUNT if no clip corresponds.
+ */
+callout_id_t callout_id_for_ft(float ft);
+
+#endif /* LIDARAGL_CALLOUTS_H */

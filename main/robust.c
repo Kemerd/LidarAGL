@@ -68,29 +68,13 @@ static bool is_hard_junk(float v)
     return false;
 }
 
-float robust_estimate(const float *vals, size_t n, float current, bool *ok)
+/* ---------------------------------------------------------------------------
+ *  Core: run the hard-junk + MAD pipeline over 'surv[0..m)' and return the
+ *  inlier mean. Caller has already done the hard-junk pass into 'surv'. Returns
+ *  false via *ok when m == 0.
+ * ------------------------------------------------------------------------- */
+static float inlier_mean(const float *surv, size_t m, bool *ok)
 {
-    /* Defensive clamp so a caller passing more than we budgeted can't overflow
-     * the fixed scratch — we simply consider only the first ROBUST_MAX_VALS-1. */
-    if (n > BOOT_BUFFER_N) {
-        n = BOOT_BUFFER_N;
-    }
-
-    float surv[ROBUST_MAX_VALS];        /* survivors of the hard-junk pass      */
-    size_t m = 0;
-
-    /* --- Pass 1: hard rejects on the stored set + the current reading ------ */
-    for (size_t i = 0; i < n; ++i) {
-        if (!is_hard_junk(vals[i])) {
-            surv[m++] = vals[i];
-        }
-    }
-    bool current_ok = !is_hard_junk(current);
-    if (current_ok) {
-        surv[m++] = current;
-    }
-
-    /* Nothing survived -> no usable estimate. */
     if (m == 0) {
         if (ok) {
             *ok = false;
@@ -98,9 +82,8 @@ float robust_estimate(const float *vals, size_t n, float current, bool *ok)
         return 0.0f;
     }
 
-    /* --- Pass 2: MAD-based robust rejection -------------------------------- */
-    /*  median_inplace sorts 'surv', so take the median first, then compute the
-     *  absolute deviations into a second scratch and median THOSE for the MAD.  */
+    /* MAD: median first (on a copy, since median_inplace sorts), then the
+     * median of the absolute deviations.                                      */
     float sorted[ROBUST_MAX_VALS];
     memcpy(sorted, surv, m * sizeof(float));
     float med = median_inplace(sorted, m);
@@ -111,25 +94,73 @@ float robust_estimate(const float *vals, size_t n, float current, bool *ok)
     }
     float mad = median_inplace(devs, m);
 
-    /* --- Pass 3: average the inliers --------------------------------------- */
+    /* Average the inliers. When MAD == 0 (all equal) the test is meaningless,
+     * so keep everything.                                                     */
     float sum = 0.0f;
     size_t inliers = 0;
     for (size_t i = 0; i < m; ++i) {
-        /* When MAD == 0 (all survivors equal) the test is meaningless — keep
-         * every survivor rather than divide-by-nothing.                        */
         if (mad == 0.0f || fabsf(surv[i] - med) <= MAD_K * mad) {
             sum += surv[i];
             ++inliers;
         }
     }
 
-    /* MAD math can in pathological cases reject everything; fall back to the
-     * median so we always return SOMETHING usable when m > 0.                  */
-    float estimate = (inliers > 0) ? (sum / (float)inliers) : med;
+    if (ok) {
+        *ok = true;
+    }
+    /* Pathological all-rejected case falls back to the median. */
+    return (inliers > 0) ? (sum / (float)inliers) : med;
+}
 
-    /* Blend the inlier mean with the current reading when current is valid, so
-     * the freshest sample pulls the estimate toward "now" without letting a
-     * single noisy current reading dominate the historical ground set.         */
+/* Hard-junk filter from a source array into 'surv'; returns survivor count. */
+static size_t collect_survivors(const float *vals, size_t n, float *surv)
+{
+    size_t m = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!is_hard_junk(vals[i])) {
+            surv[m++] = vals[i];
+        }
+    }
+    return m;
+}
+
+float robust_mean(const float *vals, size_t n, bool *ok)
+{
+    if (n > BOOT_BUFFER_N) {
+        n = BOOT_BUFFER_N;
+    }
+    float surv[ROBUST_MAX_VALS];
+    size_t m = collect_survivors(vals, n, surv);
+    return inlier_mean(surv, m, ok);
+}
+
+float robust_estimate(const float *vals, size_t n, float current, bool *ok)
+{
+    /* Defensive clamp so a caller passing more than we budgeted can't overflow
+     * the fixed scratch.                                                       */
+    if (n > BOOT_BUFFER_N) {
+        n = BOOT_BUFFER_N;
+    }
+
+    float surv[ROBUST_MAX_VALS];
+    size_t m = collect_survivors(vals, n, surv);
+
+    bool current_ok = !is_hard_junk(current);
+    if (current_ok) {
+        surv[m++] = current;
+    }
+
+    bool got = false;
+    float estimate = inlier_mean(surv, m, &got);
+    if (!got) {
+        if (ok) {
+            *ok = false;
+        }
+        return 0.0f;
+    }
+
+    /* Blend with the current reading so the freshest sample pulls the estimate
+     * toward "now" without a single noisy reading dominating the set.          */
     if (current_ok) {
         estimate = 0.5f * estimate + 0.5f * current;
     }

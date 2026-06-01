@@ -87,6 +87,39 @@ int main(void)
         ASSERT_NEAR(est, 12.5f, 1e-5, "current-only estimate equals current");
     }
 
+    /* --- robust_mean: no current-blend, pure set mean --------------------- */
+    {
+        float g[3] = { 9.0f, 10.0f, 9.4f };
+        float mean = robust_mean(g, 3, &ok);
+        ASSERT_TRUE(ok, "robust_mean produces a value");
+        ASSERT_NEAR(mean, 9.4667f, 0.05f, "robust_mean is the clean cluster mean");
+
+        /* Empty set -> not ok. */
+        float none = robust_mean(NULL, 0, &ok);
+        ASSERT_TRUE(!ok, "robust_mean of empty set is not ok");
+        ASSERT_NEAR(none, 0.0f, 1e-6, "robust_mean of empty set is 0");
+
+        /* A gross flier within the hard cap is rejected by MAD. */
+        float f[5] = { 9.0f, 9.1f, 9.2f, 8.9f, 48.0f };
+        float fm = robust_mean(f, 5, &ok);
+        ASSERT_TRUE(ok && fm < 12.0f, "robust_mean rejects a flier");
+    }
+
+    /* --- Boot ground-vs-airborne arithmetic (mirrors boot_buffer_resolve) -- */
+    {
+        /* Learned ground ~9.47 ft. A 400 ft current reading must read as
+         * airborne with AGL ~390.5 ft.                                        */
+        float g[3] = { 9.0f, 10.0f, 9.4f };
+        float gref = robust_mean(g, 3, &ok);
+        ASSERT_TRUE(ok, "ground ref established");
+        float agl = 400.0f - gref;
+        ASSERT_NEAR(agl, 390.5f, 1.0f, "400 ft reading -> ~390 ft AGL");
+        ASSERT_TRUE((400.0f - gref) > GROUND_DEV_FT, "400 ft reading is airborne");
+
+        /* An 11 ft reading (within GROUND_DEV_FT of ~9.47) is still 'ground'. */
+        ASSERT_TRUE((11.0f - gref) <= GROUND_DEV_FT, "11 ft reading is still ground");
+    }
+
     TEST_SUMMARY();
     return TEST_EXIT_CODE();
 }

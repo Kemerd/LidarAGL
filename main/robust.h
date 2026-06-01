@@ -26,13 +26,30 @@
 float median_inplace(float *scratch, size_t n);
 
 /**
- * @brief Robustly estimate a single value from a noisy set + a current reading.
+ * @brief Robust mean of a set, with median/MAD outlier rejection (no blend).
  *
  * @details Pipeline (allocation-free; uses a fixed internal scratch):
  *            1. Hard reject inf / NaN / negatives / values > MAX_VALID_FT.
  *            2. On the survivors, reject any point more than MAD_K * MAD from
  *               the median (skipped when MAD == 0, i.e. all-equal survivors).
- *            3. Return the mean of the inliers, blended with @p current.
+ *            3. Return the mean of the inliers.
+ *
+ *          Use this when you want the estimate of a set ALONE (e.g. the learned
+ *          ground reference) with no extra reading folded in.
+ *
+ * @param vals     Readings (may be NULL when @p n == 0).
+ * @param n        Number of entries (0 .. BOOT_BUFFER_N).
+ * @param[out] ok  True if a usable mean was produced; false if all were junk.
+ * @return         The robust mean when @p *ok is true; 0.0f otherwise.
+ */
+float robust_mean(const float *vals, size_t n, bool *ok);
+
+/**
+ * @brief Robustly estimate a value from a noisy set blended with a fresh reading.
+ *
+ * @details Same outlier pipeline as robust_mean(), but the inlier mean is then
+ *          blended 50/50 with @p current (when @p current is itself valid) so
+ *          the freshest sample pulls the estimate toward "now".
  *
  * @param vals     Stored historical readings (may be NULL when @p n == 0).
  * @param n        Number of entries in @p vals (0 .. BOOT_BUFFER_N).
