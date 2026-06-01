@@ -1,0 +1,15 @@
+# =============================================================================
+#  LidarAGL — partition table
+# -----------------------------------------------------------------------------
+#  Minimal single-app layout. The voice clips are EMBEDDED in the app image
+#  (EMBED_FILES), NOT stored in a data partition, so we only need:
+#    - nvs     : the boot-buffer rolling ground-reference store (wear-leveled).
+#    - phy_init: RF calibration data (kept for completeness; radios are off).
+#    - factory : the application image.
+#
+#  Sizes assume an 8 MB flash devkit. Adjust 'factory' if your module differs.
+# =============================================================================
+# Name,     Type, SubType,  Offset,   Size
+nvs,        data, nvs,      0x9000,   0x6000
+phy_init,   data, phy,      0xf000,   0x1000
+factory,    app,  factory,  0x10000,  0x300000

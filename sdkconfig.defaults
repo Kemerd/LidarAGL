@@ -1,0 +1,45 @@
+# =============================================================================
+#  LidarAGL — default sdkconfig
+# -----------------------------------------------------------------------------
+#  These defaults seed menuconfig. The builder may tweak in menuconfig, but the
+#  radio-off and power-management settings below are load-bearing for the
+#  design (no EMI into avionics; light-sleep in idle states) and should stay.
+# =============================================================================
+
+# ---- Target -----------------------------------------------------------------
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- Custom partition table (dedicated NVS for the boot buffer) -------------
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- Radios OFF (spec §8) ---------------------------------------------------
+#  Compiling the WiFi/BT stacks OUT (not merely "not started") removes their
+#  code/RAM and guarantees zero draw and zero EMI radiated into the audio path
+#  and the aircraft avionics bus. Note: the v5 WiFi Kconfig key is
+#  CONFIG_ESP_WIFI_ENABLED (the old CONFIG_ESP32_WIFI_* family is gone).
+CONFIG_ESP_WIFI_ENABLED=n
+CONFIG_BT_ENABLED=n
+CONFIG_BLUEDROID_ENABLED=n
+CONFIG_BT_BLE_ENABLED=n
+
+# ---- Power management / light-sleep (spec §6.4) -----------------------------
+#  esp_pm_configure() needs BOTH of these or it returns ESP_ERR_NOT_SUPPORTED.
+#  The state machine drops the MCU into automatic light-sleep in GROUND/CRUISE,
+#  where the tone is silent and the I2S channel is disabled.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+#  Dynamic-frequency-scaling floor; the audio task forces 240 MHz when active.
+CONFIG_PM_DFS_INIT_AUTO=y
+
+# ---- Logging over the native USB-Serial-JTAG (no UART0 pins consumed) -------
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ---- Main task / app behaviour ----------------------------------------------
+#  app_main runs the one-shot boot sequence then spawns the real tasks, so it
+#  can keep a modest stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# ---- Compiler ---------------------------------------------------------------
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
