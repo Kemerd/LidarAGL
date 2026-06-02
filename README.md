@@ -1,4 +1,4 @@
-# LidarAGL — by [Novabox](https://novabox.works/)
+# LidarAGL — open source, by [Novabox.Works](https://novabox.works/)
 
 **Advisory AGL height-callout + flare-tone box for experimental aircraft.**
 
@@ -24,7 +24,8 @@ short flare window). WiFi/Bluetooth are **off by design** — no EMI into the av
 > 🛒 **Novabox project.** Files and build kits available at
 > **[novabox.works](https://novabox.works/)**. A complete unit (including the smart
 > threaded housing with acrylic lens — see [Enclosure](#enclosure-3d-printed-housing))
-> is available for purchase at **$599.95**.
+> is available for purchase at **$599.95** (100 m / SF30/C) or **$699.95**
+> (200 m / SF30/D).
 
 ---
 
@@ -51,12 +52,12 @@ short flare window). WiFi/Bluetooth are **off by design** — no EMI into the av
 | 2 | **LightWare SF30/C** (100 m) **or SF30/D** (200 m) micro-lidar | Slant-range rangefinder | SF30/C is the default. The box auto-detects which is fitted. |
 | 3 | **PCM5102A** I2S DAC breakout | Digital audio → line level (stereo) | The common purple/black breakout. **SCK jumper must go to GND** (internal PLL). |
 | 4 | **Level-trim potentiometer** (~10 kΩ) | Master output level | Sets absolute loudness into the panel. Firmware only shapes the *perceptual* ramp. |
-| 5 | **Momentary push button** | Reset / re-learn ground reference | Wipes the learned ground offset and reboots. Active-low, uses internal pull-up. Mount it in the cockpit on a harness conductor. |
+| 5 | **Momentary push button** | Config button (set audio modes + re-learn ground) | Hold at power-on for the config menu; wipes the learned ground + saved config. Active-low, internal pull-up. Mount in the cockpit on a harness conductor. |
 | 6 | **Clean regulated 5 V supply** | Supply | A single clean 5 V rail feeds the S3, the DAC, **and** the SF30. See [Power](#power). |
-| 7 | **Multi-conductor shielded cable** (≥6 cores) | Cockpit harness | Carries +, −, L, R, panel audio-LO reference, and the remote button. See [Cockpit harness](#4-analog-output--audio-panel-gma-245). |
-| 9 | **Acrylic lens disc** + Novabox threaded housing | Enclosure | See [Enclosure](#enclosure-3d-printed-housing). Available at novabox.works. |
+| 7 | **Multi-conductor shielded cable** (≥6 cores) | Cockpit harness | Carries +, −, L, R, panel audio-LO reference, and the config button. See [Cockpit harness](#cockpit-harness-6-conductor-shielded). |
+| 8 | **Acrylic lens disc** + Novabox threaded housing | Enclosure | See [Enclosure](#enclosure-3d-printed-housing). Available at Novabox.Works. |
 
-**Interfaces used:** UART (sensor), I2S (DAC, **stereo**), one GPIO (reset button),
+**Interfaces used:** UART (sensor), I2S (DAC, **stereo**), one GPIO (config button),
 USB (flash/log). All sensor & DAC logic is 3.3 V.
 
 ---
@@ -109,20 +110,20 @@ USB (flash/log). All sensor & DAC logic is 3.3 V.
 > the S3 emits **no MCLK** (firmware sets `mclk = I2S_GPIO_UNUSED`). Leave the onboard
 > jumpers FLT / DEMP / XSMT / FMT at their board defaults (I2S format, normal latency).
 
-### 3) Reset button → ESP32-S3
+### 3) Config button → ESP32-S3
 
 | Button | wire to | ESP32-S3 GPIO | `config.h` |
 |--------|:-------:|---------------|------------|
-| one leg  | →     | **GPIO 4**    | `PIN_RESET_BTN` |
+| one leg  | →     | **GPIO 4**    | `PIN_CONFIG_BTN` |
 | other leg| →     | GND           | — |
 
 > Active-low with the S3's internal pull-up (no external resistor). **Held at
-> power-on** → the box enters the **boot config menu**: it wipes the stored ground
-> readings *and* the saved audio config, then lets you tap to pick an audio mode
-> (see [Boot config menu](#boot-config-menu-button-held-at-power-on)). Use it on
-> install / re-install so the ground reference re-learns fresh. In the aircraft
-> install this button lives in the **cockpit**, reached over harness conductor 6
-> (see [Cockpit harness](#cockpit-harness-6-conductor-shielded)).
+> power-on** → the box enters the **config menu**: it wipes the stored ground
+> readings *and* the saved audio config, then lets you tap to pick the audio mode
+> and callout start altitude (see [Configuring the unit](#configuring-the-unit)).
+> Use it on install / re-install so the ground reference re-learns fresh. In the
+> aircraft install this button lives in the **cockpit**, reached over harness
+> conductor 6 (see [Cockpit harness](#cockpit-harness-6-conductor-shielded)).
 
 ### 4) Analog output → audio panel (GMA 245)
 
@@ -162,15 +163,16 @@ power, stereo audio + its reference, and the remote button:
 | 3 | **L** | DAC LOUT (via trim) → GMA 245 aux **L** |
 | 4 | **R** | DAC ROUT (via trim) → GMA 245 aux **R** |
 | 5 | **LO** | GMA 245 **audio-LO** reference ← box audio return |
-| 6 | **BTN** | remote reset button → **GPIO 4** (`PIN_RESET_BTN`) |
+| 6 | **BTN** | cockpit config button → **GPIO 4** (`PIN_CONFIG_BTN`) |
 
 > **Shield:** bond the cable shield to chassis at **one end only — the panel
 > side** — so it drains noise without forming a ground loop. Never bond both ends.
 >
-> **Remote button:** this is the *same* reset / re-learn button from §3, just
-> relocated into the cockpit on conductor 6 (still active-low to the box's GND,
-> using the S3's internal pull-up — no firmware change). Held at power-on it wipes
-> the learned ground reference and reboots.
+> **Config button:** the §3 config button, relocated into the cockpit on
+> conductor 6 (active-low to the box's GND via the S3's internal pull-up). Held at
+> power-on it opens the config menu (wipes ground + saved config, then tap/double-
+> tap to set the audio mode + start altitude — see
+> [Configuring the unit](#configuring-the-unit)).
 >
 > **Ground-loop fallback:** a GMA aux input + single-end shield is normally quiet.
 > If you ever hear supply-correlated whine (alternator buzz / switching hash) in
