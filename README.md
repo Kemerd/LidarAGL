@@ -437,19 +437,29 @@ per boot**, so flash wear is negligible. `AGL = measured_range − ground_avg`.
 > 🚧 **Placeholder — full housing guide coming.**
 
 The production unit ships in a **Novabox smart threaded housing**: the body has an
-integral thread so it acts as its own compression fitting — you cut a hole, drop in the
-**acrylic lens**, and thread the housing down to clamp everything into place (no separate
-hardware, clean optical window for the lidar/indicator).
+integral thread so it acts as its own compression fitting — you thread the housing down
+to clamp it into place (no separate hardware, clean optical window for the lidar).
+
+### Mounting — one hole, no screws
+The housing is **belly- or wing-mountable** and installs with **zero fasteners**:
+
+- **Drill a single 2.5″ hole** in the skin at your chosen mount point.
+- Drop the unit in and thread it down — the **integral thread acts as a compression
+  fitting**, clamping the housing to the skin against its built-in flange/lens.
+- **Overall height: ~70 mm** tall, so confirm you have that much clearance behind the
+  skin (and a clear, unobstructed view of the ground for the lidar).
+
+That's the whole install: **one 2.5″ hole, hand-tighten, done** — no screw holes to
+drill, no backing plate, no separate hardware.
 
 This section will be filled in with:
 - [ ] STL / STEP files and print settings (material, walls, infill, orientation)
 - [ ] Acrylic lens spec (diameter, thickness, cut template)
-- [ ] Cut-hole dimensions and the thread/compression assembly steps
-- [ ] Mounting guidance (belly location, sensor aim, strain relief)
-- [ ] BOM additions (gasket/o-ring, fasteners if any)
+- [ ] Exact thread pitch / torque + gasket/o-ring spec
+- [ ] Mounting guidance (belly vs wing location, sensor aim, strain relief)
 
-Print files and ready-made units are at **[novabox.works](https://novabox.works/)**
-(complete unit **$599.95**).
+Print files and ready-made units are at **[Novabox.Works](https://novabox.works/)**
+(complete unit **$599.95** for 100 m / SF30/C, **$699.95** for 200 m / SF30/D).
 
 ---
 
@@ -502,4 +512,4 @@ they build and run on a desktop compiler.
 
 ---
 
-*LidarAGL is an open project by [Novabox](https://novabox.works/). Advisory use only.*
+*LidarAGL is an open-source project by [Novabox.Works](https://novabox.works/). Advisory use only.*

@@ -60,11 +60,11 @@ hear supply-correlated whine, add a small inline aux ground-loop isolator on L/R
 > Onboard jumpers FLT / DEMP / XSMT / FMT: leave at the board defaults
 > (I2S format, normal latency).
 
-### Reset button (wipe learned ground reference)
+### Config button (audio modes + wipe learned ground reference)
 
 | Button | → | ESP32-S3 | config.h |
 |--------|---|----------|----------|
-| momentary, one side | → | GPIO **4** | `PIN_RESET_BTN` |
+| momentary, one side | → | GPIO **4** | `PIN_CONFIG_BTN` |
 | other side | → | GND | — |
 
 > Active-low with the S3's internal pull-up (no external resistor needed).
@@ -100,7 +100,7 @@ PCM5102A ROUT ─► trim pot ─┼─► GMA 245 aux  (L, R, audio-LO ref)
 | 3 | **L** | DAC LOUT (via trim) → GMA 245 aux L |
 | 4 | **R** | DAC ROUT (via trim) → GMA 245 aux R |
 | 5 | **LO** | GMA 245 audio-LO ref ← box audio return |
-| 6 | **BTN** | cockpit reset button → GPIO 4 |
+| 6 | **BTN** | cockpit config button → GPIO 4 |
 
 > Bond the cable **shield at one end only — the panel side** — so it drains noise
 > without forming a ground loop. The button on conductor 6 is the same reset /
