@@ -59,6 +59,8 @@ typedef struct {
     uint32_t   armed_mask;   /**< Per-callout armed bits.                      */
     bool       armed;        /**< True once climbed through ARM_FT.            */
     bool       have_prev;    /**< False until the first step seeds prev_agl.   */
+    float      ground_ms;    /**< Continuous time held in GROUND (ms); disarms */
+                             /**< at GROUND_RESET_MS, resets on leaving ground.*/
 } sm_ctx_t;
 
 /** Result of one sm_step() evaluation. */

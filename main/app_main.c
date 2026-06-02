@@ -119,7 +119,14 @@ static size_t capture_ground_fill(float *out, size_t want)
  *       mode (no callouts to gate). Otherwise: speak "Callout Start Altitude",
  *       then a TAP cycles the profile's callout ladder (200..10 / 500..10),
  *       each spoken with the existing number clips; DOUBLE-TAP / timeout confirms.
- *    4. A chirp marks each confirm. Persist both values and reboot.
+ *    4. LEVEL 3 — master volume offset. Speak "Volume Adjustment", then a TAP
+ *       cycles 0 dB down to VOLUME_OFFSET_DB_MIN in VOLUME_OFFSET_DB_STEP steps.
+ *       Each step previews the chosen level by ear as "tone .. <number> .. tone"
+ *       (a 1 kHz burst, one spoken number, the burst again) AT the selected
+ *       offset, so the pilot trims tone+voice together against the cockpit. The
+ *       offset is applied live so every prompt afterward reflects it; DOUBLE-TAP
+ *       / timeout confirms. This level always runs (it trims the tone too).
+ *    5. A chirp marks each confirm. Persist all three values and reboot.
  *
  *  This function does not return — it always ends in esp_restart().
  * ------------------------------------------------------------------------- */
@@ -187,6 +194,21 @@ static void announce_mode(int mode)
     audio_play_clip_blocking(config_clip_piece(stream));
 }
 
+/*  Preview the currently-selected master volume at the level it will actually
+ *  run: "tone .. <number> .. tone". The 1 kHz bursts and the spoken number all
+ *  pass through the same master offset (already applied via audio_set_master_db),
+ *  so the pilot judges tone-vs-voice balance and absolute loudness in one listen.
+ *  The number clip is fixed (CO_THIRTY) just to give the voice something to say;
+ *  its value carries no meaning here — only its loudness against the tone does.   */
+static void preview_volume(void)
+{
+    audio_play_tone_blocking(VOLUME_PREVIEW_HZ, VOLUME_PREVIEW_MS, VOLUME_PREVIEW_DB);
+    vTaskDelay(pdMS_TO_TICKS(90));
+    audio_play_clip_blocking(callout_clip(CO_THIRTY));
+    vTaskDelay(pdMS_TO_TICKS(90));
+    audio_play_tone_blocking(VOLUME_PREVIEW_HZ, VOLUME_PREVIEW_MS, VOLUME_PREVIEW_DB);
+}
+
 static void run_config_menu(void)
 {
     ESP_LOGW(TAG, "config mode: chirp + wipe ground/audio/start-altitude config");
@@ -197,6 +219,11 @@ static void run_config_menu(void)
     boot_buffer_wipe_ground();
     config_wipe_audio_mode();
     config_wipe_start_alt();
+    config_wipe_volume_offset();
+
+    /* Start the menu at 0 dB (no cut) so the prompts/previews play un-attenuated
+     * until the pilot chooses a level in LEVEL 3 below.                          */
+    audio_set_master_db(0.0f);
 
     /* Wait out the original hold so it isn't mistaken for a menu tap (bounded). */
     for (int i = 0; i < 300 && boot_buffer_button_down(); ++i) {
@@ -255,6 +282,41 @@ static void run_config_menu(void)
         config_save_start_alt(g_profile->callouts[cap_idx]);
     } else {
         ESP_LOGI(TAG, "config: tone-only mode, skipping start-altitude menu");
+    }
+
+    /* ---- LEVEL 3: master volume offset ------------------------------------ */
+    /* A pilot-set master trim layered on the analog pot, cycling 0 dB down to
+     * VOLUME_OFFSET_DB_MIN in VOLUME_OFFSET_DB_STEP steps. Always runs (it trims
+     * the presence tone too, not only the voice). Each tap applies the offset
+     * LIVE — so the very next preview, and every prompt after — plays at that
+     * level — then previews it as "tone .. number .. tone".                     */
+    {
+        float vol_db = 0.0f;                /* start at no cut (the default)     */
+        audio_set_master_db(vol_db);
+
+        audio_play_clip_blocking(config_clip_piece(CFG_PIECE_VOLUME_ADJ));
+        vTaskDelay(pdMS_TO_TICKS(120));
+        preview_volume();                   /* preview the starting (0 dB) level */
+
+        idle_ms = 0;
+        for (;;) {
+            tap_event_t ev = wait_tap_event(&idle_ms);
+            if (ev == TAP_DOUBLE || ev == TAP_TIMEOUT) {
+                break;                      /* confirm this volume               */
+            }
+            if (ev == TAP_SINGLE) {
+                /* Step DOWN one increment; wrap back to 0 dB past the floor. */
+                vol_db -= VOLUME_OFFSET_DB_STEP;
+                if (vol_db < VOLUME_OFFSET_DB_MIN - 0.001f) {
+                    vol_db = 0.0f;          /* wrap to no-cut */
+                }
+                ESP_LOGI(TAG, "config: volume offset -> %.0f dB", vol_db);
+                audio_set_master_db(vol_db);   /* apply live for the preview */
+                preview_volume();
+            }
+        }
+        audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
+        config_save_volume_offset(vol_db);
     }
 
     ESP_LOGW(TAG, "config committed (mode %d); rebooting", selected_mode);
@@ -403,6 +465,12 @@ void app_main(void)
      * callout is the default when nothing has been configured).                 */
     s_start_alt_ft = config_load_start_alt(g_profile->callouts[0]);
     ESP_LOGI(TAG, "callout start-altitude cap: %.0f ft", s_start_alt_ft);
+
+    /* Apply the saved master volume offset (0 dB == no cut). Done after the menu
+     * branch so a freshly-committed value is the one in effect this boot.        */
+    float vol_db = config_load_volume_offset();
+    audio_set_master_db(vol_db);
+    ESP_LOGI(TAG, "master volume offset: %.0f dB", vol_db);
 
     /* 5. Ground-fill + current reading -> reconstruct ground reference. */
     float ground_reads[BOOT_BUFFER_N];

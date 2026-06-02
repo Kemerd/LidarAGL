@@ -282,6 +282,79 @@ static void test_trend_deadband(const sensor_profile_t *p)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ *  Ground-dwell disarm: after GROUND_RESET_MS continuously parked we must DISARM
+ *  (as if rebooted onto the ground) so the next takeoff is silent until we climb
+ *  back through ARM_FT; but a quick touch-and-go inside the window keeps the arm.
+ * ------------------------------------------------------------------------- */
+static void test_ground_dwell_disarm(const sensor_profile_t *p)
+{
+    char msg[96];
+
+    /* --- Part A: park past the timeout -> next descent is silent until re-arm. */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_GROUND);
+
+        /* Fly a full circuit so everything is armed and fired once. */
+        float scratch[16];
+        float top = p->callouts[0] + REARM_MARGIN_FT + 20.0f;
+        ramp(&c, p, 0.0f, top, +2.0f, scratch, 16);
+        ramp(&c, p, top, 0.0f, -2.0f, scratch, 16);
+
+        /* Sit on the ground (0 ft, level) for well past GROUND_RESET_MS. With
+         * DT = 25 ms that is GROUND_RESET_MS/25 ticks; add margin.               */
+        int park_ticks = (int)(GROUND_RESET_MS / (DT * 1000.0f)) + 20;
+        sm_out_t out;
+        for (int i = 0; i < park_ticks; ++i) {
+            sm_step(&c, 0.0f, DT, p, &out);
+        }
+        snprintf(msg, sizeof msg, "[%s] parked past timeout -> disarmed", p->name);
+        ASSERT_TRUE(out.state == ST_GROUND, msg);
+
+        /* Now take off and descend again WITHOUT first climbing through ARM_FT:
+         * a low hop to just above a mid callout then back down must stay silent,
+         * because the disarm means callouts only re-arm after ARM_FT.            */
+        float hits[16];
+        float hop = ARM_FT - 10.0f;     /* below ARM_FT: must not re-arm */
+        ramp(&c, p, 0.0f, hop, +2.0f, scratch, 16);
+        int n = ramp(&c, p, hop, 0.0f, -2.0f, hits, 16);
+        snprintf(msg, sizeof msg, "[%s] post-park low hop stays silent", p->name);
+        ASSERT_TRUE(n == 0, msg);
+
+        /* And a proper climb back through ARM_FT re-arms it the normal way. */
+        ramp(&c, p, 0.0f, top, +2.0f, scratch, 16);
+        int n2 = ramp(&c, p, top, 0.0f, -2.0f, hits, 16);
+        snprintf(msg, sizeof msg, "[%s] climb past ARM_FT re-arms after park", p->name);
+        ASSERT_TRUE(n2 == (int)p->n_callouts, msg);
+    }
+
+    /* --- Part B: a quick touch-and-go inside the window keeps the arm. -------- */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_GROUND);
+
+        float scratch[16];
+        float top = p->callouts[0] + REARM_MARGIN_FT + 20.0f;
+        ramp(&c, p, 0.0f, top, +2.0f, scratch, 16);
+        ramp(&c, p, top, 0.0f, -2.0f, scratch, 16);
+
+        /* Touch down only briefly — a handful of ground ticks, far under the
+         * timeout — then go around. The arm must survive, so the 50 ft callout
+         * re-fires on the next descent without needing a full re-climb logic
+         * beyond the normal go-around re-arm.                                    */
+        sm_out_t out;
+        for (int i = 0; i < 5; ++i) {       /* ~125 ms on the ground */
+            sm_step(&c, 0.0f, DT, p, &out);
+        }
+        float hits[16];
+        ramp(&c, p, 0.0f, top, +2.0f, scratch, 16);
+        int n = ramp(&c, p, top, 0.0f, -2.0f, hits, 16);
+        snprintf(msg, sizeof msg, "[%s] brief touch-and-go keeps callouts armed", p->name);
+        ASSERT_TRUE(n == (int)p->n_callouts, msg);
+    }
+}
+
 int main(void)
 {
     const sensor_profile_t *profiles[2] = { &SF30C_PROFILE, &SF30D_PROFILE };
@@ -297,6 +370,7 @@ int main(void)
         test_cruise_gating(p);
         test_initial_state(p);
         test_trend_deadband(p);
+        test_ground_dwell_disarm(p);
     }
     printf("-- profile-specific high callouts --\n");
     test_high_callouts_profile_specific();

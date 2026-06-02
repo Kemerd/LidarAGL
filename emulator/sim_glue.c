@@ -296,6 +296,80 @@ float sim_tone_harmonic2(void) { return TONE_HARMONIC2_LVL; }
 EMSCRIPTEN_KEEPALIVE
 float sim_mix_lpf_fc(void) { return MIX_LPF_FC_HZ; }
 
+/* ---- Master volume offset (boot config menu) ------------------------------ */
+/*  The pilot's master trim, layered on the analog pot, that attenuates the WHOLE
+ *  mix (tone + voice). These getters hand the SAME range/step/default the firmware
+ *  config menu cycles so the emulator's volume control and audio graph match the
+ *  hardware exactly. db_to_gain() converts a chosen offset to the linear master
+ *  gain the WebAudio master node should use.                                     */
+
+/** @brief Deepest cut the volume menu offers, in dB (VOLUME_OFFSET_DB_MIN). */
+EMSCRIPTEN_KEEPALIVE
+float sim_volume_offset_db_min(void) { return VOLUME_OFFSET_DB_MIN; }
+
+/** @brief Step between volume settings, in dB (VOLUME_OFFSET_DB_STEP). */
+EMSCRIPTEN_KEEPALIVE
+float sim_volume_offset_db_step(void) { return VOLUME_OFFSET_DB_STEP; }
+
+/** @brief Default volume offset applied until the pilot lowers it (0 dB). */
+EMSCRIPTEN_KEEPALIVE
+float sim_default_volume_offset_db(void) { return DEFAULT_VOLUME_OFFSET_DB; }
+
+/** @brief Linear master gain for a given offset dB — the SAME db_to_gain() the
+ *         firmware applies, so the sim's master node tracks the hardware 1:1. */
+EMSCRIPTEN_KEEPALIVE
+float sim_master_gain(float db) { return db_to_gain(db > 0.0f ? 0.0f : db); }
+
+/* ---- Volume-preview tone (config menu) ------------------------------------ */
+/*  The "tone .. number .. tone" preview the volume menu plays at each step. The
+ *  sim re-creates it with a short WebAudio oscillator burst at exactly these
+ *  parameters so the preview the user hears matches the firmware's.             */
+
+/** @brief Preview tone frequency (Hz) — the 1 kHz equal-loudness reference. */
+EMSCRIPTEN_KEEPALIVE
+float sim_volume_preview_hz(void) { return VOLUME_PREVIEW_HZ; }
+
+/** @brief Preview tone burst length (ms). */
+EMSCRIPTEN_KEEPALIVE
+float sim_volume_preview_ms(void) { return VOLUME_PREVIEW_MS; }
+
+/** @brief Preview tone level (dB) before the master offset (VOLUME_PREVIEW_DB). */
+EMSCRIPTEN_KEEPALIVE
+float sim_volume_preview_db(void) { return VOLUME_PREVIEW_DB; }
+
+/* ---- Voice-duck envelope + baseline tone trim ----------------------------- */
+/*  The firmware ducks the tone under a callout with an ASYMMETRIC envelope (fast
+ *  attack, slow release) and, whenever callouts are enabled, holds the tone a
+ *  constant TONE_TRIM_WITH_VOICE_DB down so the voice reads clearer. The emulator
+ *  mirrors both; these getters hand it the SAME constants.                       */
+
+/** @brief Per-callout tone duck depth (dB), VOICE_DUCK_DB (positive magnitude). */
+EMSCRIPTEN_KEEPALIVE
+float sim_voice_duck_db(void) { return VOICE_DUCK_DB; }
+
+/** @brief Duck ATTACK time (ms): tone -> ducked, fast (DUCK_ATTACK_MS). */
+EMSCRIPTEN_KEEPALIVE
+float sim_duck_attack_ms(void) { return DUCK_ATTACK_MS; }
+
+/** @brief Duck RELEASE time (ms): ducked -> full, gentle (DUCK_RELEASE_MS). */
+EMSCRIPTEN_KEEPALIVE
+float sim_duck_release_ms(void) { return DUCK_RELEASE_MS; }
+
+/** @brief Steady tone trim (dB) held while callouts are enabled
+ *         (TONE_TRIM_WITH_VOICE_DB; negative == a cut). */
+EMSCRIPTEN_KEEPALIVE
+float sim_tone_trim_with_voice_db(void) { return TONE_TRIM_WITH_VOICE_DB; }
+
+/* ---- Ground-dwell disarm (taxi-back reset) -------------------------------- */
+/*  After GROUND_RESET_MS continuously parked the firmware disarms as if rebooted.
+ *  The sim's state machine is the REAL one (state_machine.c), so this already
+ *  happens inside sim_step(); this getter is exposed only so the UI can show /
+ *  explain the timeout without hard-coding it.                                   */
+
+/** @brief Continuous-on-ground time (ms) after which the box disarms. */
+EMSCRIPTEN_KEEPALIVE
+float sim_ground_reset_ms(void) { return GROUND_RESET_MS; }
+
 /**
  * @brief 1 if @p mode pans the two streams apart (stereo), 0 if it duplicates L=R.
  * @details Mirrors audio_config_from_mode().stereo for the given AUDIO_MODE_*.

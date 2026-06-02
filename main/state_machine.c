@@ -27,6 +27,7 @@ void sm_init(sm_ctx_t *c, sm_state_t initial)
     c->trend_fps  = 0.0f;
     c->armed_mask = 0u;
     c->have_prev  = false;
+    c->ground_ms  = 0.0f;   /* fresh ground-dwell timer */
 
     /* If we are seeded into a flying state, the descent callouts must already
      * be armed — we may have rebooted mid-descent and need to fire on the way
@@ -235,6 +236,30 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
     }
 
     c->state = next;
+
+    /* --- Ground-dwell disarm (taxi-back / parked reset) ------------------- */
+    /*  Accumulate continuous time spent SETTLED ON THE GROUND. Note we can't key
+     *  this off ST_GROUND: once 'armed', the machine only ever picks CRUISE /
+     *  DESCENT / ARMED, so a landed-but-armed box sits in ST_ARMED, never returns
+     *  to ST_GROUND. So we detect "parked" directly from the motion — at/below the
+     *  ground band (a hair above 0) and not descending or climbing. The instant we
+     *  leave that (a bounce, a climb, a go-around) the timer resets, so a quick
+     *  return to flight keeps the callouts/tone armed. Once we've simply sat parked
+     *  past GROUND_RESET_MS we DISARM as if freshly rebooted onto the ground: clear
+     *  the arm latch and every armed bit, so the next takeoff is silent until the
+     *  aircraft climbs back through ARM_FT and re-arms naturally.                  */
+    bool parked = (agl_ft <= 2.0f) && !is_descending(trend) && !is_climbing(trend);
+    if (parked) {
+        c->ground_ms += dt_s * 1000.0f;
+        if (c->armed && c->ground_ms >= (float)GROUND_RESET_MS) {
+            c->armed      = false;
+            c->armed_mask = 0u;
+            next          = ST_GROUND;   /* reflect the disarmed, parked reset */
+            c->state      = next;
+        }
+    } else {
+        c->ground_ms = 0.0f;
+    }
 
     /* --- Tone gating ------------------------------------------------------ */
     /*  The audio engine owns the dB swell curve; here we only decide WHETHER a

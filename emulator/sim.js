@@ -134,6 +134,11 @@ let modeStereo  = true;     // resolved api.modeStereo(audioMode)
 let modeCallouts = true;    // resolved api.modeCallouts(audioMode)
 let modeTone    = true;     // resolved api.modeTone(audioMode)
 
+// Master volume offset (dB, <= 0). The pilot's trim layered on the analog pot,
+// attenuating the WHOLE mix (tone + voice) exactly like app_main.c's saved offset
+// driving audio_set_master_db(). 0 dB == no cut; default seeded from the firmware.
+let volumeDb    = 0;
+
 // WebAudio graph.
 let audioCtx     = null; // AudioContext (created on first gesture)
 let osc          = null; // continuous OscillatorNode for the presence tone
@@ -142,8 +147,17 @@ let osc2Gain     = null; // fixed gain on osc2 == TONE_HARMONIC2_LVL / (1 + lvl)
 let toneGainNode = null; // GainNode — 0 == silent
 let tonePanNode  = null; // StereoPannerNode — leans the tone left in stereo mode
 let mixLpfNode   = null; // BiquadFilter (lowpass) — anti-harshness mix-bus LPF
+let masterGainNode = null; // GainNode — the pilot's master volume offset (tone+voice)
 let audioUnlocked = false;
 const calloutBuffers = new Map(); // height(ft) -> decoded AudioBuffer
+
+// Voice-duck envelope, mirroring audio.c's s_duck_cur. While a callout plays the
+// tone ducks by VOICE_DUCK_DB with a fast ATTACK and a slow RELEASE; between
+// callouts it sits at 1.0 (no duck). We slew it per frame by dt with the firmware's
+// asymmetric rates so the first syllable is never masked yet the tone eases back
+// without a pump. duckActiveUntil holds the audioCtx time a fired callout ends.
+let duckCur        = 1;   // current duck multiplier (1 = un-ducked)
+let duckActiveUntil = 0;  // audioCtx.currentTime by which the active callout ends
 
 // Canvas / layout.
 let canvas, ctx, dpr = 1;
@@ -204,13 +218,36 @@ async function main() {
     modeStereo:     M.cwrap('sim_mode_stereo',        num, [num]),
     modeCallouts:   M.cwrap('sim_mode_callouts',      num, [num]),
     modeTone:       M.cwrap('sim_mode_tone',          num, [num]),
+
+    // Master volume offset (boot config menu) — range/step/default + the SAME
+    // db_to_gain() the firmware uses, so the master node matches the DAC path.
+    volMinDb:       M.cwrap('sim_volume_offset_db_min',  num, []),
+    volStepDb:      M.cwrap('sim_volume_offset_db_step', num, []),
+    volDefaultDb:   M.cwrap('sim_default_volume_offset_db', num, []),
+    masterGain:     M.cwrap('sim_master_gain',        num, [num]),
+
+    // Volume-preview tone parameters ("tone .. number .. tone").
+    volPreviewHz:   M.cwrap('sim_volume_preview_hz',  num, []),
+    volPreviewMs:   M.cwrap('sim_volume_preview_ms',  num, []),
+    volPreviewDb:   M.cwrap('sim_volume_preview_db',  num, []),
+
+    // Voice-duck envelope + baseline tone trim, mirrored from audio.c.
+    voiceDuckDb:    M.cwrap('sim_voice_duck_db',      num, []),
+    duckAttackMs:   M.cwrap('sim_duck_attack_ms',     num, []),
+    duckReleaseMs:  M.cwrap('sim_duck_release_ms',    num, []),
+    toneTrimDb:     M.cwrap('sim_tone_trim_with_voice_db', num, []),
+
+    // Ground-dwell disarm timeout (informational; the real SM enforces it).
+    groundResetMs:  M.cwrap('sim_ground_reset_ms',    num, []),
   };
 
   // 3. Start the machine on the default profile, parked on the ground.
   //    Seed the boot config from the firmware's own defaults, then resolve the
   //    mode flags so the very first audio frame already honours them.
   audioMode = api.defaultMode();
+  volumeDb  = api.volDefaultDb();      // master offset default (0 dB == no cut)
   applyAudioMode(audioMode);
+  applyVolume(volumeDb);
   api.setProfile(profileIdx);
   api.init(0 /* ST_GROUND */);
   readConfig();
@@ -293,6 +330,24 @@ function applyAudioMode(mode) {
   }
 }
 
+/**
+ * Apply the pilot's master volume offset (dB) to the whole mix — the sim analogue
+ * of app_main.c calling audio_set_master_db(). The offset is converted to a linear
+ * gain by the SAME firmware db_to_gain() (via api.masterGain) and driven into the
+ * master node so it trims the presence tone AND the voice callouts equally, just
+ * like the DAC path. Clamped to attenuation only (never boosts past the schedule).
+ *
+ * @param {number} db  Offset in dB (<= 0).
+ */
+function applyVolume(db) {
+  volumeDb = Math.min(0, db);
+  if (masterGainNode && audioCtx) {
+    // Short glide so a live change during the menu preview never clicks.
+    masterGainNode.gain.setTargetAtTime(
+      api.masterGain(volumeDb), audioCtx.currentTime, 0.02);
+  }
+}
+
 /* =============================================================================
  *  Boot config menu (Calibrate button)
  *
@@ -307,6 +362,7 @@ function applyAudioMode(mode) {
 
 let pendingMode   = 1;   // mode highlighted in the open sheet (not yet applied)
 let pendingCapFt  = 0;   // start-alt cap highlighted in the open sheet
+let pendingVolDb  = 0;   // master volume offset highlighted in the open sheet
 
 /** Open the config sheet, seeding the controls from the current live config. */
 function openConfigMenu() {
@@ -314,9 +370,11 @@ function openConfigMenu() {
   // Seed the cap from the live value, but never above this profile's ceiling.
   const top = cfg.callouts[0];
   pendingCapFt = isFinite(startAltFt) ? Math.min(startAltFt, top) : top;
+  pendingVolDb = volumeDb;          // seed the master offset from the live value
 
   buildModeList();
   buildCapControl();
+  buildVolumeControl();
 
   document.getElementById('configBackdrop').classList.add('open');
 }
@@ -427,6 +485,8 @@ function calibrateToGround() {
   api.init(0 /* ST_GROUND */);
   lastFiredFt = null;
   flareFade = 1;
+  duckCur = 1;                 // un-duck (no callout in flight after a zeroing)
+  duckActiveUntil = 0;
 }
 
 /* =============================================================================
@@ -563,14 +623,23 @@ function setupAudioGraph() {
   mixLpfNode.type = 'lowpass';
   mixLpfNode.frequency.value = api.mixLpfFc();   // MIX_LPF_FC_HZ
 
+  // Master volume offset node — the pilot's trim layered on the analog pot. The
+  // firmware applies it LAST, to the whole mix (tone AND voice), so in the graph
+  // BOTH the tone chain and every callout source feed THIS node, and only this
+  // node reaches the destination. Mirrors audio_set_master_db()/s_master_gain.
+  masterGainNode = audioCtx.createGain();
+  masterGainNode.gain.value = api.masterGain(volumeDb);
+  masterGainNode.connect(audioCtx.destination);
+
   // Fundamental feeds the gain node at the normalised weight; the harmonic feeds
-  // it through osc2Gain. Then: gain -> pan -> LPF -> out (LPF is post-pan so it
-  // shapes the final mix exactly like audio.c filters the L/R after panning).
+  // it through osc2Gain. Then: gain -> pan -> LPF -> master -> out (LPF is
+  // post-pan so it shapes the final mix exactly like audio.c filters the L/R
+  // after panning; master is post-LPF, the true master trim).
   const fundGain = audioCtx.createGain();
   fundGain.gain.value = norm;        // fundamental weight (1/(1+lvl))
   osc.connect(fundGain).connect(toneGainNode);
   osc2.connect(osc2Gain).connect(toneGainNode);
-  toneGainNode.connect(tonePanNode).connect(mixLpfNode).connect(audioCtx.destination);
+  toneGainNode.connect(tonePanNode).connect(mixLpfNode).connect(masterGainNode);
   osc.start();
   osc2.start();
 }
@@ -607,8 +676,15 @@ function playCallout(ft) {
   const pan = audioCtx.createStereoPanner();
   pan.pan.value = modeStereo ? +api.stereoPan() : 0;
 
-  src.connect(pan).connect(audioCtx.destination);
+  // Through the master node (post-pan) so the pilot's volume offset trims the
+  // voice exactly as it does the tone — the firmware applies master to both.
+  src.connect(pan).connect(masterGainNode);
   src.start();
+
+  // Open the duck window for this clip's duration so the frame loop ducks the
+  // tone under it (fast attack now, slow release once it ends), mirroring the
+  // firmware's s_duck_cur envelope. buf.duration is the real clip length.
+  duckActiveUntil = audioCtx.currentTime + buf.duration;
 }
 
 /**
@@ -673,6 +749,22 @@ function frame(ts) {
   const fadeStep   = fadeMs > 0 ? dt / (fadeMs / 1000) : 1;
   flareFade += clamp(fadeTarget - flareFade, -fadeStep, fadeStep);
 
+  // --- Voice duck: mirror audio.c's asymmetric s_duck_cur envelope ----------
+  // While a callout is sounding (we tracked its end in duckActiveUntil) the tone
+  // ducks toward db_to_gain(-VOICE_DUCK_DB); otherwise it releases back to 1.0.
+  // The ATTACK (fast) and RELEASE (slow) use the firmware's own ms constants,
+  // slewed per frame by dt — the frame-stepped equivalent of the per-sample slew
+  // — so the first syllable is cleared instantly yet the tone eases back without
+  // a pump. Only meaningful when callouts can play; otherwise it stays at 1.0.
+  if (audioUnlocked) {
+    const ducking   = modeCallouts && audioCtx.currentTime < duckActiveUntil;
+    const duckTarget = ducking ? api.masterGain(-api.voiceDuckDb()) : 1; // db->gain
+    const duckMs    = duckTarget < duckCur ? api.duckAttackMs()
+                                           : api.duckReleaseMs();
+    const duckStep  = duckMs > 0 ? dt / (duckMs / 1000) : 1;
+    duckCur += clamp(duckTarget - duckCur, -duckStep, duckStep);
+  }
+
   if (audioUnlocked) {
     const now = audioCtx.currentTime;
     // The tone only sounds when the configured mode enables it (MONO_CALLOUTS
@@ -681,12 +773,21 @@ function frame(ts) {
     if (toneOn && modeTone) {
       // Drive the oscillator from the SAME math the firmware uses. setTargetAtTime
       // gives a short, click-free glide analogous to the raised-cosine envelope.
-      // The flare fade multiplies the scheduled gain, exactly as in audio.c.
       const fHz = api.pitchHz(toneAgl);
       osc.frequency.setTargetAtTime(fHz, now, 0.01);
       // Keep the 2nd-harmonic oscillator locked to 2x the fundamental as it glides.
       osc2.frequency.setTargetAtTime(fHz * 2, now, 0.01);
-      toneGainNode.gain.setTargetAtTime(api.toneGain(toneAgl) * flareFade, now, 0.01);
+
+      // Steady baseline tone trim while callouts are enabled (TONE_TRIM_WITH_VOICE
+      // _DB): holds the tone a touch down for the whole descent so the voice reads
+      // clearer over it — exactly audio.c's s_tone_trim (1.0 / no trim otherwise).
+      const toneTrim = modeCallouts ? api.masterGain(api.toneTrimDb()) : 1;
+
+      // Final tone gain = scheduled gain · flare fade · voice duck · baseline trim,
+      // the same stack of multipliers the firmware applies per sample (the master
+      // volume offset lives on masterGainNode, downstream of this node).
+      toneGainNode.gain.setTargetAtTime(
+        api.toneGain(toneAgl) * flareFade * duckCur * toneTrim, now, 0.01);
     } else {
       // Ramp to silence rather than cutting — no click.
       toneGainNode.gain.setTargetAtTime(0, now, 0.03);

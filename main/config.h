@@ -95,6 +95,15 @@
  *  since there is no IMU/baro. A small dead-band stops noise flipping the sign. */
 #define TREND_DEADBAND_FPS 0.5f        /* |dAGL/dt| below this == "level"        */
 
+/*  After a landing the box keeps its descent callouts armed so a quick bounce or
+ *  go-around still gets the tone (you usually WANT it then). But once the aircraft
+ *  has simply SAT on the ground for this long — a taxi-back, a full-stop, parked —
+ *  we DISARM as if freshly rebooted: the next takeoff is silent until the aircraft
+ *  climbs back through ARM_FT and re-arms naturally. The timer counts only
+ *  continuous GROUND dwell and resets the moment we leave the ground, so a touch-
+ *  and-go inside this window keeps the arming and the tone.                       */
+#define GROUND_RESET_MS    30000u      /* 30 s parked -> disarm (re-arm via climb)*/
+
 /* ---- Per-state poll cadence (ms between sensor reads) -------------------- */
 /*  One place defines the power/latency policy; set_poll_profile() maps state
  *  to one of these. Fast in DESCENT for crisp callout timing; slow (sleep-
