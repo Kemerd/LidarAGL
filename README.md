@@ -21,7 +21,7 @@ short flare window). WiFi/Bluetooth are **off by design** — no EMI into the av
 > 🛒 **Novabox project.** Files and build kits available at
 > **[novabox.works](https://novabox.works/)**. A complete unit (including the smart
 > threaded housing with acrylic lens — see [Enclosure](#enclosure-3d-printed-housing))
-> is available for purchase at **$599.95**.
+> is available for purchase at **$599.95** for 100m range unit or $699.95 for the 200m range unit.
 
 ---
 
