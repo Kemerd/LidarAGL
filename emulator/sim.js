@@ -42,6 +42,16 @@ const STATE_COLORS = {
 // every WAV once regardless of which profile is active.
 const ALL_CALLOUT_FT = [500, 400, 300, 200, 100, 50, 40, 30, 20, 10];
 
+// Human-facing labels for the AUDIO_MODE_* indices (config.h). The INDEX is the
+// source of truth (the flags come from the WASM glue per mode); this is only the
+// UI copy. Order matches AUDIO_MODE_MONO_BOTH..MONO_TONE = 0..3.
+const AUDIO_MODE_META = [
+  { title: 'Mono · both',     desc: 'Callouts + tone, same signal to both ears.' },
+  { title: 'Stereo · both',   desc: 'Callouts lean right, tone leans left (gentle pan).' },
+  { title: 'Callouts only',   desc: 'Spoken heights only — no presence tone.' },
+  { title: 'Tone only',       desc: 'Presence tone only — no spoken callouts.' },
+];
+
 // Smoothing factor for the *visual* aircraft glyph only. The state machine is
 // always fed the RAW target AGL; this just makes the on-screen motion glide.
 const DISPLAY_EASE = 0.18;
@@ -61,10 +71,28 @@ let profileIdx = 0;      // 0 = SF30/C, 1 = SF30/D
 let cfg        = null;   // cached profile + constant readouts (see readConfig)
 let lastFiredFt = null;  // most recent callout height fired (for the readout)
 
+// Flare-fade multiplier, mirroring audio.c's s_flare_fade. 1 = tone fully
+// present, 0 = faded out under the flare. Slewed every frame with the firmware's
+// asymmetric rates: slow toward 0 below flareFadeFt, fast toward 1 above it.
+let flareFade  = 1;
+
+// --- Boot config (mirrors the firmware's hold-at-boot NVS menu) --------------
+// audioMode is one of AUDIO_MODE_* (0..3). startAltFt is the callout ceiling: no
+// callout ABOVE this height fires, exactly like app_main.c's s_start_alt_ft cap
+// (the tone is unaffected). Both default to the firmware defaults at boot and are
+// changed only by committing the in-sim config menu. Resolved flags are cached so
+// the audio frame doesn't re-cross the WASM boundary every tick.
+let audioMode   = 1;        // set to api.defaultMode() once the module is up
+let startAltFt  = Infinity; // "no cap" until a profile is loaded (then = top callout)
+let modeStereo  = true;     // resolved api.modeStereo(audioMode)
+let modeCallouts = true;    // resolved api.modeCallouts(audioMode)
+let modeTone    = true;     // resolved api.modeTone(audioMode)
+
 // WebAudio graph.
 let audioCtx     = null; // AudioContext (created on first gesture)
 let osc          = null; // continuous OscillatorNode for the presence tone
 let toneGainNode = null; // GainNode — 0 == silent
+let tonePanNode  = null; // StereoPannerNode — leans the tone left in stereo mode
 let audioUnlocked = false;
 const calloutBuffers = new Map(); // height(ft) -> decoded AudioBuffer
 
@@ -104,6 +132,7 @@ async function main() {
 
     pitchHz:       M.cwrap('sim_pitch_hz',       num,   [num]),
     toneDb:        M.cwrap('sim_tone_db',        num,   [num]),
+    eqlDb:         M.cwrap('sim_eql_db',         num,   [num]),
     toneGain:      M.cwrap('sim_tone_gain',      num,   [num]),
 
     armFt:         M.cwrap('sim_arm_ft',         num,   []),
@@ -111,9 +140,25 @@ async function main() {
     toneFullFt:    M.cwrap('sim_tone_full_ft',   num,   []),
     flareHiFt:     M.cwrap('sim_flare_hi_ft',    num,   []),
     flareLoFt:     M.cwrap('sim_flare_lo_ft',    num,   []),
+
+    flareFadeFt:     M.cwrap('sim_flare_fade_ft',     num, []),
+    flareFadeOutMs:  M.cwrap('sim_flare_fade_out_ms', num, []),
+    flareFadeInMs:   M.cwrap('sim_flare_fade_in_ms',  num, []),
+
+    // Boot config menu — audio mode flags + stereo lean (see sim_glue.c).
+    audioModeCount: M.cwrap('sim_audio_mode_count',   num, []),
+    defaultMode:    M.cwrap('sim_default_audio_mode', num, []),
+    stereoPan:      M.cwrap('sim_stereo_pan',         num, []),
+    modeStereo:     M.cwrap('sim_mode_stereo',        num, [num]),
+    modeCallouts:   M.cwrap('sim_mode_callouts',      num, [num]),
+    modeTone:       M.cwrap('sim_mode_tone',          num, [num]),
   };
 
   // 3. Start the machine on the default profile, parked on the ground.
+  //    Seed the boot config from the firmware's own defaults, then resolve the
+  //    mode flags so the very first audio frame already honours them.
+  audioMode = api.defaultMode();
+  applyAudioMode(audioMode);
   api.setProfile(profileIdx);
   api.init(0 /* ST_GROUND */);
   readConfig();
@@ -144,6 +189,12 @@ function readConfig() {
     toneFull:  api.toneFullFt(),
     flareHi:   api.flareHiFt(),
     flareLo:   api.flareLoFt(),
+
+    // Flare fade-out: threshold + the two asymmetric ramp times (ms), straight
+    // from the firmware so the emulated envelope matches the hardware timing.
+    flareFadeFt:    api.flareFadeFt(),
+    flareFadeOutMs: api.flareFadeOutMs(),
+    flareFadeInMs:  api.flareFadeInMs(),
   };
 
   // Visible tape top: a little headroom above the highest callout / cruise so
@@ -152,6 +203,177 @@ function readConfig() {
 
   // Keep the target within the new range.
   targetAgl = clamp(targetAgl, 0, topFt);
+
+  // Resolve the start-altitude cap against THIS profile's ladder, mirroring the
+  // firmware's config_load_start_alt(top-callout) default. If the cap is still
+  // unset (Infinity) OR sits above the new ladder's ceiling, snap it to the top
+  // callout (= "no suppression"); a valid lower pick made in the menu survives a
+  // profile switch as long as it's still on the ladder.
+  const top = cfg.callouts[0];
+  if (!isFinite(startAltFt) || startAltFt > top) {
+    startAltFt = top;
+  }
+}
+
+/* =============================================================================
+ *  Audio mode (boot config) resolution
+ * ===========================================================================*/
+
+/**
+ * Resolve one AUDIO_MODE_* index into the three behaviour flags the firmware
+ * derives in audio_config_from_mode(), caching them so the audio frame never
+ * re-crosses the WASM boundary. Also nudges the live tone panner so a mode change
+ * takes effect immediately (no need to rebuild the graph).
+ *
+ * @param {number} mode  One of AUDIO_MODE_* (0..3).
+ */
+function applyAudioMode(mode) {
+  audioMode    = mode;
+  modeStereo   = api.modeStereo(mode)   === 1;
+  modeCallouts = api.modeCallouts(mode) === 1;
+  modeTone     = api.modeTone(mode)     === 1;
+
+  // If the graph already exists, re-lean the tone panner now. The gain itself is
+  // driven each frame and respects modeTone there, so nothing else to do here.
+  if (tonePanNode && audioCtx) {
+    tonePanNode.pan.setTargetAtTime(
+      modeStereo ? -api.stereoPan() : 0, audioCtx.currentTime, 0.02);
+  }
+}
+
+/* =============================================================================
+ *  Boot config menu (Calibrate button)
+ *
+ *  A faithful in-sim version of the firmware's hold-at-boot menu: choose an audio
+ *  mode and the start-altitude cap, then Commit. Commit applies the picks and
+ *  recalibrates the box to ground (0 ft), the sim analogue of the real menu
+ *  rebooting to a clean ground reference.
+ *
+ *  PENDING picks live in these two vars while the sheet is open so Cancel can
+ *  discard them without touching the live audio. Commit copies them across.
+ * ===========================================================================*/
+
+let pendingMode   = 1;   // mode highlighted in the open sheet (not yet applied)
+let pendingCapFt  = 0;   // start-alt cap highlighted in the open sheet
+
+/** Open the config sheet, seeding the controls from the current live config. */
+function openConfigMenu() {
+  pendingMode  = audioMode;
+  // Seed the cap from the live value, but never above this profile's ceiling.
+  const top = cfg.callouts[0];
+  pendingCapFt = isFinite(startAltFt) ? Math.min(startAltFt, top) : top;
+
+  buildModeList();
+  buildCapControl();
+
+  document.getElementById('configBackdrop').classList.add('open');
+}
+
+/** Close the sheet without applying anything. */
+function closeConfigMenu() {
+  document.getElementById('configBackdrop').classList.remove('open');
+}
+
+/** (Re)render the audio-mode option rows, marking the pending pick selected. */
+function buildModeList() {
+  const list = document.getElementById('modeList');
+  list.innerHTML = '';
+
+  const n = api.audioModeCount();
+  for (let m = 0; m < n; m++) {
+    const meta = AUDIO_MODE_META[m] ?? { title: `Mode ${m}`, desc: '' };
+
+    const row = document.createElement('div');
+    row.className = 'mode-opt' + (m === pendingMode ? ' sel' : '');
+    row.innerHTML =
+      `<div class="mo-check"></div>` +
+      `<div class="mo-text"><div class="mo-title">${meta.title}</div>` +
+      `<div class="mo-desc">${meta.desc}</div></div>`;
+
+    // Selecting a mode updates the pending pick and re-skins the rows. The cap
+    // control disables itself when the chosen mode plays no callouts (tone-only),
+    // since a callout ceiling is meaningless with the voice muted.
+    row.addEventListener('click', () => {
+      pendingMode = m;
+      buildModeList();
+      refreshCapEnabled();
+    });
+
+    list.appendChild(row);
+  }
+  refreshCapEnabled();
+}
+
+/** Build the start-alt range against the active profile's callout ladder. */
+function buildCapControl() {
+  const range = document.getElementById('capRange');
+  const ladder = cfg.callouts;                 // descending, e.g. [200,...,10]
+  const top = ladder[0];
+
+  // The slider walks discrete callout heights (ascending), so every stop is a
+  // real ceiling. We store the chosen FT, not the index, to stay ladder-agnostic.
+  const asc = [...ladder].sort((a, b) => a - b);
+  range.min = 0;
+  range.max = asc.length - 1;
+  range.step = 1;
+
+  // Find the slider index whose height is the pending cap (default = top).
+  let idx = asc.indexOf(pendingCapFt);
+  if (idx < 0) idx = asc.length - 1;           // fall back to the top callout
+  range.value = idx;
+
+  // Keep the ascending ladder around for the input handler.
+  range._ascLadder = asc;
+  updateCapLabel(asc[idx]);
+
+  range.oninput = () => {
+    const ft = range._ascLadder[parseInt(range.value, 10)];
+    pendingCapFt = ft;
+    updateCapLabel(ft);
+  };
+
+  refreshCapEnabled();
+}
+
+/** Show the cap value, flagging "no cap" when it sits at the profile top. */
+function updateCapLabel(ft) {
+  const top = cfg.callouts[0];
+  const el = document.getElementById('capVal');
+  el.textContent = ft >= top ? `${ft} ft · all` : `${ft} ft`;
+}
+
+/** Grey out the cap when the pending mode mutes callouts (cap is moot then). */
+function refreshCapEnabled() {
+  const capRow = document.getElementById('capRow');
+  const calloutsOn = api.modeCallouts(pendingMode) === 1;
+  capRow.classList.toggle('disabled', !calloutsOn);
+}
+
+/**
+ * Apply the pending picks and recalibrate to ground. This is the sim analogue of
+ * the firmware committing the menu and rebooting: the audio mode + cap take
+ * effect, the state machine restarts cleanly on the ground, and the aircraft
+ * snaps to 0 ft so the box is "zeroed" for the next approach.
+ */
+function commitConfigMenu() {
+  applyAudioMode(pendingMode);
+  startAltFt = pendingCapFt;
+
+  calibrateToGround();          // zero the box (shared with the Calibrate path)
+  closeConfigMenu();
+}
+
+/**
+ * Recalibrate the box to ground: park at 0 ft, restart the state machine clean,
+ * snap the glyph (no glide), clear the last-callout readout, and re-arm the flare
+ * fade. Used by Commit and reusable elsewhere.
+ */
+function calibrateToGround() {
+  targetAgl  = 0;
+  displayAgl = 0;               // snap the glyph instantly — this is a zeroing
+  api.init(0 /* ST_GROUND */);
+  lastFiredFt = null;
+  flareFade = 1;
 }
 
 /* =============================================================================
@@ -174,7 +396,14 @@ function setupAudioGraph() {
   toneGainNode = audioCtx.createGain();
   toneGainNode.gain.value = 0;       // start silent
 
-  osc.connect(toneGainNode).connect(audioCtx.destination);
+  // Stereo lean for the tone. The firmware pans the TONE to the LEFT by
+  // STEREO_PAN in STEREO_BOTH and centres it in every mono mode; a StereoPanner
+  // reproduces that. pan = -STEREO_PAN (left) when stereo, 0 (centre) otherwise.
+  tonePanNode = audioCtx.createStereoPanner();
+  tonePanNode.pan.value = modeStereo ? -api.stereoPan() : 0;
+
+  // osc -> gain -> pan -> out. Inserting the panner is harmless in mono (pan 0).
+  osc.connect(toneGainNode).connect(tonePanNode).connect(audioCtx.destination);
   osc.start();
 }
 
@@ -199,9 +428,18 @@ async function loadCallouts() {
 function playCallout(ft) {
   const buf = calloutBuffers.get(ft);
   if (!buf || !audioCtx) return;
+
+  // Callouts are gated by the configured audio mode: MONO_TONE silences voice.
+  if (!modeCallouts) return;
+
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
-  src.connect(audioCtx.destination);
+
+  // Voice leans RIGHT in stereo (mirror of the tone's left lean); centred in mono.
+  const pan = audioCtx.createStereoPanner();
+  pan.pan.value = modeStereo ? +api.stereoPan() : 0;
+
+  src.connect(pan).connect(audioCtx.destination);
   src.start();
 }
 
@@ -242,18 +480,38 @@ function frame(ts) {
   const pollMs   = api.pollMs();
 
   // --- Audio: callout + tone ------------------------------------------------
-  if (firedFt >= 0) {
+  // Suppress any callout ABOVE the configured start-altitude cap, exactly like
+  // app_main.c (the tone is unaffected). With the cap at the profile top this
+  // never suppresses. The readout still reflects the last AUDIBLE callout only.
+  if (firedFt >= 0 && firedFt <= startAltFt) {
     lastFiredFt = firedFt;
     if (audioUnlocked) playCallout(firedFt);
   }
 
+  // --- Flare fade: mirror audio.c's s_flare_fade ----------------------------
+  // Below flareFadeFt the tone fades OUT (target 0) over flareFadeOutMs; at/above
+  // it restores (target 1) over the quick flareFadeInMs. We slew per frame by
+  // dt/rampSeconds, the frame-stepped equivalent of the firmware's per-sample
+  // slew, so a bounce back above the threshold reverses the envelope at once.
+  // When the tone is off entirely (climbed away) we hold it re-armed at full,
+  // matching the firmware re-arming s_flare_fade on light-sleep suspend.
+  const fadeTarget = (toneOn && toneAgl < cfg.flareFadeFt) ? 0 : 1;
+  const fadeMs     = fadeTarget < flareFade ? cfg.flareFadeOutMs
+                                            : cfg.flareFadeInMs;
+  const fadeStep   = fadeMs > 0 ? dt / (fadeMs / 1000) : 1;
+  flareFade += clamp(fadeTarget - flareFade, -fadeStep, fadeStep);
+
   if (audioUnlocked) {
     const now = audioCtx.currentTime;
-    if (toneOn) {
+    // The tone only sounds when the configured mode enables it (MONO_CALLOUTS
+    // silences it entirely). Gate here so the scheduled gain never reaches the
+    // node in a tone-disabled mode, mirroring audio.c's tone_enabled flag.
+    if (toneOn && modeTone) {
       // Drive the oscillator from the SAME math the firmware uses. setTargetAtTime
       // gives a short, click-free glide analogous to the raised-cosine envelope.
+      // The flare fade multiplies the scheduled gain, exactly as in audio.c.
       osc.frequency.setTargetAtTime(api.pitchHz(toneAgl), now, 0.01);
-      toneGainNode.gain.setTargetAtTime(api.toneGain(toneAgl), now, 0.01);
+      toneGainNode.gain.setTargetAtTime(api.toneGain(toneAgl) * flareFade, now, 0.01);
     } else {
       // Ramp to silence rather than cutting — no click.
       toneGainNode.gain.setTargetAtTime(0, now, 0.03);
@@ -298,14 +556,32 @@ function updateTelemetry(st, toneAgl, toneOn, pollMs) {
   if (toneOn) {
     document.getElementById('hzVal').textContent = `${Math.round(api.pitchHz(toneAgl))} Hz`;
     document.getElementById('dbVal').textContent = `${api.toneDb(toneAgl).toFixed(1)} dB`;
+
+    // Equal-loudness (Fletcher-Munson) correction, shown SEPARATELY from the
+    // scheduled level so you can watch the ISO 226 flattening track the pitch
+    // sweep. Force an explicit sign: + boosts (ear less sensitive here), - cuts
+    // (ear more sensitive). The signed default for non-negative is '+'.
+    const eql = api.eqlDb(toneAgl);
+    const sign = eql >= 0 ? '+' : '−';        // U+2212 minus for crisp typography
+    document.getElementById('eqlVal').textContent = `${sign}${Math.abs(eql).toFixed(2)} dB`;
   } else {
     document.getElementById('hzVal').textContent = '— Hz';
     document.getElementById('dbVal').textContent = '— dB';
+    document.getElementById('eqlVal').textContent = '— dB';
   }
 
   document.getElementById('pollVal').textContent = `${pollMs} ms`;
   document.getElementById('calloutVal').textContent =
     lastFiredFt == null ? '—' : `${Math.round(lastFiredFt)} ft`;
+
+  // Reflect the live boot-config picks so a Commit visibly changes the panel.
+  const modeMeta = AUDIO_MODE_META[audioMode];
+  document.getElementById('modeVal').textContent = modeMeta ? modeMeta.title : `mode ${audioMode}`;
+
+  // Cap: "all" when it sits at (or above) the profile top, else the height.
+  const capTop = cfg.callouts[0];
+  document.getElementById('capValTelem').textContent =
+    (!isFinite(startAltFt) || startAltFt >= capTop) ? 'all' : `${Math.round(startAltFt)} ft`;
 }
 
 /* =============================================================================
@@ -504,6 +780,7 @@ function setupDom() {
     api.setProfile(profileIdx);
     api.init(0 /* ST_GROUND */);   // clean restart under the new ladder
     lastFiredFt = null;
+    flareFade = 1;                 // re-arm the flare fade for the fresh run
     readConfig();
   });
 
@@ -511,12 +788,28 @@ function setupDom() {
     targetAgl = 0;
     api.init(0 /* ST_GROUND */);
     lastFiredFt = null;
+    flareFade = 1;                 // re-arm the flare fade
   });
 
   document.getElementById('cruiseBtn').addEventListener('click', () => {
     // Snap the aircraft up to just above cruise so you can demo a full approach.
     targetAgl = cfg.cruiseFt + 20;
     displayAgl = targetAgl;        // jump the glyph too, no long glide
+  });
+
+  // --- Config menu (Calibrate) --------------------------------------------
+  document.getElementById('calibrateBtn').addEventListener('click', openConfigMenu);
+  document.getElementById('cfgCancelBtn').addEventListener('click', closeConfigMenu);
+  document.getElementById('cfgCommitBtn').addEventListener('click', commitConfigMenu);
+
+  // Click the dimmed backdrop (but not the sheet itself) to dismiss.
+  document.getElementById('configBackdrop').addEventListener('click', (e) => {
+    if (e.target.id === 'configBackdrop') closeConfigMenu();
+  });
+
+  // Esc closes the sheet too, matching native sheet behaviour.
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeConfigMenu();
   });
 }
 

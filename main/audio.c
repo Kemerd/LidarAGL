@@ -69,6 +69,12 @@ static float s_tone_agl_smooth = TONE_START_FT;   /* drives pitch + level       
 static float s_gain_cur        = 0.0f;            /* current linear tone gain    */
 static float s_duck_cur        = 1.0f;            /* current duck multiplier     */
 
+/*  Flare fade multiplier: 1.0 = tone fully present, 0.0 = faded out under the
+ *  flare. It slews toward 0 (slowly) below FLARE_FADE_FT and back toward 1
+ *  (quickly) above it. Multiplied into the tone gain so a re-cross part-way
+ *  through the fade reverses smoothly from wherever the envelope sits.          */
+static float s_flare_fade      = 1.0f;            /* current flare-fade level    */
+
 /* ---- Callout playback state ---------------------------------------------- */
 
 /*  The clip currently playing (NULL = none). PCM is s16le in flash.            */
@@ -82,6 +88,13 @@ static size_t         s_clip_pos  = 0;
 static float s_gain_step = 0.0f;
 /*  Max smoothed-AGL change per sample for the pitch (slower => more stable).   */
 static float s_agl_step  = 0.0f;
+
+/*  Flare-fade slew steps (per sample): a full 1->0 swing takes FLARE_FADE_OUT_MS
+ *  on the way DOWN, and FLARE_FADE_IN_MS on the way UP. The asymmetry is what
+ *  makes "leave the flare -> tone snaps back" feel instant while "enter the
+ *  flare -> tone eases out" stays gentle.                                       */
+static float s_fade_out_step = 0.0f;   /* toward silence (slow) */
+static float s_fade_in_step  = 0.0f;   /* toward full   (fast) */
 
 /* ---- Stereo pan weights (compile-time constants) ------------------------- */
 /*  Equal-power pan used when s_cfg.stereo is set: a stream's energy is split so
@@ -140,6 +153,14 @@ void audio_init(const audio_config_t *cfg)
     /* Allow the smoothed AGL to traverse the full 100 ft band in ~250 ms. */
     float agl_ramp_samples = 0.25f * (float)SAMPLE_RATE;
     s_agl_step = TONE_START_FT / agl_ramp_samples;
+
+    /* Flare-fade steps: a full 0..1 swing covers the configured fade time. The
+     * out-step is the SLOW 3 s fade under the flare; the in-step is the QUICK
+     * restore when the aircraft climbs back through FLARE_FADE_FT.              */
+    float fade_out_samples = (FLARE_FADE_OUT_MS / 1000.0f) * (float)SAMPLE_RATE;
+    float fade_in_samples  = (FLARE_FADE_IN_MS  / 1000.0f) * (float)SAMPLE_RATE;
+    s_fade_out_step = (fade_out_samples > 0) ? (1.0f / fade_out_samples) : 1.0f;
+    s_fade_in_step  = (fade_in_samples  > 0) ? (1.0f / fade_in_samples)  : 1.0f;
 
     /* --- I2S standard mode, TX only, 16-bit. The hardware ALWAYS runs stereo
      * (interleaved L/R) so the unit works however the panel is wired; whether we
@@ -258,6 +279,10 @@ void audio_suspend(void)
         /* Reset the tone gain so it ramps cleanly back from silence on resume. */
         s_gain_cur = 0.0f;
         s_phase    = 0.0f;
+        /* Re-arm the flare fade: suspend only happens in GROUND/CRUISE (well
+         * above FLARE_FADE_FT), so the next active descent must start with the
+         * tone fully present, not stuck faded-out from a previous landing.      */
+        s_flare_fade = 1.0f;
     }
 }
 
@@ -354,6 +379,15 @@ void audio_task(void *arg)
                             ? db_to_gain(-VOICE_DUCK_DB)
                             : 1.0f;
 
+        /* Flare-fade target + the step to use this frame. Below FLARE_FADE_FT we
+         * fade the tone OUT (target 0) using the SLOW out-step; at/above it we
+         * restore (target 1) using the FAST in-step. Keyed off the live tone_agl
+         * the logic task publishes every tick, so a bounce back above 10 ft is
+         * picked up within one frame and reverses the envelope immediately.     */
+        float fade_target = (tone_agl < FLARE_FADE_FT) ? 0.0f : 1.0f;
+        float fade_step   = (fade_target < s_flare_fade) ? s_fade_out_step
+                                                         : s_fade_in_step;
+
         /* --- Render the frame sample-by-sample ----------------------------- */
         for (int i = 0; i < AUDIO_FRAME_LEN; ++i) {
             /* Slew the smoothed AGL toward the target so pitch glides. */
@@ -364,6 +398,12 @@ void audio_task(void *arg)
             s_gain_cur = slew_limit(s_gain_cur, target_gain, s_gain_step);
             s_duck_cur = slew_limit(s_duck_cur, duck_target, s_gain_step);
 
+            /* Slew the flare fade toward its target. Asymmetric step: slow out
+             * under the flare, fast in on a climb-back-up. The fade-out step is
+             * far smaller than the gain/duck steps so the tone eases away over
+             * the full 3 s rather than snapping with the level schedule.        */
+            s_flare_fade = slew_limit(s_flare_fade, fade_target, fade_step);
+
             float f = agl_to_pitch_hz(s_tone_agl_smooth);
 
             /* Equal-loudness correction: fold the ISO-226 flattening for THIS
@@ -372,7 +412,9 @@ void audio_task(void *arg)
              * cue stays in the PITCH; loudness holds steady through the flare.  */
             float eql_gain = db_to_gain(equal_loudness_db(f));
 
-            float tone = nco_sample(f) * s_gain_cur * s_duck_cur * eql_gain;
+            /* s_flare_fade silences the tone under the flare (see config.h). */
+            float tone = nco_sample(f) * s_gain_cur * s_duck_cur * eql_gain
+                         * s_flare_fade;
 
             /* Mix the voice clip (already at a comfortable level) if playing. */
             float voice = 0.0f;

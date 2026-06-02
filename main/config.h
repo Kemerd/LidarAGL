@@ -148,7 +148,7 @@
  *  500–3000 Hz band: cuts cockpit noise, survives ANR headsets, and is where
  *  the ear is most sensitive.                                                   */
 #define F_AT_TONE_START   600.0f      /* Hz at 100 ft  (low / quiet)             */
-#define F_AT_GROUND       1800.0f     /* Hz near 0 ft  (high) — ASCENDING        */
+#define F_AT_GROUND       1400.0f     /* Hz near 0 ft  (high) — ASCENDING        */
 #define F_CLAMP_LO        500.0f      /* never below this                        */
 #define F_CLAMP_HI        3000.0f     /* never above this                        */
 #define TONE_LOG_SWEEP    1           /* 1 = musical log glide, 0 = linear Hz     */
@@ -161,6 +161,21 @@
 #define TONE_FULL_DB      -6.0f       /* full presence at/below 50 ft            */
 #define VOICE_DUCK_DB     4.0f        /* duck the tone this much under a callout  */
 #define GAIN_RAMP_MS      40          /* raised-cosine envelope time (>=30–50ms)  */
+
+/* ---- Audio: flare fade-out (distraction guard under the flare) ----------- */
+/*  Once the aircraft settles below FLARE_FADE_FT the presence tone is no longer
+ *  giving the pilot useful new information (the last callout — "ten" — has
+ *  already fired) and would only distract during the flare. So we FADE THE TONE
+ *  OUT over FLARE_FADE_OUT_MS to silence. Climbing back above FLARE_FADE_FT
+ *  (a bounce or go-around) RE-ARMS the tone by fading it quickly back UP over
+ *  FLARE_FADE_IN_MS, after which the slow fade-out re-starts if we sink again.
+ *  The asymmetry — slow out, fast in — is deliberate: leaving the flare must
+ *  restore the cue promptly, while entering it must be gentle and unobtrusive.
+ *  Implemented as a slew-limited multiplier in audio.c, so a re-cross part-way
+ *  through the fade simply reverses from wherever the envelope currently sits.  */
+#define FLARE_FADE_FT       10.0f     /* below this the tone fades out           */
+#define FLARE_FADE_OUT_MS   3000      /* full->silent fade-out time              */
+#define FLARE_FADE_IN_MS    100       /* silent->full quick restore on re-cross  */
 
 /* ---- Equal-loudness (ISO 226) correction --------------------------------- */
 /*  The tone's pitch ascends as the ground nears. The ear is more sensitive to

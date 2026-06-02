@@ -71,7 +71,7 @@ With **SF30/C** selected, drag the aircraft from the ground up past the dashed
 - **Descent ladder** — on the way down you hear `200, 100, 50, 40, 30, 20, 10`,
   each once, in order.
 - **Presence tone** — silent above 100 ft; below it the tone fades in and its
-  **pitch rises** toward the ground (600 → 1800 Hz), louder by 50 ft.
+  **pitch rises** toward the ground (600 → 1400 Hz), louder by 50 ft.
 - **Hysteresis** — jitter around 50 ft after it fires and it won't re-fire; you
   must climb ~20 ft above it to re-arm (go-around).
 - **Profile switch** — pick **SF30/D** and the tape gains 500/400/300 ticks, the

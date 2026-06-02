@@ -187,6 +187,20 @@ EMSCRIPTEN_KEEPALIVE
 float sim_tone_db(float agl_ft) { return agl_to_tone_db(agl_ft); }
 
 /**
+ * @brief Equal-loudness (Fletcher-Munson) correction in dB at this AGL's pitch.
+ *
+ * @details Readout-only surface of the SAME ISO 226 term that sim_tone_gain()
+ *          folds into the final gain. Resolves the AGL to its current sweep pitch
+ *          first, then returns the dB the firmware ADDS at that frequency so equal
+ *          scheduled level sounds equally loud (negative = ear more sensitive, so
+ *          attenuate; positive = less sensitive, so boost). Lets the UI display
+ *          the flattening separately from the scheduled level. Returns 0 when
+ *          EQUAL_LOUDNESS_CORRECTION is disabled in config.h.
+ */
+EMSCRIPTEN_KEEPALIVE
+float sim_eql_db(float agl_ft) { return equal_loudness_db(agl_to_pitch_hz(agl_ft)); }
+
+/**
  * @brief Final linear gain for the tone at a given AGL.
  *
  * @details Combines the scheduled dB level with the equal-loudness correction at
@@ -227,3 +241,93 @@ float sim_flare_hi_ft(void) { return FLARE_BAND_HI; }
 /** @brief Bottom of the flare full-attention band (ft). */
 EMSCRIPTEN_KEEPALIVE
 float sim_flare_lo_ft(void) { return FLARE_BAND_LO; }
+
+/* ---- Flare fade-out (distraction guard) — see audio.c render loop --------- */
+/*  The firmware's audio_task fades the presence tone out below FLARE_FADE_FT and
+ *  quickly back in on a climb-back-up. The emulator's WebAudio path re-creates
+ *  that envelope in JS; these getters hand it the SAME constants so the timing
+ *  matches the hardware exactly and no magic number is duplicated in sim.js.    */
+
+/** @brief AGL (ft) below which the presence tone fades out under the flare. */
+EMSCRIPTEN_KEEPALIVE
+float sim_flare_fade_ft(void) { return FLARE_FADE_FT; }
+
+/** @brief Slow fade-OUT time (ms): tone full -> silent under the flare. */
+EMSCRIPTEN_KEEPALIVE
+float sim_flare_fade_out_ms(void) { return FLARE_FADE_OUT_MS; }
+
+/** @brief Quick fade-IN time (ms): tone silent -> full on a climb-back-up. */
+EMSCRIPTEN_KEEPALIVE
+float sim_flare_fade_in_ms(void) { return FLARE_FADE_IN_MS; }
+
+/* ===========================================================================
+ *  Boot config menu — audio mode + start-altitude cap.
+ *
+ *  The real firmware enters a hold-at-boot menu (app_main.c run_config_menu) that
+ *  selects one of AUDIO_MODE_* and a start-altitude cap, persists them to NVS, and
+ *  reboots. The emulator can't run audio.c (it pulls in I2S/ESP-IDF hardware and
+ *  is therefore NOT in the PURE WASM build), so we surface the SAME decision data
+ *  here from config.h's pure region and re-encode audio_config_from_mode()'s
+ *  truth table 1:1. JS reads these to drive its WebAudio graph, so the sim plays
+ *  exactly what the configured firmware would: tone-only, callouts-only, mono, or
+ *  gently panned stereo.
+ *
+ *  IMPORTANT: this switch MUST stay in lockstep with audio.c::audio_config_from_mode.
+ *  If a mode's flags change there, change them here too.
+ * ------------------------------------------------------------------------- */
+
+/** @brief Number of selectable audio modes (AUDIO_MODE_COUNT). */
+EMSCRIPTEN_KEEPALIVE
+int sim_audio_mode_count(void) { return AUDIO_MODE_COUNT; }
+
+/** @brief Default audio mode applied after a config wipe (DEFAULT_AUDIO_MODE). */
+EMSCRIPTEN_KEEPALIVE
+int sim_default_audio_mode(void) { return DEFAULT_AUDIO_MODE; }
+
+/** @brief Equal-power stereo lean fraction used in STEREO_BOTH (STEREO_PAN). */
+EMSCRIPTEN_KEEPALIVE
+float sim_stereo_pan(void) { return STEREO_PAN; }
+
+/**
+ * @brief 1 if @p mode pans the two streams apart (stereo), 0 if it duplicates L=R.
+ * @details Mirrors audio_config_from_mode().stereo for the given AUDIO_MODE_*.
+ */
+EMSCRIPTEN_KEEPALIVE
+int sim_mode_stereo(int mode)
+{
+    return (mode == AUDIO_MODE_STEREO_BOTH) ? 1 : 0;
+}
+
+/**
+ * @brief 1 if @p mode plays the spoken callouts, else 0.
+ * @details Mirrors audio_config_from_mode().callouts_enabled. Out-of-range falls
+ *          back to the default mode's flag (never silences the box on bad input).
+ */
+EMSCRIPTEN_KEEPALIVE
+int sim_mode_callouts(int mode)
+{
+    switch (mode) {
+        case AUDIO_MODE_MONO_BOTH:     return 1;
+        case AUDIO_MODE_STEREO_BOTH:   return 1;
+        case AUDIO_MODE_MONO_CALLOUTS: return 1;
+        case AUDIO_MODE_MONO_TONE:     return 0;
+        default:                       return sim_mode_callouts(DEFAULT_AUDIO_MODE);
+    }
+}
+
+/**
+ * @brief 1 if @p mode sounds the presence tone, else 0.
+ * @details Mirrors audio_config_from_mode().tone_enabled. Out-of-range falls back
+ *          to the default mode's flag.
+ */
+EMSCRIPTEN_KEEPALIVE
+int sim_mode_tone(int mode)
+{
+    switch (mode) {
+        case AUDIO_MODE_MONO_BOTH:     return 1;
+        case AUDIO_MODE_STEREO_BOTH:   return 1;
+        case AUDIO_MODE_MONO_CALLOUTS: return 0;
+        case AUDIO_MODE_MONO_TONE:     return 1;
+        default:                       return sim_mode_tone(DEFAULT_AUDIO_MODE);
+    }
+}

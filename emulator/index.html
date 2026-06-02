@@ -182,6 +182,87 @@
       color: var(--text-dim); font-size: 15px; letter-spacing: .01em;
     }
     .loading.hidden { display: none; }
+
+    /* ---- Boot config sheet --------------------------------------------------
+       A modal that mirrors the firmware's hold-at-boot menu: pick an audio mode
+       and the start-altitude cap, then Commit (which zeroes the box to ground,
+       exactly as the real menu reboots to a clean ground reference). Styled like
+       an iOS sheet: dimmed backdrop, frosted card, spring-in entrance.          */
+    #configBackdrop {
+      position: fixed; inset: 0; z-index: 40;
+      display: grid; place-items: center;
+      padding: 20px;
+      background: rgba(4, 5, 8, .55);
+      -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+      opacity: 0; pointer-events: none;
+      transition: opacity .28s ease;
+    }
+    #configBackdrop.open { opacity: 1; pointer-events: auto; }
+
+    .config-sheet {
+      width: min(440px, 100%);
+      background: var(--surface);
+      border: 1px solid var(--hairline);
+      border-radius: 22px;                 /* slightly rounder than panels — sheet feel */
+      box-shadow: var(--shadow);
+      padding: 22px 22px 18px;
+      /* Spring-in: start small + nudged down, settle with an overshoot curve.   */
+      transform: scale(.92) translateY(12px);
+      opacity: 0;
+      transition: transform .42s cubic-bezier(.34, 1.56, .64, 1), opacity .3s ease;
+    }
+    #configBackdrop.open .config-sheet { transform: scale(1) translateY(0); opacity: 1; }
+
+    .config-sheet h2 {
+      margin: 0 0 4px; font-size: 19px; font-weight: 700; letter-spacing: -0.02em;
+    }
+    .config-sheet .sheet-sub {
+      margin: 0 0 18px; color: var(--text-dim); font-size: 13px; line-height: 1.5;
+    }
+    .config-group-label {
+      font-size: 12px; font-weight: 600; letter-spacing: .02em;
+      text-transform: uppercase; color: var(--text-dim);
+      margin: 0 0 8px;
+    }
+
+    /* Segmented mode list — each row is a tappable option with a live check.    */
+    .mode-list { display: grid; gap: 8px; margin-bottom: 20px; }
+    .mode-opt {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 14px; border-radius: 13px;
+      background: var(--surface-2); border: 1px solid var(--hairline);
+      cursor: pointer; user-select: none;
+      transition: border-color .18s ease, background .18s ease, transform .08s ease;
+    }
+    .mode-opt:hover { border-color: #3a4150; }
+    .mode-opt:active { transform: scale(.99); }
+    .mode-opt.sel { border-color: var(--accent); background: rgba(10,132,255,.12); }
+    .mode-opt .mo-text { flex: 1; min-width: 0; }
+    .mode-opt .mo-title { font-size: 14px; font-weight: 600; }
+    .mode-opt .mo-desc  { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+    /* The check disc fills in only on the selected row, with a tiny pop.        */
+    .mode-opt .mo-check {
+      width: 20px; height: 20px; border-radius: 50%; flex: 0 0 auto;
+      border: 2px solid var(--hairline);
+      display: grid; place-items: center;
+      transition: border-color .18s ease, background .18s ease;
+    }
+    .mode-opt.sel .mo-check { border-color: var(--accent); background: var(--accent); }
+    .mode-opt .mo-check::after {
+      content: ''; width: 8px; height: 8px; border-radius: 50%;
+      background: white; transform: scale(0); transition: transform .2s cubic-bezier(.34,1.56,.64,1);
+    }
+    .mode-opt.sel .mo-check::after { transform: scale(1); }
+
+    /* Start-altitude cap — a labelled range that snaps to the live ladder.      */
+    .cap-row { display: grid; gap: 8px; margin-bottom: 22px; }
+    .cap-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .cap-head .cap-val { font-size: 15px; font-weight: 700; color: var(--accent); }
+    .cap-row input[type=range] { width: 100%; accent-color: var(--accent); }
+    .cap-row.disabled { opacity: .45; pointer-events: none; }
+    .cap-hint { color: var(--text-dim); font-size: 11.5px; line-height: 1.45; }
+
+    .sheet-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   </style>
 </head>
 
@@ -221,8 +302,11 @@
             <div class="row"><span class="k">Tone</span><span class="v" id="toneVal">off</span></div>
             <div class="row"><span class="k">Tone pitch</span><span class="v" id="hzVal">— Hz</span></div>
             <div class="row"><span class="k">Tone level</span><span class="v" id="dbVal">— dB</span></div>
+            <div class="row"><span class="k">Equal-loudness</span><span class="v" id="eqlVal">— dB</span></div>
             <div class="row"><span class="k">Poll period</span><span class="v" id="pollVal">— ms</span></div>
             <div class="row"><span class="k">Last callout</span><span class="v" id="calloutVal">—</span></div>
+            <div class="row"><span class="k">Audio mode</span><span class="v" id="modeVal">—</span></div>
+            <div class="row"><span class="k">Callout cap</span><span class="v" id="capValTelem">—</span></div>
           </div>
         </div>
 
@@ -240,12 +324,51 @@
             <button class="btn secondary" id="cruiseBtn">Jump to cruise</button>
           </div>
 
+          <!-- Calibrate opens the boot config menu (audio mode + start-alt cap)
+               and, on commit, zeroes the box to ground — the sim equivalent of
+               the firmware's hold-at-boot calibration that reboots to 0 ft. -->
+          <button class="btn" id="calibrateBtn" style="margin-top:10px; width:100%;">
+            Calibrate · open config menu
+          </button>
+
           <p class="hint">
             Drag the aircraft on the tape (or use the slider that appears on the
             tape) to climb and descend. Callouts arm only after you climb through
             the dashed <b>ARM</b> line, then fire on the way <b>down</b>.
           </p>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Boot config menu (mirrors the firmware's hold-at-boot NVS menu). Opened by
+       the Calibrate button; commit zeroes the box to ground. Populated by sim.js. -->
+  <div id="configBackdrop">
+    <div class="config-sheet" role="dialog" aria-modal="true" aria-labelledby="cfgTitle">
+      <h2 id="cfgTitle">Config menu</h2>
+      <p class="sheet-sub">
+        The same options the box exposes when you hold the button at power-on.
+        Commit to apply and recalibrate to ground (0&nbsp;ft).
+      </p>
+
+      <p class="config-group-label">Audio mode</p>
+      <div class="mode-list" id="modeList"><!-- rows injected by sim.js --></div>
+
+      <div class="cap-row" id="capRow">
+        <div class="cap-head">
+          <span class="config-group-label" style="margin:0;">Start-altitude cap</span>
+          <span class="cap-val" id="capVal">—</span>
+        </div>
+        <input type="range" id="capRange" min="0" max="0" step="1" value="0" />
+        <p class="cap-hint">
+          Highest callout that will sound. Numbers above this are suppressed on the
+          way down (the presence tone is unaffected).
+        </p>
+      </div>
+
+      <div class="sheet-actions">
+        <button class="btn secondary" id="cfgCancelBtn">Cancel</button>
+        <button class="btn" id="cfgCommitBtn">Commit &amp; calibrate</button>
       </div>
     </div>
   </div>
