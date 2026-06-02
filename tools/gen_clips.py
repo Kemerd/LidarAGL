@@ -206,7 +206,7 @@ def write_chirp():
     samples += sine(880, 0.18, 0.8)    # high
     samples += [0] * int(0.04 * SAMPLE_RATE)
     samples += sine(440, 0.28, 0.8)    # low (falling = 'problem')
-    write_pcm("calib_error", samples)
+    write_pcm("calibration_error", samples)   # matches the firmware clip symbol
 
 
 def gen_placeholders():

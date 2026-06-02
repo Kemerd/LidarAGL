@@ -179,12 +179,15 @@
 #ifndef UNIT_TEST
 
 /* ---- GPIO pin map (defaults; see WIRING.md) ------------------------------ */
-/*  Avoid strapping pins (0, 45, 46) and the native-USB pins (19, 20) since the
- *  console uses USB-Serial-JTAG for logging.                                   */
+/*  Target board is a MINI ESP32-S3 that only breaks out GPIO 1..13 (plus 5V,
+ *  GND, 3V3 and the USB TX/RX), so every assignment below lives in 1..13.
+ *  Avoid strapping pins (0, 3, 45, 46) and the native-USB pins (19, 20) — the
+ *  console uses USB-Serial-JTAG for logging. GPIO 3 is skipped (strapping).     */
 
-/*  SF30 on UART1. (Sensor TX -> S3 RX, Sensor RX -> S3 TX.)                    */
-#define PIN_SF30C_RX      17          /* S3 UART RX  <- SF30 TX                  */
-#define PIN_SF30C_TX      18          /* S3 UART TX  -> SF30 RX                  */
+/*  SF30 on UART1. (Sensor TX -> S3 RX, Sensor RX -> S3 TX.) Pins 8/9 are clean
+ *  low GPIOs on the mini board (not strapping, not USB).                        */
+#define PIN_SF30C_RX      8           /* S3 UART RX  <- SF30 TX                  */
+#define PIN_SF30C_TX      9           /* S3 UART TX  -> SF30 RX                  */
 #define SF30C_UART_NUM    UART_NUM_1
 
 /*  PCM5102A on I2S. SCK is tied to GND on the board (internal PLL) so the S3
@@ -193,10 +196,11 @@
 #define PIN_I2S_LRCK      6           /* word select / LRCK                     */
 #define PIN_I2S_DIN       7           /* data out (S3 -> DAC DIN)               */
 
-/*  Reset button: momentary to GND, internal pull-up. Wipes the NVS ground
- *  buffer and reboots (install / reinstall). Active-low.                       */
-#define PIN_RESET_BTN     4
-#define RESET_BTN_ACTIVE_LEVEL 0      /* pressed == logic low                   */
+/*  Config button: momentary to GND, internal pull-up. Held at power-on it opens
+ *  the boot config menu (wipes the NVS ground buffer + saved audio config, then
+ *  tap/double-tap to pick the audio mode + callout start altitude). Active-low. */
+#define PIN_CONFIG_BTN    4
+#define CONFIG_BTN_ACTIVE_LEVEL 0     /* pressed == logic low                   */
 
 /* ---- UART driver buffer sizing ------------------------------------------ */
 #define SF30C_UART_RX_BUF 1024

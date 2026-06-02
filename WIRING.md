@@ -11,9 +11,8 @@ there if your devkit conflicts, don't hand-edit the wiring assumptions in code.
 ## 1. Block diagram
 
 ```
-  SF30/C or SF30/D ──UART (3.3V TTL)──► ESP32-S3 ──I2S──► PCM5102A ──► level trim
+  SF30/C or SF30/D ──UART (3.3V TTL)──► ESP32-S3 ──I2S──► PCM5102A ── L / R / LO ──►
    (belly lidar)                         (MCU)             (DAC)            │
-                                                                      L / R / LO
                                                                            │
                                                                            ▼
                                                             GMA 245 audio panel
@@ -34,8 +33,8 @@ hear supply-correlated whine, add a small inline aux ground-loop isolator on L/R
 
 | SF30 pin | → | ESP32-S3 | config.h |
 |----------|---|----------|----------|
-| SF30 **TX** | → | GPIO **17** (UART RX) | `PIN_SF30C_RX` |
-| SF30 **RX** | → | GPIO **18** (UART TX) | `PIN_SF30C_TX` |
+| SF30 **TX** | → | GPIO **8** (UART RX) | `PIN_SF30C_RX` |
+| SF30 **RX** | → | GPIO **9** (UART TX) | `PIN_SF30C_TX` |
 | SF30 **GND** | → | common GND | — |
 | SF30 **V+** | → | shared clean 5 V rail | — |
 
@@ -68,28 +67,29 @@ hear supply-correlated whine, add a small inline aux ground-loop isolator on L/R
 | other side | → | GND | — |
 
 > Active-low with the S3's internal pull-up (no external resistor needed).
-> Held at power-on → the box enters the **boot config menu**: it wipes the stored
-> ground readings *and* the saved audio config, then you tap to pick an audio mode
-> (mono/stereo, callouts/tone). It commits ~5 s after your last tap and reboots.
-> Use it after an install / re-install so the ground reference re-learns fresh.
-> In the aircraft the button is **cockpit-mounted** on harness conductor 6.
+> Held at power-on → the box enters the **config menu**: it wipes the stored ground
+> readings *and* the saved audio config, then a single **tap** cycles the option and
+> a **double-tap** (or ~5 s of silence) confirms — first the audio mode (mono/stereo,
+> callouts/tone), then the callout start altitude. It reboots on commit. Use it after
+> an install / re-install so the ground reference re-learns fresh. In the aircraft the
+> button is **cockpit-mounted** on harness conductor 6.
 
 ### Analog output → GMA 245 (stereo aux)
 
 ```
-PCM5102A LOUT ─► trim pot ─┐
-PCM5102A ROUT ─► trim pot ─┼─► GMA 245 aux  (L, R, audio-LO ref)
-              panel LO  ◄──┘
+PCM5102A LOUT ─┐
+PCM5102A ROUT ─┼─► GMA 245 aux  (L, R, audio-LO ref)
+   panel LO  ◄──┘
 ```
 
+- **Line level, no trim pot** — the DAC output goes straight to the GMA 245 aux,
+  which sets the volume. The firmware only shapes the perceptual dB ramp.
 - **Stereo by default** — firmware emits L/R and gently pans the streams apart
-  (voice right, tone left). Mono/stereo is a **runtime** choice from the boot
-  config menu (hold the button at power-on); the I2S hardware always drives both
+  (voice right, tone left). Mono/stereo is a **runtime** choice from the config
+  menu (hold the button at power-on); the I2S hardware always drives both
   channels, so mono just duplicates the signal to L and R (safe if wired mono).
 - Land L and R against the GMA's **audio LO** reference (not power ground) — that
   isolation is what replaces the old transformer.
-- Set absolute loudness with the **trim pot** — the firmware only shapes the
-  perceptual ramp (the tone fades in by dB; the pot sets the master level).
 
 ### Cockpit harness (6-conductor, shielded)
 
@@ -97,14 +97,14 @@ PCM5102A ROUT ─► trim pot ─┼─► GMA 245 aux  (L, R, audio-LO ref)
 |---|-----------|-----------|
 | 1 | **+** (5 V) | clean 5 V rail → box |
 | 2 | **−** (GND) | power ground → box |
-| 3 | **L** | DAC LOUT (via trim) → GMA 245 aux L |
-| 4 | **R** | DAC ROUT (via trim) → GMA 245 aux R |
+| 3 | **L** | DAC LOUT → GMA 245 aux L (line level) |
+| 4 | **R** | DAC ROUT → GMA 245 aux R (line level) |
 | 5 | **LO** | GMA 245 audio-LO ref ← box audio return |
 | 6 | **BTN** | cockpit config button → GPIO 4 |
 
 > Bond the cable **shield at one end only — the panel side** — so it drains noise
-> without forming a ground loop. The button on conductor 6 is the same reset /
-> re-learn button, just relocated to the cockpit (active-low to box GND).
+> without forming a ground loop. The button on conductor 6 is the config button,
+> just relocated to the cockpit (active-low to box GND).
 
 ---
 
@@ -122,7 +122,9 @@ PCM5102A ROUT ─► trim pot ─┼─► GMA 245 aux  (L, R, audio-LO ref)
 
 ## 4. GPIO cautions
 
-- Avoid the strapping pins (**0, 45, 46**) and the native-USB pins (**19, 20**) —
+- **Mini ESP32-S3 board:** only GPIO **1–13** are broken out (plus 5V/GND/3V3 and
+  USB TX/RX). All defaults fit: UART **8/9**, I2S **5/6/7**, config button **4**.
+- Avoid the strapping pins (**0, 3, 45, 46**) and the native-USB pins (**19, 20**) —
   logging uses the USB-Serial-JTAG console.
 - Any other free GPIOs are fine for I2S/UART/button; keep the defaults above
   unless they conflict on your specific devkit, and change them in `config.h`.

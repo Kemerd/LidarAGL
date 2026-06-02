@@ -75,6 +75,13 @@ const clip_t *callout_clip(callout_id_t id);
 const clip_t *callout_chirp(void);
 
 /**
+ * @brief The spoken calibration-error instruction ("please reset unit on the
+ *        ground"), played right after the chirp on a calibration failure.
+ * @return Pointer to the descriptor; never NULL itself (may be an absent clip).
+ */
+const clip_t *callout_calib_voice(void);
+
+/**
  * @brief The "config mode, memory cleared" prompt played when config mode opens.
  * @return Pointer to the descriptor; never NULL itself (may be an absent clip).
  */

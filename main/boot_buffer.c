@@ -39,7 +39,7 @@ void boot_buffer_init(void)
 
     /* Configure the reset button: input with internal pull-up, active low. */
     gpio_config_t io = {
-        .pin_bit_mask = (1ULL << PIN_RESET_BTN),
+        .pin_bit_mask = (1ULL << PIN_CONFIG_BTN),
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -56,7 +56,7 @@ bool boot_buffer_reset_pressed(void)
      * glitch on the line can't trigger a wipe.                                */
     const int SAMPLES = 5;
     for (int i = 0; i < SAMPLES; ++i) {
-        if (gpio_get_level(PIN_RESET_BTN) != RESET_BTN_ACTIVE_LEVEL) {
+        if (gpio_get_level(PIN_CONFIG_BTN) != CONFIG_BTN_ACTIVE_LEVEL) {
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -68,11 +68,11 @@ bool boot_buffer_button_down(void)
 {
     /* Two quick spaced samples — enough to reject a single-sample glitch while
      * keeping the config-menu poll loop snappy for tap detection.             */
-    if (gpio_get_level(PIN_RESET_BTN) != RESET_BTN_ACTIVE_LEVEL) {
+    if (gpio_get_level(PIN_CONFIG_BTN) != CONFIG_BTN_ACTIVE_LEVEL) {
         return false;
     }
     vTaskDelay(pdMS_TO_TICKS(3));
-    return gpio_get_level(PIN_RESET_BTN) == RESET_BTN_ACTIVE_LEVEL;
+    return gpio_get_level(PIN_CONFIG_BTN) == CONFIG_BTN_ACTIVE_LEVEL;
 }
 
 void boot_buffer_wipe_ground(void)

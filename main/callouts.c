@@ -39,7 +39,10 @@ DECLARE_CLIP(_binary_two_hundred_pcm);
 DECLARE_CLIP(_binary_three_hundred_pcm);
 DECLARE_CLIP(_binary_four_hundred_pcm);
 DECLARE_CLIP(_binary_five_hundred_pcm);
-DECLARE_CLIP(_binary_calib_error_pcm);
+DECLARE_CLIP(_binary_calibration_error_pcm);
+/*  Spoken instruction played right after the calibration-error chirp: the chirp
+ *  grabs attention, this voice line tells the pilot what to do.                 */
+DECLARE_CLIP(_binary_please_reset_unit_on_the_ground_pcm);
 
 /*  Boot config-menu prompts (see config_clip_* accessors). We compose phrases
  *  from small pieces to save flash. Filenames in assets/clips/ map to these
@@ -82,6 +85,7 @@ static clip_t make_clip(const uint8_t *start, const uint8_t *end, const char *na
  * ------------------------------------------------------------------------- */
 static clip_t s_clips[CO_COUNT];
 static clip_t s_chirp;                        /* calibration-error chirp          */
+static clip_t s_calib_voice;                  /* "please reset unit on the ground"*/
 static clip_t s_cfg_enter;                    /* "config mode, memory cleared"    */
 static clip_t s_cfg_chirp;                    /* short menu chirp (entry/confirm) */
 static clip_t s_cfg_pieces[CFG_PIECE_COUNT];  /* composable spoken pieces         */
@@ -100,7 +104,9 @@ static void build_manifest(void)
     s_clips[CO_FOUR_HUNDRED]  = make_clip(_binary_four_hundred_pcm_start,  _binary_four_hundred_pcm_end,  "four hundred");
     s_clips[CO_FIVE_HUNDRED]  = make_clip(_binary_five_hundred_pcm_start,  _binary_five_hundred_pcm_end,  "five hundred");
 
-    s_chirp = make_clip(_binary_calib_error_pcm_start, _binary_calib_error_pcm_end, "calib error");
+    s_chirp       = make_clip(_binary_calibration_error_pcm_start, _binary_calibration_error_pcm_end, "calib error");
+    s_calib_voice = make_clip(_binary_please_reset_unit_on_the_ground_pcm_start,
+                              _binary_please_reset_unit_on_the_ground_pcm_end, "please reset on ground");
 
     /* Boot config-menu prompts + composable pieces. */
     s_cfg_enter = make_clip(_binary_config_mode_pcm_start, _binary_config_mode_pcm_end, "config mode");
@@ -133,6 +139,14 @@ const clip_t *callout_chirp(void)
         build_manifest();
     }
     return &s_chirp;
+}
+
+const clip_t *callout_calib_voice(void)
+{
+    if (!s_built) {
+        build_manifest();
+    }
+    return &s_calib_voice;
 }
 
 const clip_t *config_clip_enter(void)

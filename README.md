@@ -50,12 +50,11 @@ short flare window). WiFi/Bluetooth are **off by design** — no EMI into the av
 |---|-----------|------|-------|
 | 1 | **ESP32-S3** devkit or module (≥8 MB flash, PSRAM helpful) | The MCU / brain | e.g. ESP32-S3-DevKitC-1. Native USB used for flashing + logging. |
 | 2 | **LightWare SF30/C** (100 m) **or SF30/D** (200 m) micro-lidar | Slant-range rangefinder | SF30/C is the default. The box auto-detects which is fitted. |
-| 3 | **PCM5102A** I2S DAC breakout | Digital audio → line level (stereo) | The common purple/black breakout. **SCK jumper must go to GND** (internal PLL). |
-| 4 | **Level-trim potentiometer** (~10 kΩ) | Master output level | Sets absolute loudness into the panel. Firmware only shapes the *perceptual* ramp. |
-| 5 | **Momentary push button** | Config button (set audio modes + re-learn ground) | Hold at power-on for the config menu; wipes the learned ground + saved config. Active-low, internal pull-up. Mount in the cockpit on a harness conductor. |
-| 6 | **Clean regulated 5 V supply** | Supply | A single clean 5 V rail feeds the S3, the DAC, **and** the SF30. See [Power](#power). |
-| 7 | **Multi-conductor shielded cable** (≥6 cores) | Cockpit harness | Carries +, −, L, R, panel audio-LO reference, and the config button. See [Cockpit harness](#cockpit-harness-6-conductor-shielded). |
-| 8 | **Acrylic lens disc** + Novabox threaded housing | Enclosure | See [Enclosure](#enclosure-3d-printed-housing). Available at Novabox.Works. |
+| 3 | **PCM5102A** I2S DAC breakout | Digital audio → **line level** (stereo) | The common purple/black breakout. **SCK jumper must go to GND** (internal PLL). Output goes straight to the panel — it's line level, so the panel sets volume (no trim pot needed). |
+| 4 | **Momentary push button** | Config button (set audio modes + re-learn ground) | Hold at power-on for the config menu; wipes the learned ground + saved config. Active-low, internal pull-up. Mount in the cockpit on a harness conductor. |
+| 5 | **Clean regulated 5 V supply** | Supply | A single clean 5 V rail feeds the S3, the DAC, **and** the SF30. See [Power](#power). |
+| 6 | **Multi-conductor shielded cable** (≥6 cores) | Cockpit harness | Carries +, −, L, R, panel audio-LO reference, and the config button. See [Cockpit harness](#cockpit-harness-6-conductor-shielded). |
+| 7 | **Acrylic lens disc** (55 mm ideal, or 2″ + gasket) + Novabox threaded housing | Enclosure | One 2.5″ hole, no screws — compression fit. See [Enclosure](#enclosure-3d-printed-housing). Available at Novabox.Works. |
 
 **Interfaces used:** UART (sensor), I2S (DAC, **stereo**), one GPIO (config button),
 USB (flash/log). All sensor & DAC logic is 3.3 V.
@@ -71,21 +70,19 @@ USB (flash/log). All sensor & DAC logic is 3.3 V.
 ### Block diagram
 
 ```
-  SF30/C or SF30/D ──UART (3.3V TTL)──► ESP32-S3 ──I2S──► PCM5102A ──► trim pot(s)
-   (belly lidar)                         (MCU)             (DAC)          │
-                                                                    L / R / LO
-                                                                         │
-                                                                         ▼
-                                                          GMA 245 audio panel
-                                                          (stereo aux input)
+  SF30/C or SF30/D ──UART (3.3V TTL)──► ESP32-S3 ──I2S──► PCM5102A ── L / R / LO ──►
+   (belly lidar)                         (MCU)             (DAC)                     │
+                                                                                     ▼
+                                                                       GMA 245 audio panel
+                                                                       (stereo aux input)
 ```
 
 ### 1) SF30 lidar → ESP32-S3 — UART1, 115200 8N1
 
 | SF30 pin | wire to | ESP32-S3 GPIO | `config.h` |
 |----------|:-------:|---------------|------------|
-| **TX**   |  →      | **GPIO 17** (UART RX) | `PIN_SF30C_RX` |
-| **RX**   |  →      | **GPIO 18** (UART TX) | `PIN_SF30C_TX` |
+| **TX**   |  →      | **GPIO 8** (UART RX) | `PIN_SF30C_RX` |
+| **RX**   |  →      | **GPIO 9** (UART TX) | `PIN_SF30C_TX` |
 | **GND**  |  →      | common GND            | — |
 | **V+**   |  →      | the shared clean 5 V rail | — |
 
@@ -135,21 +132,23 @@ the panel's input stage does the level/impedance work, and referencing both audi
 channels to the panel's LO keeps the audio return off the noisy power ground.
 
 ```
-PCM5102A LOUT ─► trim pot ─┐
-PCM5102A ROUT ─► trim pot ─┼─► GMA 245 aux  (L, R, audio-LO ref)
-              panel LO  ◄──┘
+PCM5102A LOUT ─┐
+PCM5102A ROUT ─┼─► GMA 245 aux  (L, R, audio-LO ref)
+   panel LO  ◄──┘
 ```
 
+- **Line level — no trim pot.** The DAC output is line level and goes **straight to
+  the panel**; the GMA 245 sets the volume, so there's no master-level pot in the
+  chain. The firmware only shapes the *perceptual* dB ramp.
 - **Stereo by default.** The firmware emits L/R and gently pans the streams to
   opposite sides (voice right, tone left — see [How it works](#presence-tone-perceptual)).
   Mono and stereo are a **runtime** choice — pick it from the
-  [boot config menu](#boot-config-menu-button-held-at-power-on); the I2S hardware
+  [config menu](#configuring-the-unit); the I2S hardware
   always drives both channels, so mono just sends the same signal to L and R
   (safe even if the panel is wired stereo). `DEFAULT_AUDIO_MODE` in `config.h` sets
   the post-wipe default.
 - **Audio LO is the reference, not power ground.** Land L and R against the GMA's
   **audio LO** conductor — that's what isolates the audio return from the supply.
-- Set **absolute loudness with the trim pot** — the firmware only shapes the dB ramp.
 
 #### Cockpit harness (6-conductor, shielded)
 
@@ -160,8 +159,8 @@ power, stereo audio + its reference, and the remote button:
 |---|-----------|-----------|
 | 1 | **+** (5 V) | clean 5 V rail → box supply |
 | 2 | **−** (GND) | power ground → box ground |
-| 3 | **L** | DAC LOUT (via trim) → GMA 245 aux **L** |
-| 4 | **R** | DAC ROUT (via trim) → GMA 245 aux **R** |
+| 3 | **L** | DAC LOUT → GMA 245 aux **L** (line level) |
+| 4 | **R** | DAC ROUT → GMA 245 aux **R** (line level) |
 | 5 | **LO** | GMA 245 **audio-LO** reference ← box audio return |
 | 6 | **BTN** | cockpit config button → **GPIO 4** (`PIN_CONFIG_BTN`) |
 
@@ -181,7 +180,10 @@ power, stereo audio + its reference, and the remote button:
 > far smaller.
 
 ### ⚠️ GPIO cautions
-- Avoid the **strapping pins (0, 45, 46)** and the **native-USB pins (19, 20)** — the
+- **Mini-board pin budget.** The reference build targets a **mini ESP32-S3** that only
+  breaks out **GPIO 1–13** (plus 5 V, GND, 3V3, and the USB TX/RX), so every default
+  pin lives in that range: UART **8/9**, I2S **5/6/7**, config button **4**.
+- Avoid the **strapping pins (0, 3, 45, 46)** and the **native-USB pins (19, 20)** — the
   console logs over USB-Serial-JTAG.
 - Any other free GPIOs work for UART/I2S/button; if you remap, do it in `config.h`.
 
@@ -331,18 +333,24 @@ The spoken clips are raw **16 kHz mono signed-16-bit-LE PCM** (headerless `.pcm`
 `assets/clips/`. The build **globs that folder and embeds whatever exists**; any missing
 clip is skipped gracefully by the firmware (the tone keeps running).
 
-**Config-menu clips.** Beyond the altitude numbers + `calib_error.pcm`, the
-[boot config menu](#boot-config-menu-button-held-at-power-on) uses these files (drop
-them in `assets/clips/` — the build picks them up automatically):
+**Config-menu clips.** Beyond the altitude numbers + `calibration_error.pcm`, the
+[config menu](#configuring-the-unit) uses these files (drop them in `assets/clips/` —
+the build picks them up automatically). To save flash the spoken options are
+**composed from pieces** (a channel piece + a stream piece) rather than one clip per
+phrase, and the start-altitude reuses the existing number clips:
 
 | File | Spoken phrase |
 |------|---------------|
+| `chirp.pcm` | short chirp (entry / each confirm) |
 | `config_mode.pcm` | "Config mode, memory cleared" |
-| `cfg_mono_both.pcm` | "Mono, Callouts and Tone" |
-| `cfg_stereo_both.pcm` | "Stereo, Callouts and Tone" |
-| `cfg_mono_callouts.pcm` | "Mono, Callouts Only" |
-| `cfg_mono_tone.pcm` | "Mono, Tone Only" |
-| `tone.pcm` | a short confirmation tone (commit) |
+| `mono.pcm` / `stereo.pcm` | "Mono" / "Stereo" (channel piece) |
+| `callouts_and_tone.pcm` | "Callouts and Tone" (stream piece) |
+| `callouts_only.pcm` | "Callouts Only" (stream piece) |
+| `tone_only.pcm` | "Tone Only" (stream piece) |
+| `callout_start_altitude.pcm` | "Callout Start Altitude" |
+
+The converter sniffs the header, so a `.pcm` file that is secretly a renamed WAV
+still converts — you can pass `assets/original_audio/*.pcm` alongside the WAVs.
 
 You have two ways to make them:
 
@@ -364,7 +372,7 @@ python tools/gen_clips.py --list-voices   # pick a voice, then --voice N
 python tools/gen_clips.py --placeholder-tones   # bench BEEPS, clearly labelled
 ```
 
-A distinctive **calibration-error chirp** (`calib_error.pcm`) is also generated and
+A distinctive **calibration-error chirp** (`calibration_error.pcm`) is also generated and
 plays at boot if the box can't establish a ground reference.
 
 ---
@@ -422,7 +430,7 @@ per boot**, so flash wear is negligible. `AGL = measured_range − ground_avg`.
   speech-favoured ear while the tone takes the other — easier to parse the two at once
   without either dominating. The pan never changes a stream's loudness, and it's purely a
   separation cue (no inter-channel time delay, so callout onset stays crisp). Mono is a
-  runtime option in the [boot config menu](#boot-config-menu-button-held-at-power-on).
+  runtime option in the [config menu](#configuring-the-unit).
 
 ### Power
 - WiFi/BT compiled out. In GROUND/CRUISE the tone is silent, the I2S channel is paused,
@@ -446,15 +454,20 @@ The housing is **belly- or wing-mountable** and installs with **zero fasteners**
 - **Drill a single 2.5″ hole** in the skin at your chosen mount point.
 - Drop the unit in and thread it down — the **integral thread acts as a compression
   fitting**, clamping the housing to the skin against its built-in flange/lens.
-- **Overall height: ~70 mm** tall, so confirm you have that much clearance behind the
+- **Overall height: ~70 mm**, so confirm you have that much clearance behind the
   skin (and a clear, unobstructed view of the ground for the lidar).
 
 That's the whole install: **one 2.5″ hole, hand-tighten, done** — no screw holes to
 drill, no backing plate, no separate hardware.
 
+### Acrylic lens
+- **Ideal: a 55 mm acrylic disc** — sized to seat cleanly in the threaded housing.
+- **Alternative: a standard 2″ (50.8 mm) disc** works too, sealed with a **gasket**
+  to take up the difference and keep the optical window weather-tight.
+
 This section will be filled in with:
 - [ ] STL / STEP files and print settings (material, walls, infill, orientation)
-- [ ] Acrylic lens spec (diameter, thickness, cut template)
+- [ ] Acrylic lens spec (thickness, cut template) — 55 mm ideal / 2″ + gasket
 - [ ] Exact thread pitch / torque + gasket/o-ring spec
 - [ ] Mounting guidance (belly vs wing location, sensor aim, strain relief)
 

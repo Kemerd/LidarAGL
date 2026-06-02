@@ -133,11 +133,34 @@ def wav_to_samples(wav_path):
         raw     = w.readframes(nframes)
 
     if width == 2:
+        # 16-bit signed little-endian.
         ints = list(struct.unpack("<%dh" % (len(raw) // 2), raw))
         scale = 32768.0
     elif width == 1:
-        ints = [b - 128 for b in raw]          # 8-bit WAV is unsigned
+        # 8-bit WAV is unsigned (0..255, centred on 128).
+        ints = [b - 128 for b in raw]
         scale = 128.0
+    elif width == 3:
+        # 24-bit signed little-endian. There's no struct code for 3-byte ints,
+        # so assemble each sample from its 3 bytes and sign-extend the top bit.
+        ints = []
+        for i in range(0, len(raw) - 2, 3):
+            v = raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16)
+            if v & 0x800000:                   # negative -> sign-extend to 32-bit
+                v -= 0x1000000
+            ints.append(v)
+        scale = 8388608.0                      # 2^23
+    elif width == 4:
+        # 32-bit. Could be int OR float (WAVE_FORMAT_IEEE_FLOAT); wave can't tell
+        # us the format tag, so sniff it: float PCM lives in roughly [-1, 1], int
+        # PCM spans the full +/-2^31 range. Decode as int, and if every value is
+        # tiny relative to the int range, re-read it as float.
+        ints = list(struct.unpack("<%di" % (len(raw) // 4), raw))
+        peak = max((abs(x) for x in ints), default=0)
+        if peak <= 0x7FFFFF:                   # never uses the high bytes -> float
+            floats = struct.unpack("<%df" % (len(raw) // 4), raw)
+            ints   = [int(x * 2147483648.0) for x in floats]
+        scale = 2147483648.0                   # 2^31
     else:
         raise ValueError(f"unsupported WAV sample width: {width} bytes")
 

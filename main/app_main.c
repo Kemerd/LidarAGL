@@ -429,11 +429,14 @@ void app_main(void)
     ESP_LOGI(TAG, "ground_ref=%.2f ft  boot_agl=%.1f ft  airborne=%d calib_err=%d",
              br.ground_ref_ft, br.boot_agl_ft, br.airborne, br.calib_error);
 
-    /* 6. Calibration error -> warn the pilot with the boot chirp. */
+    /* 6. Calibration error -> warn the pilot: the chirp grabs attention, then the
+     *    spoken instruction tells them what to do ("please reset unit on the
+     *    ground"). Both are blocking so they play in order before tasks start.   */
     if (br.calib_error) {
-        ESP_LOGW(TAG, "no ground reference; using %.1f ft fallback (chirping)",
+        ESP_LOGW(TAG, "no ground reference; using %.1f ft fallback (chirp + voice)",
                  (double)MOUNT_OFFSET_FALLBACK_FT);
         audio_play_chirp();
+        audio_play_clip_blocking(callout_calib_voice());
     }
 
     /* 7. The ONE NVS write per boot: persist this boot's ground readings.
