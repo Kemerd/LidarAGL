@@ -41,6 +41,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_pm.h"
+#include "esp_system.h"   /* esp_restart() — config menu reboot */
 
 static const char *TAG = "app";
 
@@ -390,7 +391,7 @@ void app_main(void)
     /* 3. Audio up with the resolved runtime configuration. */
     audio_init(&audio_cfg);
 
-    /* 4. Reset button HELD at boot -> enter the config menu. Audio + profile are
+    /* 4. Config button HELD at boot -> enter the config menu. Audio + profile are
      * both up, so the menu can speak prompts and cycle the right callout ladder.
      * run_config_menu() wipes ground + config and never returns (it reboots once
      * the selection commits).                                                    */
