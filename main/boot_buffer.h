@@ -56,11 +56,68 @@ void boot_buffer_init(void);
 bool boot_buffer_reset_pressed(void);
 
 /**
+ * @brief Lightly-debounced instantaneous button state (for the config menu).
+ *
+ * @return True if the button reads its active level on two quick spaced samples.
+ *
+ * @details Cheaper than boot_buffer_reset_pressed() (which spaces five samples
+ *          over ~25 ms): this samples twice ~3 ms apart so the config-menu loop
+ *          can do its own edge detection while staying responsive to taps.
+ */
+bool boot_buffer_button_down(void);
+
+/**
  * @brief Wipe the stored ground buffer and reboot the MCU.
  *
  * @details Erases the NVS key and calls esp_restart(). Does not return.
  */
 void boot_buffer_wipe_and_reboot(void);
+
+/**
+ * @brief Erase the stored ground reference only (does NOT reboot).
+ *
+ * @details Used by the boot config menu, which wipes both the ground reference
+ *          and the saved audio config in one pass, then continues into the menu
+ *          rather than rebooting immediately.
+ */
+void boot_buffer_wipe_ground(void);
+
+/**
+ * @brief Load the saved audio-mode index (AUDIO_MODE_*) from NVS.
+ * @return The stored mode, or DEFAULT_AUDIO_MODE if none is saved / on error.
+ */
+int config_load_audio_mode(void);
+
+/**
+ * @brief Persist the chosen audio-mode index (AUDIO_MODE_*) to NVS.
+ * @param mode  The AUDIO_MODE_* index to store.
+ */
+void config_save_audio_mode(int mode);
+
+/**
+ * @brief Erase the saved audio config (the next load returns the default).
+ */
+void config_wipe_audio_mode(void);
+
+/**
+ * @brief Load the saved callout start-altitude cap (ft) from NVS.
+ *
+ * @param default_ft  Value to return when none is saved (the profile top
+ *                    callout, since the default depends on the fitted sensor).
+ * @return            The stored cap in feet, or @p default_ft if absent/invalid.
+ */
+float config_load_start_alt(float default_ft);
+
+/**
+ * @brief Persist the chosen callout start-altitude cap (ft) to NVS.
+ * @param ft  Cap in feet (stored as a u16; rounded).
+ */
+void config_save_start_alt(float ft);
+
+/**
+ * @brief Erase the saved start-altitude cap (the next load returns the default).
+ */
+void config_wipe_start_alt(void);
 
 /**
  * @brief Load the stored ground readings.

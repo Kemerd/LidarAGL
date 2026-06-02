@@ -112,6 +112,32 @@
 #define SAMPLE_RATE       16000       /* plenty for voice + tone, saves flash    */
 #define AUDIO_FRAME_LEN   128         /* samples generated per render block      */
 
+/* ---- Audio: channel layout & runtime config defaults -------------------- */
+/*  The PCM5102A is a true stereo DAC. The I2S peripheral ALWAYS runs in stereo
+ *  (both L and R driven) so the unit works no matter how the panel is wired;
+ *  whether we actually SEPARATE the two streams is a RUNTIME choice set by the
+ *  boot config menu (hold the button at power-on — see app_main.c) and stored in
+ *  NVS. These defines only seed the DEFAULT used after a config wipe.
+ *
+ *  Audio modes (AUDIO_MODE_*): selected by tapping through the boot config menu.
+ *    MONO_BOTH    - callouts + tone, same signal to L and R (safe if mono-wired)
+ *    STEREO_BOTH  - callouts + tone, gently panned apart (voice right, tone left)
+ *    MONO_CALLOUTS- callouts only, mono
+ *    MONO_TONE    - tone only, mono
+ *
+ *  STEREO_PAN is the gentle equal-power separation used in STEREO_BOTH: most of
+ *  each stream stays common to both channels, only this fraction leans aside.
+ *  Into a MONO panel input the two channels sum and the lean cancels to plain
+ *  mono — so the pan only buys you anything when both L and R reach your ears.  */
+#define AUDIO_MODE_MONO_BOTH     0
+#define AUDIO_MODE_STEREO_BOTH   1
+#define AUDIO_MODE_MONO_CALLOUTS 2
+#define AUDIO_MODE_MONO_TONE     3
+#define AUDIO_MODE_COUNT         4
+
+#define DEFAULT_AUDIO_MODE       AUDIO_MODE_STEREO_BOTH  /* used after a wipe     */
+#define STEREO_PAN               0.15f   /* equal-power lean, ~85% common/~15% aside */
+
 #define TONE_START_FT     100.0f      /* tone becomes barely audible here        */
 #define TONE_FULL_FT      50.0f       /* tone reaches full presence by here      */
 #define FLARE_BAND_HI     35.0f       /* top of flare full-attention band        */
@@ -135,6 +161,17 @@
 #define TONE_FULL_DB      -6.0f       /* full presence at/below 50 ft            */
 #define VOICE_DUCK_DB     4.0f        /* duck the tone this much under a callout  */
 #define GAIN_RAMP_MS      40          /* raised-cosine envelope time (>=30–50ms)  */
+
+/* ---- Equal-loudness (ISO 226) correction --------------------------------- */
+/*  The tone's pitch ascends as the ground nears. The ear is more sensitive to
+ *  higher pitches, so WITHOUT correction the tone would sound progressively
+ *  louder through the flare even at a constant electrical level — an unwanted
+ *  stress cue. Urgency is meant to be carried by PITCH, with perceived loudness
+ *  held constant once the tone has faded in. This flag flattens the ear's
+ *  frequency tilt (relative to 1 kHz) using the ISO 226 ~60 phon contour, so
+ *  equal scheduled dB sounds equally loud across the whole sweep.
+ *  Set to 0 to A/B the raw (uncorrected) behaviour on the bench.               */
+#define EQUAL_LOUDNESS_CORRECTION 1
 
 /* ===========================================================================
  *  REGION 2 — HARDWARE-ONLY CONSTANTS  (firmware build only)
@@ -168,6 +205,8 @@
 /* ---- NVS namespace / keys ------------------------------------------------ */
 #define NVS_NAMESPACE     "lidaragl"
 #define NVS_KEY_GROUNDBUF "groundbuf"  /* blob: BOOT_BUFFER_N x boot_entry_t     */
+#define NVS_KEY_AUDIOCFG  "audiocfg"   /* u8: selected AUDIO_MODE_* (config menu) */
+#define NVS_KEY_STARTALT  "startalt"   /* u16: callout start-altitude cap in ft   */
 
 /* ---- FreeRTOS task stacks (BYTES in ESP-IDF) & priorities ---------------- */
 #define SENSOR_TASK_STACK 3072

@@ -3,10 +3,14 @@
  * @brief   LidarAGL entry point: boot sequence, task spawning, and logic loop.
  *
  * @details Boot order (spec §5, §6, §8 + the builder's ground-reference model):
- *            1. NVS up; radios stay off (compiled out + never started).
- *            2. Reset button held? -> wipe ground buffer + reboot.
- *            3. UART up; autodetect the sensor -> g_profile; start streaming.
- *            4. I2S up.
+ *            1. NVS up; radios stay off (compiled out + never started). Load the
+ *               saved audio config (mono/stereo + which streams play).
+ *            2. UART up; autodetect the sensor -> g_profile; start streaming.
+ *               (Done before the menu so it can cycle the right callout ladder.)
+ *            3. I2S up with the resolved audio config.
+ *            4. Reset button held? -> enter the config menu (wipes ground +
+ *               config, two-level tap/double-tap menu, reboots on commit). Then
+ *               resolve the callout start-altitude cap from the saved config.
  *            5. Capture a ground-fill (10 readings spread over ~1 s) + one
  *               current reading; reconstruct the ground reference and boot AGL.
  *            6. If no real reference existed -> calibration-error chirp.
@@ -52,6 +56,12 @@ SemaphoreHandle_t       g_audio_mutex    = NULL;
  *  range into AGL. Set once during boot.                                       */
 static float s_ground_ref_ft = MOUNT_OFFSET_FALLBACK_FT;
 
+/*  Callout start-altitude cap (ft): the highest callout that is allowed to
+ *  speak. Numbers ABOVE this are suppressed (the tone is unaffected). Set once
+ *  during boot from the saved config; defaults to the profile's top callout, so
+ *  the behaviour is unchanged unless the pilot lowers it in the config menu.    */
+static float s_start_alt_ft = 0.0f;   /* 0 == uncapped until boot sets it       */
+
 /* ---- LWNX update-rate code per poll profile ------------------------------ */
 /*  The binary update-rate code (cmd 76). We keep the sensor at a brisk rate in
  *  flight; on the ASCII path this is a no-op. Code 8 ~= 78 readings/sec.        */
@@ -96,6 +106,162 @@ static size_t capture_ground_fill(float *out, size_t want)
 }
 
 /* ---------------------------------------------------------------------------
+ *  Boot config menu (entered by HOLDING the button at power-on).
+ *
+ *  Flow (audio + the sensor profile must already be up):
+ *    1. Chirp, speak "config mode, memory cleared", and wipe BOTH the learned
+ *       ground reference and the saved audio/start-altitude config.
+ *    2. LEVEL 1 — audio mode. A single TAP cycles the four modes (each announced
+ *       as two composed pieces, e.g. "Stereo" + "Callouts and Tone"); a
+ *       DOUBLE-TAP (or CONFIG_COMMIT_MS of silence) confirms the current mode.
+ *    3. LEVEL 2 — callout start altitude. Skipped entirely for the tone-only
+ *       mode (no callouts to gate). Otherwise: speak "Callout Start Altitude",
+ *       then a TAP cycles the profile's callout ladder (200..10 / 500..10),
+ *       each spoken with the existing number clips; DOUBLE-TAP / timeout confirms.
+ *    4. A chirp marks each confirm. Persist both values and reboot.
+ *
+ *  This function does not return — it always ends in esp_restart().
+ * ------------------------------------------------------------------------- */
+#define CONFIG_COMMIT_MS    5000   /* idle time with no tap that auto-confirms   */
+#define CONFIG_POLL_MS      15     /* button poll cadence inside the menu        */
+#define CONFIG_DTAP_MS      400    /* two taps within this window == double-tap  */
+
+/*  Classified result of one menu interaction. */
+typedef enum {
+    TAP_NONE = 0,   /* nothing happened this poll                                */
+    TAP_SINGLE,     /* a single tap (cycle)                                      */
+    TAP_DOUBLE,     /* a double tap (confirm)                                    */
+    TAP_TIMEOUT,    /* CONFIG_COMMIT_MS elapsed with no tap (confirm)            */
+} tap_event_t;
+
+/*  Wait for the next tap event. Tracks a rolling idle timer for the timeout and,
+ *  on a press, opens a short window to see whether a second press makes it a
+ *  double-tap. *idle_ms accumulates across calls so the timeout spans the whole
+ *  level, not just one call.                                                    */
+static tap_event_t wait_tap_event(int *idle_ms)
+{
+    /* Wait for a rising edge (press), accumulating idle time toward timeout. */
+    while (!boot_buffer_button_down()) {
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_POLL_MS));
+        *idle_ms += CONFIG_POLL_MS;
+        if (*idle_ms >= CONFIG_COMMIT_MS) {
+            return TAP_TIMEOUT;
+        }
+    }
+    *idle_ms = 0;   /* a press resets the idle timer */
+
+    /* Wait for this press to release (so the next press is a distinct tap). */
+    while (boot_buffer_button_down()) {
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_POLL_MS));
+    }
+
+    /* Double-tap window: a second press within CONFIG_DTAP_MS makes it double. */
+    for (int t = 0; t < CONFIG_DTAP_MS; t += CONFIG_POLL_MS) {
+        if (boot_buffer_button_down()) {
+            /* Consume the second tap's release, then report a double-tap. */
+            while (boot_buffer_button_down()) {
+                vTaskDelay(pdMS_TO_TICKS(CONFIG_POLL_MS));
+            }
+            return TAP_DOUBLE;
+        }
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_POLL_MS));
+    }
+    return TAP_SINGLE;
+}
+
+/*  Speak an audio-mode option as two composed pieces (channel + stream) with a
+ *  short gap so they don't run together. */
+static void announce_mode(int mode)
+{
+    config_piece_t channel = (mode == AUDIO_MODE_STEREO_BOTH)
+                             ? CFG_PIECE_STEREO : CFG_PIECE_MONO;
+    config_piece_t stream;
+    switch (mode) {
+        case AUDIO_MODE_MONO_CALLOUTS: stream = CFG_PIECE_CALLOUTS_ONLY;     break;
+        case AUDIO_MODE_MONO_TONE:     stream = CFG_PIECE_TONE_ONLY;         break;
+        default:                       stream = CFG_PIECE_CALLOUTS_AND_TONE; break;
+    }
+    audio_play_clip_blocking(config_clip_piece(channel));
+    vTaskDelay(pdMS_TO_TICKS(120));   /* small gap between the two pieces */
+    audio_play_clip_blocking(config_clip_piece(stream));
+}
+
+static void run_config_menu(void)
+{
+    ESP_LOGW(TAG, "config mode: chirp + wipe ground/audio/start-altitude config");
+
+    /* Entry chirp, then the spoken "config mode, memory cleared", then the wipe.*/
+    audio_play_clip_blocking(config_clip_chirp());
+    audio_play_clip_blocking(config_clip_enter());
+    boot_buffer_wipe_ground();
+    config_wipe_audio_mode();
+    config_wipe_start_alt();
+
+    /* Wait out the original hold so it isn't mistaken for a menu tap (bounded). */
+    for (int i = 0; i < 300 && boot_buffer_button_down(); ++i) {
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_POLL_MS));
+    }
+
+    /* ---- LEVEL 1: audio mode ---------------------------------------------- */
+    int selected_mode = DEFAULT_AUDIO_MODE;
+    announce_mode(selected_mode);          /* announce the starting selection */
+
+    int idle_ms = 0;
+    for (;;) {
+        tap_event_t ev = wait_tap_event(&idle_ms);
+        if (ev == TAP_DOUBLE || ev == TAP_TIMEOUT) {
+            break;                          /* confirm this mode */
+        }
+        if (ev == TAP_SINGLE) {
+            selected_mode = (selected_mode + 1) % AUDIO_MODE_COUNT;
+            ESP_LOGI(TAG, "config: mode -> %d", selected_mode);
+            announce_mode(selected_mode);
+        }
+    }
+    audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
+    config_save_audio_mode(selected_mode);
+
+    /* ---- LEVEL 2: callout start altitude ---------------------------------- */
+    /* Resolve the active behaviour so we can skip this level when there are no
+     * callouts to gate (tone-only mode).                                       */
+    audio_config_t chosen = audio_config_from_mode(selected_mode);
+    if (chosen.callouts_enabled) {
+        /* The profile ladder is descending (callouts[0] is the top). The cap
+         * starts at the top (= the default) and tapping steps DOWN the ladder. */
+        size_t n_cal   = g_profile->n_callouts;
+        size_t cap_idx = 0;                 /* index into g_profile->callouts[] */
+
+        audio_play_clip_blocking(config_clip_piece(CFG_PIECE_START_ALT));
+        vTaskDelay(pdMS_TO_TICKS(120));
+        /* Announce the starting (top) altitude via the number clips. */
+        callout_id_t cid = callout_id_for_ft(g_profile->callouts[cap_idx]);
+        audio_play_clip_blocking(callout_clip(cid));
+
+        idle_ms = 0;
+        for (;;) {
+            tap_event_t ev = wait_tap_event(&idle_ms);
+            if (ev == TAP_DOUBLE || ev == TAP_TIMEOUT) {
+                break;                      /* confirm this altitude */
+            }
+            if (ev == TAP_SINGLE) {
+                cap_idx = (cap_idx + 1) % n_cal;   /* step down, wrap to top */
+                float ft = g_profile->callouts[cap_idx];
+                ESP_LOGI(TAG, "config: start-alt -> %.0f ft", ft);
+                audio_play_clip_blocking(callout_clip(callout_id_for_ft(ft)));
+            }
+        }
+        audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
+        config_save_start_alt(g_profile->callouts[cap_idx]);
+    } else {
+        ESP_LOGI(TAG, "config: tone-only mode, skipping start-altitude menu");
+    }
+
+    ESP_LOGW(TAG, "config committed (mode %d); rebooting", selected_mode);
+    vTaskDelay(pdMS_TO_TICKS(50));   /* let the log + DMA flush */
+    esp_restart();                   /* does not return */
+}
+
+/* ---------------------------------------------------------------------------
  *  Logic task (core 1): the decision loop.
  * ------------------------------------------------------------------------- */
 static void logic_task(void *arg)
@@ -136,14 +302,22 @@ static void logic_task(void *arg)
         sm_out_t out;
         sm_step(&sm, agl, dt_s, g_profile, &out);
 
-        /* Fire the callout, if any, mapping the profile height -> clip id. */
+        /* Fire the callout, if any, mapping the profile height -> clip id.
+         * Suppress any callout ABOVE the configured start-altitude cap so the
+         * pilot only hears numbers from their chosen ceiling down (the tone is
+         * unaffected). With the cap at the profile top this never suppresses.   */
         if (out.fired_callout >= 0) {
             float ft = g_profile->callouts[out.fired_callout];
-            callout_id_t cid = callout_id_for_ft(ft);
-            if (cid != CO_COUNT) {
-                audio_request_callout(cid);
+            if (ft <= s_start_alt_ft) {
+                callout_id_t cid = callout_id_for_ft(ft);
+                if (cid != CO_COUNT) {
+                    audio_request_callout(cid);
+                }
+                ESP_LOGI(TAG, "callout %.0f ft (state=%d)", ft, out.state);
+            } else {
+                ESP_LOGI(TAG, "callout %.0f ft suppressed (cap %.0f ft)",
+                         ft, s_start_alt_ft);
             }
-            ESP_LOGI(TAG, "callout %.0f ft (state=%d)", ft, out.state);
         }
 
         /* Publish tone params + poll cadence. */
@@ -200,20 +374,34 @@ void app_main(void)
     /* 1. NVS + reset-button GPIO. */
     boot_buffer_init();
 
-    /* 2. Reset button held at boot -> wipe ground buffer and reboot. */
-    if (boot_buffer_reset_pressed()) {
-        boot_buffer_wipe_and_reboot();   /* does not return */
-    }
+    /* Resolve the stored audio configuration (mono/stereo + which streams play).
+     * NVS wins at runtime; a missing/corrupt value yields DEFAULT_AUDIO_MODE.   */
+    audio_config_t audio_cfg = audio_config_from_mode(config_load_audio_mode());
 
-    /* 3. Sensor up + autodetect + stream config. */
+    /* 2. Sensor up + autodetect + stream config. We detect the profile BEFORE the
+     * config menu so the start-altitude sub-menu can cycle the correct callout
+     * ladder (200..10 for SF30/C, 500..10 for SF30/D).                          */
     sf30c_init();
     g_profile = sf30c_detect_profile();
     sf30c_configure_stream(SF30_RATE_CODE_ACTIVE);
     ESP_LOGI(TAG, "active profile: %s (cruise %.0f ft, %d callouts)",
              g_profile->name, g_profile->cruise_ft, (int)g_profile->n_callouts);
 
-    /* 4. Audio up. */
-    audio_init();
+    /* 3. Audio up with the resolved runtime configuration. */
+    audio_init(&audio_cfg);
+
+    /* 4. Reset button HELD at boot -> enter the config menu. Audio + profile are
+     * both up, so the menu can speak prompts and cycle the right callout ladder.
+     * run_config_menu() wipes ground + config and never returns (it reboots once
+     * the selection commits).                                                    */
+    if (boot_buffer_reset_pressed()) {
+        run_config_menu();               /* does not return                      */
+    }
+
+    /* Resolve the callout start-altitude cap now the profile is known (its top
+     * callout is the default when nothing has been configured).                 */
+    s_start_alt_ft = config_load_start_alt(g_profile->callouts[0]);
+    ESP_LOGI(TAG, "callout start-altitude cap: %.0f ft", s_start_alt_ft);
 
     /* 5. Ground-fill + current reading -> reconstruct ground reference. */
     float ground_reads[BOOT_BUFFER_N];

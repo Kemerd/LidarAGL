@@ -15,7 +15,7 @@
 # =============================================================================
 
 CC      ?= gcc
-CFLAGS  := -I../main -DUNIT_TEST -std=c11 -Wall -Wextra -O2
+CFLAGS  := -I../main -DUNIT_TEST -std=gnu11 -Wall -Wextra -O2
 LDLIBS  := -lm
 SRC     := ../main
 

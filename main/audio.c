@@ -12,6 +12,13 @@
  *              envelope; nothing is ever hard-gated (no clicks, no startle).
  *            - The tone ducks ~VOICE_DUCK_DB while a callout plays; numbers are
  *              never masked by the tone peak. No pre-token alert chirp.
+ *            - Channel layout is a RUNTIME choice (set by the boot config menu,
+ *              stored in NVS). The I2S hardware always runs stereo so the unit
+ *              works however the panel is wired; s_cfg.stereo decides whether we
+ *              pan the streams apart (voice right, tone left, equal-power
+ *              STEREO_PAN) or send identical audio to both channels (mono). The
+ *              callouts/tone enable flags gate each stream for the
+ *              callouts-only / tone-only modes.
  */
 
 #include "audio.h"
@@ -38,6 +45,16 @@ static const char *TAG = "audio";
 
 static i2s_chan_handle_t s_tx = NULL;
 static bool              s_running = false;
+
+/*  Resolved runtime behaviour (channel layout + which streams are live). Set by
+ *  audio_init() from the boot config; read in the render loop. Defaults are
+ *  harmless until init runs.                                                    */
+static audio_config_t s_cfg = { .stereo = true, .callouts_enabled = true,
+                                .tone_enabled = true };
+
+/*  The DMA frame is ALWAYS interleaved stereo (the hardware runs stereo); mono
+ *  modes simply write the same sample to both channels.                         */
+#define AUDIO_CH 2
 
 #define LUT_SIZE 1024
 static float s_sine_lut[LUT_SIZE];
@@ -66,6 +83,19 @@ static float s_gain_step = 0.0f;
 /*  Max smoothed-AGL change per sample for the pitch (slower => more stable).   */
 static float s_agl_step  = 0.0f;
 
+/* ---- Stereo pan weights (compile-time constants) ------------------------- */
+/*  Equal-power pan used when s_cfg.stereo is set: a stream's energy is split so
+ *  STEREO_PAN of it leans to its far channel and the rest stays near, with
+ *  NEAR^2 + FAR^2 == 1 so panning never changes a stream's perceived loudness.
+ *  The VOICE leans RIGHT and the TONE leans LEFT (opposite sides): the right ear
+ *  has a well-documented advantage for processing speech (the right-ear /
+ *  dichotic-listening effect — right ear -> left auditory cortex, the
+ *  language-dominant hemisphere in most people), so the spoken numbers get the
+ *  speech-favoured ear while the tone takes the other. The result is a steady
+ *  center image with gentle separation. At STEREO_PAN = 0.15 it is ~0.92/~0.27. */
+#define PAN_NEAR  (sqrtf(1.0f - 0.5f * (STEREO_PAN)))   /* dominant side         */
+#define PAN_FAR   (sqrtf(0.5f * (STEREO_PAN)))          /* bled-across side      */
+
 /* ---------------------------------------------------------------------------
  *  Init
  * ------------------------------------------------------------------------- */
@@ -77,8 +107,30 @@ static void build_lut(void)
     }
 }
 
-void audio_init(void)
+audio_config_t audio_config_from_mode(int mode)
 {
+    /* Map the menu index to concrete behaviour. Anything out of range falls back
+     * to the compiled default so a corrupt NVS value can never silence the box. */
+    switch (mode) {
+        case AUDIO_MODE_MONO_BOTH:
+            return (audio_config_t){ .stereo = false, .callouts_enabled = true,  .tone_enabled = true  };
+        case AUDIO_MODE_STEREO_BOTH:
+            return (audio_config_t){ .stereo = true,  .callouts_enabled = true,  .tone_enabled = true  };
+        case AUDIO_MODE_MONO_CALLOUTS:
+            return (audio_config_t){ .stereo = false, .callouts_enabled = true,  .tone_enabled = false };
+        case AUDIO_MODE_MONO_TONE:
+            return (audio_config_t){ .stereo = false, .callouts_enabled = false, .tone_enabled = true  };
+        default:
+            return audio_config_from_mode(DEFAULT_AUDIO_MODE);
+    }
+}
+
+void audio_init(const audio_config_t *cfg)
+{
+    if (cfg) {
+        s_cfg = *cfg;
+    }
+
     build_lut();
 
     /* Precompute the per-sample slew limits. A full-scale gain ramp should take
@@ -89,7 +141,10 @@ void audio_init(void)
     float agl_ramp_samples = 0.25f * (float)SAMPLE_RATE;
     s_agl_step = TONE_START_FT / agl_ramp_samples;
 
-    /* --- I2S standard mode, TX only, 16-bit mono ------------------------- */
+    /* --- I2S standard mode, TX only, 16-bit. The hardware ALWAYS runs stereo
+     * (interleaved L/R) so the unit works however the panel is wired; whether we
+     * pan the streams apart or duplicate them to both channels is decided per
+     * sample from s_cfg.stereo in the render loop.                            */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO,
                                                             I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx, NULL));
@@ -97,7 +152,7 @@ void audio_init(void)
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                        I2S_SLOT_MODE_MONO),
+                                                        I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             /* PCM5102A SCK -> GND => internal PLL => we emit NO MCLK. */
             .mclk = I2S_GPIO_UNUSED,
@@ -112,8 +167,11 @@ void audio_init(void)
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx));
     s_running = true;
 
-    ESP_LOGI(TAG, "I2S up: %d Hz 16-bit mono (BCK=%d WS=%d DIN=%d, no MCLK)",
-             SAMPLE_RATE, PIN_I2S_BCK, PIN_I2S_LRCK, PIN_I2S_DIN);
+    ESP_LOGI(TAG, "I2S up: %d Hz 16-bit stereo-HW [%s, callouts=%d tone=%d] "
+             "(BCK=%d WS=%d DIN=%d, no MCLK)",
+             SAMPLE_RATE, s_cfg.stereo ? "panned" : "mono-dup",
+             s_cfg.callouts_enabled, s_cfg.tone_enabled,
+             PIN_I2S_BCK, PIN_I2S_LRCK, PIN_I2S_DIN);
 }
 
 /* ---------------------------------------------------------------------------
@@ -153,26 +211,39 @@ static void start_clip(const clip_t *c)
     s_clip_pos = 0;
 }
 
-void audio_play_chirp(void)
+void audio_play_clip_blocking(const clip_t *c)
 {
-    /* Played synchronously from the boot path before tasks run; we render it
-     * directly here so the warning sounds even if the audio task isn't up yet. */
-    const clip_t *c = callout_chirp();
+    /* Played synchronously from the boot path before the render tasks run (config
+     * menu prompts + the calibration chirp), so the prompt sounds even with no
+     * audio task up. Always centered: each mono sample is duplicated to both L
+     * and R of the stereo hardware frame; pan settings do not apply to prompts. */
     if (!c || !c->pcm || c->len_bytes < 2 || !s_running) {
         return;
     }
     const int16_t *pcm = (const int16_t *)c->pcm;
-    size_t n = c->len_bytes / 2;
+    size_t n = c->len_bytes / 2;       /* mono s16 samples */
     size_t written_total = 0;
-    /* Write in small blocks so we don't hold a huge stack buffer. */
+
+    /* Write in small interleaved blocks so we don't hold a huge stack buffer. */
+    int16_t buf[AUDIO_FRAME_LEN * AUDIO_CH];
     while (written_total < n) {
         size_t chunk = n - written_total;
         if (chunk > AUDIO_FRAME_LEN) chunk = AUDIO_FRAME_LEN;
+        for (size_t i = 0; i < chunk; ++i) {
+            buf[2 * i]     = pcm[written_total + i];   /* L */
+            buf[2 * i + 1] = pcm[written_total + i];   /* R */
+        }
         size_t wrote = 0;
-        i2s_channel_write(s_tx, &pcm[written_total], chunk * sizeof(int16_t),
+        i2s_channel_write(s_tx, buf, chunk * AUDIO_CH * sizeof(int16_t),
                           &wrote, portMAX_DELAY);
         written_total += chunk;
     }
+}
+
+void audio_play_chirp(void)
+{
+    /* Convenience wrapper: the calibration-error chirp is just a blocking clip. */
+    audio_play_clip_blocking(callout_chirp());
 }
 
 /* ---------------------------------------------------------------------------
@@ -234,14 +305,19 @@ void audio_task(void *arg)
 {
     (void)arg;
 
-    int16_t frame[AUDIO_FRAME_LEN];
+    /*  Always interleaved stereo (L,R,L,R,...); mono modes write L == R. */
+    int16_t frame[AUDIO_FRAME_LEN * AUDIO_CH];
 
     for (;;) {
-        /* Pick up a queued callout (non-blocking) and start it if idle. */
+        /* Pick up a queued callout (non-blocking) and start it if idle. When the
+         * active mode has callouts disabled (tone-only) we still DRAIN the queue
+         * so requests can't pile up, but we never start the clip.              */
         callout_id_t id;
         if (s_clip_pcm == NULL && q_callouts &&
             xQueueReceive(q_callouts, &id, 0) == pdTRUE) {
-            start_clip(callout_clip(id));
+            if (s_cfg.callouts_enabled) {
+                start_clip(callout_clip(id));
+            }
         }
 
         /* Snapshot the tone params under the mutex. */
@@ -253,14 +329,21 @@ void audio_task(void *arg)
             xSemaphoreGive(g_audio_mutex);
         }
 
+        /* The tone-disabled modes (callouts-only) silence the tone outright. */
+        if (!s_cfg.tone_enabled) {
+            tone_active = false;
+        }
+
         /* If the channel is suspended (light-sleep window), idle briefly. */
         if (!s_running) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 
-        /* Target gain from the dB schedule; 0 when the tone is inactive so it
-         * fades out via the slew limiter rather than hard-stopping.           */
+        /* Target gain from the dB SCHEDULE only; 0 when the tone is inactive so
+         * it fades out via the slew limiter rather than hard-stopping. The
+         * frequency-dependent equal-loudness term is applied per-sample below,
+         * since the pitch glides within a frame.                              */
         float target_gain = 0.0f;
         if (tone_active) {
             target_gain = db_to_gain(agl_to_tone_db(tone_agl));
@@ -281,8 +364,15 @@ void audio_task(void *arg)
             s_gain_cur = slew_limit(s_gain_cur, target_gain, s_gain_step);
             s_duck_cur = slew_limit(s_duck_cur, duck_target, s_gain_step);
 
-            float f    = agl_to_pitch_hz(s_tone_agl_smooth);
-            float tone = nco_sample(f) * s_gain_cur * s_duck_cur;
+            float f = agl_to_pitch_hz(s_tone_agl_smooth);
+
+            /* Equal-loudness correction: fold the ISO-226 flattening for THIS
+             * frequency into the gain so the perceived loudness follows the
+             * scheduled dB instead of rising as the pitch ascends. The urgency
+             * cue stays in the PITCH; loudness holds steady through the flare.  */
+            float eql_gain = db_to_gain(equal_loudness_db(f));
+
+            float tone = nco_sample(f) * s_gain_cur * s_duck_cur * eql_gain;
 
             /* Mix the voice clip (already at a comfortable level) if playing. */
             float voice = 0.0f;
@@ -296,8 +386,21 @@ void audio_task(void *arg)
                 }
             }
 
-            float mixed = soft_clip(tone + voice);
-            frame[i] = (int16_t)(mixed * 32767.0f);
+            float left, right;
+            if (s_cfg.stereo) {
+                /* Gently pan the two streams to OPPOSITE sides (PAN_NEAR/FAR):
+                 * voice leans RIGHT — the right ear processes speech better, so
+                 * the spoken numbers get the speech-favoured ear (lol) — and the
+                 * tone leans LEFT. Each channel soft-clips its own sum.         */
+                left  = soft_clip(tone * PAN_NEAR + voice * PAN_FAR);
+                right = soft_clip(tone * PAN_FAR  + voice * PAN_NEAR);
+            } else {
+                /* Mono: identical signal to both channels, so the box works even
+                 * if only one channel is wired or L+R are tied together.        */
+                left = right = soft_clip(tone + voice);
+            }
+            frame[2 * i]     = (int16_t)(left  * 32767.0f);   /* L */
+            frame[2 * i + 1] = (int16_t)(right * 32767.0f);   /* R */
         }
 
         /* Blocking write paces the loop to real time (the DMA backpressures). */

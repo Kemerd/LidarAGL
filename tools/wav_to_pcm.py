@@ -12,6 +12,24 @@ Usage:
     python tools/wav_to_pcm.py fifty.wav -o assets/clips/fifty.pcm
     python tools/wav_to_pcm.py *.wav            # batch (shell-expanded)
 
+    # Convert everything (numbers + chirp + the boot-config-menu prompts):
+    python tools/wav_to_pcm.py assets/original_audio/*.wav assets/original_audio/*.pcm
+
+Config-menu prompts the firmware expects (drop the WAVs in original_audio/ and
+convert; the build globs assets/clips/ and embeds whatever exists):
+    chirp.wav                 -> chirp.pcm                  (short menu chirp)
+    config_mode.wav           -> config_mode.pcm            ("config mode, memory cleared")
+    mono.wav / stereo.wav     -> mono.pcm / stereo.pcm      (channel pieces)
+    callouts_and_tone.wav     -> callouts_and_tone.pcm      (stream pieces)
+    callouts_only.wav         -> callouts_only.pcm
+    tone_only.wav             -> tone_only.pcm
+    callout_start_altitude.wav-> callout_start_altitude.pcm ("callout start altitude")
+The start-altitude numbers reuse the existing number clips (200..10).
+
+Note: a source file that ends in .pcm but is actually a RIFF/WAVE file (renamed)
+is detected by its header and decoded normally — so you can pass *.pcm too. A
+genuinely headerless .pcm is skipped (it's already in the target format).
+
 Windows-console-safe: forces UTF-8 stdout.
 """
 
@@ -90,6 +108,21 @@ def trim_silence(mono):
     return clip
 
 
+def is_riff_wav(path):
+    """True if the file actually begins with a RIFF/WAVE header.
+
+    Some source clips arrive with a .pcm extension but are really WAV files
+    (e.g. exported then renamed). We sniff the magic bytes so those still get
+    decoded properly instead of being treated as headerless raw PCM.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+        return head[:4] == b"RIFF" and head[8:12] == b"WAVE"
+    except OSError:
+        return False
+
+
 def wav_to_samples(wav_path):
     """Decode a WAV to s16 mono @ 16 kHz, returning a list of int samples."""
     with wave.open(wav_path, "rb") as w:
@@ -165,6 +198,13 @@ def main():
     for wav_path in args.inputs:
         if not os.path.exists(wav_path):
             print(f"  [!] missing: {wav_path}", file=sys.stderr)
+            continue
+        # Skip anything that isn't actually a WAV (covers .pcm files that are
+        # already headerless raw PCM, and rejects junk early). A .pcm input that
+        # is secretly RIFF/WAVE is detected and decoded normally.
+        if not is_riff_wav(wav_path):
+            print(f"  [skip] not a WAV (no RIFF header): {wav_path}",
+                  file=sys.stderr)
             continue
         samples = wav_to_samples(wav_path)
         if args.output:

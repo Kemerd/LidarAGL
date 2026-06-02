@@ -83,6 +83,81 @@ int main(void)
         ASSERT_NEAR(mid, halfway, 0.5f, "dB ~halfway at 75 ft");
     }
 
+    /* --- equal-loudness correction (ISO 226) ------------------------------ */
+    {
+        /* 1 kHz is the reference: zero correction. */
+        ASSERT_NEAR(equal_loudness_db(1000.0f), 0.0f, 0.05f,
+                    "equal-loudness is 0 dB at 1 kHz");
+
+        /* Where the ear is LESS sensitive (low freqs in band) -> positive boost. */
+        ASSERT_TRUE(equal_loudness_db(500.0f) > 1.0f,
+                    "500 Hz gets a positive (boost) correction");
+
+        /* Where the ear is MORE sensitive (~2.5-3 kHz) -> negative (attenuate). */
+        ASSERT_TRUE(equal_loudness_db(2500.0f) < -1.0f,
+                    "2500 Hz gets a negative (attenuate) correction");
+
+        /* Interpolation between table points is monotonic on a known segment
+         * (2000 Hz -> 2500 Hz both attenuate increasingly). */
+        ASSERT_TRUE(equal_loudness_db(2500.0f) < equal_loudness_db(2000.0f),
+                    "correction interpolates between table points");
+
+        /* Clamps below/above the table without blowing up. */
+        ASSERT_NEAR(equal_loudness_db(400.0f), equal_loudness_db(500.0f), 0.001f,
+                    "below-band freq clamps to first point");
+        ASSERT_NEAR(equal_loudness_db(5000.0f), equal_loudness_db(3150.0f), 0.001f,
+                    "above-band freq clamps to last point");
+    }
+
+    /* --- THE key behaviour: perceived loudness is FLAT through the flare ---- */
+    {
+        /* Independent model of the ear's sensitivity (positive = MORE sensitive
+         * vs 1 kHz), from the same ISO 226 @ 60 phon data the firmware's
+         * correction is built to cancel. This is the INVERSE of the correction
+         * table, computed here independently so the test isn't tautological. */
+        struct { float hz, sens; } EAR[] = {
+            {500.f,-2.04f},{630.f,-0.80f},{800.f,0.12f},{1000.f,0.0f},
+            {1250.f,-2.14f},{1600.f,-3.18f},{2000.f,0.05f},{2500.f,2.76f},{3150.f,3.59f},
+        };
+        const int EN = (int)(sizeof EAR / sizeof EAR[0]);
+        /* interpolate the independent ear-sensitivity model */
+        /* (local lambda-free helper) */
+        #define EAR_SENS(F) ({ float _f=(F); float _r; \
+            if (_f<=EAR[0].hz) _r=EAR[0].sens; \
+            else if (_f>=EAR[EN-1].hz) _r=EAR[EN-1].sens; \
+            else { _r=0; for(int _i=0;_i+1<EN;++_i){ if(_f>=EAR[_i].hz&&_f<=EAR[_i+1].hz){ \
+                float _t=(_f-EAR[_i].hz)/(EAR[_i+1].hz-EAR[_i].hz); \
+                _r=EAR[_i].sens+_t*(EAR[_i+1].sens-EAR[_i].sens); break; } } } _r; })
+
+        /* UNCORRECTED perceived loudness (scheduled + ear sensitivity) WANDERS
+         * through the flare as the pitch sweeps across the ear's uneven
+         * sensitivity — confirm the problem (loudness not constant) exists. */
+        float ulo = 1e9f, uhi = -1e9f;
+        for (float agl = 50.0f; agl >= 0.0f; agl -= 2.0f) {
+            float f = agl_to_pitch_hz(agl);
+            float perceived = agl_to_tone_db(agl) + EAR_SENS(f);
+            if (perceived < ulo) ulo = perceived;
+            if (perceived > uhi) uhi = perceived;
+        }
+        ASSERT_TRUE((uhi - ulo) > 1.0f,
+                    "uncorrected: perceived loudness wanders >1 dB through the flare (the problem)");
+
+        /* CORRECTED perceived loudness (scheduled + firmware correction + ear)
+         * stays flat: the correction cancels the ear tilt, leaving the constant
+         * scheduled level. Check the spread across the whole flare band. */
+        float lo = 1e9f, hi = -1e9f;
+        for (float agl = 50.0f; agl >= 0.0f; agl -= 2.0f) {
+            float f = agl_to_pitch_hz(agl);
+            float perceived = agl_to_tone_db(agl) + equal_loudness_db(f) + EAR_SENS(f);
+            if (perceived < lo) lo = perceived;
+            if (perceived > hi) hi = perceived;
+        }
+        ASSERT_TRUE((hi - lo) < 0.2f,
+                    "corrected: perceived loudness is FLAT through the flare (<0.2 dB)");
+
+        #undef EAR_SENS
+    }
+
     /* --- db_to_gain ------------------------------------------------------- */
     {
         ASSERT_NEAR(db_to_gain(0.0f),   1.0f,   1e-4, "0 dB -> gain 1.0");

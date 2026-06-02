@@ -9,6 +9,7 @@
 #include "config.h"
 
 #include <math.h>
+#include <stddef.h>
 
 /* M_PI is not in the C standard (it's POSIX/_USE_MATH_DEFINES), so define it
  * locally to stay portable across MinGW, MSVC and the ESP-IDF toolchain.       */
@@ -72,6 +73,59 @@ float agl_to_tone_db(float agl_ft)
     frac = clampf(frac, 0.0f, 1.0f);
 
     return TONE_FLOOR_DB + frac * (TONE_FULL_DB - TONE_FLOOR_DB);
+}
+
+/* ---------------------------------------------------------------------------
+ *  Equal-loudness flattening table (ISO 226:2003, ~60 phon).
+ *
+ *  Each entry is { frequency Hz, correction dB }. The correction is the dB to
+ *  ADD to the scheduled level so equal scheduled dB sounds equally loud across
+ *  the sweep, referenced to 1 kHz (so 1 kHz == 0). Values were computed directly
+ *  from the ISO 226 inverse formula at 60 phon for our 500–3000 Hz working band:
+ *  where the ear is MORE sensitive the correction is NEGATIVE (attenuate); where
+ *  LESS sensitive it is POSITIVE (boost). The dip near 1250–1600 Hz is genuine
+ *  to the standard (ear-canal resonance behaviour), not a fudge.
+ * ------------------------------------------------------------------------- */
+typedef struct { float hz; float corr_db; } eql_point_t;
+
+static const eql_point_t EQL_TABLE[] = {
+    {  500.0f, +2.04f },
+    {  630.0f, +0.80f },
+    {  800.0f, -0.12f },
+    { 1000.0f,  0.00f },
+    { 1250.0f, +2.14f },
+    { 1600.0f, +3.18f },
+    { 2000.0f, -0.05f },
+    { 2500.0f, -2.76f },
+    { 3150.0f, -3.59f },
+};
+#define EQL_N (sizeof(EQL_TABLE) / sizeof(EQL_TABLE[0]))
+
+float equal_loudness_db(float freq_hz)
+{
+#if EQUAL_LOUDNESS_CORRECTION
+    /* Clamp to the table ends (our tone is already clamped to 500–3000 Hz). */
+    if (freq_hz <= EQL_TABLE[0].hz) {
+        return EQL_TABLE[0].corr_db;
+    }
+    if (freq_hz >= EQL_TABLE[EQL_N - 1].hz) {
+        return EQL_TABLE[EQL_N - 1].corr_db;
+    }
+    /* Linear interpolation between the two bracketing points. */
+    for (size_t i = 0; i + 1 < EQL_N; ++i) {
+        float f0 = EQL_TABLE[i].hz;
+        float f1 = EQL_TABLE[i + 1].hz;
+        if (freq_hz >= f0 && freq_hz <= f1) {
+            float t = (freq_hz - f0) / (f1 - f0);
+            return EQL_TABLE[i].corr_db +
+                   t * (EQL_TABLE[i + 1].corr_db - EQL_TABLE[i].corr_db);
+        }
+    }
+    return 0.0f;   /* unreachable */
+#else
+    (void)freq_hz;
+    return 0.0f;   /* correction disabled: no change */
+#endif
 }
 
 float db_to_gain(float db)

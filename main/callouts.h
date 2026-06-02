@@ -44,6 +44,24 @@ typedef struct {
 } clip_t;
 
 /**
+ * @brief Composable config-menu prompt pieces.
+ *
+ * @details To save flash we don't store one clip per full phrase. Instead the
+ *          menu plays a CHANNEL piece ("Mono" / "Stereo") followed by a STREAM
+ *          piece ("Callouts and Tone" / "Callouts Only" / "Tone Only"), with a
+ *          short gap between. The number clips (CO_*) voice the start-altitude.
+ */
+typedef enum {
+    CFG_PIECE_MONO = 0,          /**< "Mono"                                     */
+    CFG_PIECE_STEREO,            /**< "Stereo"                                   */
+    CFG_PIECE_CALLOUTS_AND_TONE, /**< "Callouts and Tone"                        */
+    CFG_PIECE_CALLOUTS_ONLY,     /**< "Callouts Only"                            */
+    CFG_PIECE_TONE_ONLY,         /**< "Tone Only"                                */
+    CFG_PIECE_START_ALT,         /**< "Callout Start Altitude"                   */
+    CFG_PIECE_COUNT
+} config_piece_t;
+
+/**
  * @brief Resolve a callout id to its embedded clip.
  * @param id  Callout id.
  * @return    Pointer to a (possibly absent) clip descriptor; never NULL itself.
@@ -55,6 +73,25 @@ const clip_t *callout_clip(callout_id_t id);
  * @return Pointer to the chirp descriptor; never NULL itself.
  */
 const clip_t *callout_chirp(void);
+
+/**
+ * @brief The "config mode, memory cleared" prompt played when config mode opens.
+ * @return Pointer to the descriptor; never NULL itself (may be an absent clip).
+ */
+const clip_t *config_clip_enter(void);
+
+/**
+ * @brief The short chirp played at config entry, on each confirm, and on commit.
+ * @return Pointer to the descriptor; never NULL itself (may be an absent clip).
+ */
+const clip_t *config_clip_chirp(void);
+
+/**
+ * @brief One composable config-menu prompt piece (see config_piece_t).
+ * @param piece  Which piece to fetch.
+ * @return       Pointer to the descriptor; never NULL itself (may be absent).
+ */
+const clip_t *config_clip_piece(config_piece_t piece);
 
 /**
  * @brief Map a callout HEIGHT in feet to its clip id.

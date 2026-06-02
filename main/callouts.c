@@ -41,6 +41,20 @@ DECLARE_CLIP(_binary_four_hundred_pcm);
 DECLARE_CLIP(_binary_five_hundred_pcm);
 DECLARE_CLIP(_binary_calib_error_pcm);
 
+/*  Boot config-menu prompts (see config_clip_* accessors). We compose phrases
+ *  from small pieces to save flash. Filenames in assets/clips/ map to these
+ *  symbols: chirp.pcm, config_mode.pcm, mono.pcm, stereo.pcm,
+ *  callouts_and_tone.pcm, callouts_only.pcm, tone_only.pcm,
+ *  callout_start_altitude.pcm. Start-altitude numbers reuse the CO_* clips.    */
+DECLARE_CLIP(_binary_chirp_pcm);
+DECLARE_CLIP(_binary_config_mode_pcm);
+DECLARE_CLIP(_binary_mono_pcm);
+DECLARE_CLIP(_binary_stereo_pcm);
+DECLARE_CLIP(_binary_callouts_and_tone_pcm);
+DECLARE_CLIP(_binary_callouts_only_pcm);
+DECLARE_CLIP(_binary_tone_only_pcm);
+DECLARE_CLIP(_binary_callout_start_altitude_pcm);
+
 /* Compute the byte length of an embedded clip, or 0 if it is absent. */
 #define CLIP_LEN(sym) ((sym##_start && sym##_end) \
                        ? (size_t)(sym##_end - sym##_start) : (size_t)0)
@@ -67,7 +81,10 @@ static clip_t make_clip(const uint8_t *start, const uint8_t *end, const char *na
  *  is computed once and reused).
  * ------------------------------------------------------------------------- */
 static clip_t s_clips[CO_COUNT];
-static clip_t s_chirp;
+static clip_t s_chirp;                        /* calibration-error chirp          */
+static clip_t s_cfg_enter;                    /* "config mode, memory cleared"    */
+static clip_t s_cfg_chirp;                    /* short menu chirp (entry/confirm) */
+static clip_t s_cfg_pieces[CFG_PIECE_COUNT];  /* composable spoken pieces         */
 static bool   s_built = false;
 
 static void build_manifest(void)
@@ -84,6 +101,17 @@ static void build_manifest(void)
     s_clips[CO_FIVE_HUNDRED]  = make_clip(_binary_five_hundred_pcm_start,  _binary_five_hundred_pcm_end,  "five hundred");
 
     s_chirp = make_clip(_binary_calib_error_pcm_start, _binary_calib_error_pcm_end, "calib error");
+
+    /* Boot config-menu prompts + composable pieces. */
+    s_cfg_enter = make_clip(_binary_config_mode_pcm_start, _binary_config_mode_pcm_end, "config mode");
+    s_cfg_chirp = make_clip(_binary_chirp_pcm_start,       _binary_chirp_pcm_end,       "config chirp");
+
+    s_cfg_pieces[CFG_PIECE_MONO]              = make_clip(_binary_mono_pcm_start,                   _binary_mono_pcm_end,                   "mono");
+    s_cfg_pieces[CFG_PIECE_STEREO]            = make_clip(_binary_stereo_pcm_start,                 _binary_stereo_pcm_end,                 "stereo");
+    s_cfg_pieces[CFG_PIECE_CALLOUTS_AND_TONE] = make_clip(_binary_callouts_and_tone_pcm_start,      _binary_callouts_and_tone_pcm_end,      "callouts and tone");
+    s_cfg_pieces[CFG_PIECE_CALLOUTS_ONLY]     = make_clip(_binary_callouts_only_pcm_start,          _binary_callouts_only_pcm_end,          "callouts only");
+    s_cfg_pieces[CFG_PIECE_TONE_ONLY]         = make_clip(_binary_tone_only_pcm_start,              _binary_tone_only_pcm_end,              "tone only");
+    s_cfg_pieces[CFG_PIECE_START_ALT]         = make_clip(_binary_callout_start_altitude_pcm_start, _binary_callout_start_altitude_pcm_end, "callout start altitude");
 
     s_built = true;
 }
@@ -105,6 +133,33 @@ const clip_t *callout_chirp(void)
         build_manifest();
     }
     return &s_chirp;
+}
+
+const clip_t *config_clip_enter(void)
+{
+    if (!s_built) {
+        build_manifest();
+    }
+    return &s_cfg_enter;
+}
+
+const clip_t *config_clip_chirp(void)
+{
+    if (!s_built) {
+        build_manifest();
+    }
+    return &s_cfg_chirp;
+}
+
+const clip_t *config_clip_piece(config_piece_t piece)
+{
+    if (!s_built) {
+        build_manifest();
+    }
+    if (piece < 0 || piece >= CFG_PIECE_COUNT) {
+        return &s_cfg_chirp;   /* harmless absent-safe fallback */
+    }
+    return &s_cfg_pieces[piece];
 }
 
 callout_id_t callout_id_for_ft(float ft)

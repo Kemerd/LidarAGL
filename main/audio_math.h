@@ -45,6 +45,35 @@ float agl_to_pitch_hz(float agl_ft);
 float agl_to_tone_db(float agl_ft);
 
 /**
+ * @brief Equal-loudness correction (dB) to flatten the ear's frequency tilt.
+ *
+ * @details The human ear is more sensitive to some frequencies than others
+ *          (the ISO 226 equal-loudness contours / Fletcher-Munson curves). Our
+ *          presence tone deliberately SWEEPS its pitch up as the ground nears,
+ *          which — if uncorrected — makes the tone sound progressively louder
+ *          even when its electrical level is held constant, because the rising
+ *          pitch climbs into the ear's more-sensitive band. That extra
+ *          loudness reads as a stress cue we do NOT want: urgency is carried by
+ *          the PITCH, while loudness is meant to stay perceptually constant once
+ *          the tone has faded in.
+ *
+ *          This returns the dB to ADD to the scheduled level so that equal
+ *          scheduled dB sounds equally loud across the sweep. It is a RELATIVE
+ *          flattening (referenced to 1 kHz), based on a compact interpolation of
+ *          the ISO 226 contour at a typical cockpit listening level (~60 phon).
+ *          It is not absolute calibration — the trim pot still sets master level.
+ *
+ *          Where the ear is MORE sensitive (higher freqs) this returns a
+ *          NEGATIVE value (attenuate); where it is LESS sensitive (lower freqs)
+ *          it returns a POSITIVE value (boost). Gated by
+ *          EQUAL_LOUDNESS_CORRECTION in config.h.
+ *
+ * @param freq_hz  The current tone frequency.
+ * @return         dB to add to the scheduled level (0.0 if correction disabled).
+ */
+float equal_loudness_db(float freq_hz);
+
+/**
  * @brief Convert a dB level (relative to full scale) to a linear gain.
  * @param db  Level in dB (<= 0 for attenuation).
  * @return    Linear gain, 10^(db/20).
