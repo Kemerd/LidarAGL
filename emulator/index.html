@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>LidarAGL — Emulator</title>
+
+  <!--
+    ===========================================================================
+     LidarAGL Web Emulator
+    ---------------------------------------------------------------------------
+     A single-page test bench for the LidarAGL firmware's altitude logic. Drag
+     the aircraft (or the slider) up and down; the REAL firmware state machine —
+     compiled from main/state_machine.c to WebAssembly — fires the callouts,
+     drives the presence tone, and reports its state. No logic is faked here.
+
+     Visual language: Apple HIG. Generous negative space, a single system font
+     stack, one restrained accent, soft depth via subtle shadows, and motion
+     that eases rather than snaps. Fully responsive: the layout collapses from a
+     two-column desk view to a stacked phone view, and the canvas tracks the
+     device pixel ratio so the tape stays crisp on retina displays.
+    ===========================================================================
+  -->
+
+  <style>
+    /* ---- Design tokens -------------------------------------------------- */
+    /*  One place for the palette and spacing so the whole UI stays coherent. */
+    :root {
+      --bg:        #0b0c10;   /* near-black cockpit backdrop                  */
+      --surface:   #15171e;   /* raised panel                                 */
+      --surface-2: #1d2029;   /* control wells                                */
+      --hairline:  #2a2e3a;   /* 1px separators                               */
+      --text:      #f5f6fa;   /* primary text                                 */
+      --text-dim:  #9aa0ad;   /* secondary text                              */
+      --accent:    #0a84ff;   /* iOS system blue — the single accent          */
+      --good:      #30d158;   /* iOS green — tone-active / armed              */
+      --warn:      #ff9f0a;   /* iOS orange — descent                          */
+      --danger:    #ff453a;   /* iOS red — flare band                          */
+      --radius:    16px;      /* continuous-corner feel                        */
+      --shadow:    0 8px 30px rgba(0,0,0,.45);
+    }
+
+    /* System font stack — matches the native OS for that first-party feel.   */
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background:
+        radial-gradient(1200px 600px at 70% -10%, #11243f 0%, transparent 60%),
+        var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+                   system-ui, Roboto, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right)
+               env(safe-area-inset-bottom) env(safe-area-inset-left);
+    }
+
+    /* ---- App shell ------------------------------------------------------ */
+    .wrap {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: clamp(16px, 4vw, 40px);
+      display: flex;
+      flex-direction: column;
+      gap: clamp(16px, 3vw, 28px);
+      min-height: 100%;
+    }
+
+    header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    header h1 {
+      font-size: clamp(20px, 3.4vw, 28px);
+      font-weight: 700; letter-spacing: -0.02em; margin: 0;
+    }
+    header .sub { color: var(--text-dim); font-size: 14px; font-weight: 500; }
+
+    /* The main split: tape canvas on the left, readouts/controls on the right.
+       On narrow screens this stacks vertically.                              */
+    .stage {
+      display: grid;
+      grid-template-columns: minmax(280px, 1fr) minmax(260px, 360px);
+      gap: clamp(16px, 3vw, 28px);
+      align-items: stretch;
+    }
+    @media (max-width: 720px) {
+      .stage { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    /* Canvas fills its panel; height comes from JS-driven aspect on resize.   */
+    .tape-panel { padding: 0; position: relative; min-height: 420px; }
+    #tape { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+    #tape.dragging { cursor: grabbing; }
+
+    .side { display: flex; flex-direction: column; gap: clamp(14px, 2.4vw, 20px); }
+
+    /* ---- Readout card --------------------------------------------------- */
+    .card { padding: 18px 20px; }
+    .card h2 {
+      margin: 0 0 14px; font-size: 12px; font-weight: 600; letter-spacing: 0.08em;
+      text-transform: uppercase; color: var(--text-dim);
+    }
+    .rows { display: grid; gap: 10px; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .row .k { color: var(--text-dim); font-size: 14px; }
+    .row .v {
+      font-variant-numeric: tabular-nums;
+      font-weight: 600; font-size: 15px;
+      font-feature-settings: "tnum" 1;
+    }
+
+    /* The big state pill — colour tracks the active state.                   */
+    .state-pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 6px 12px; border-radius: 999px;
+      background: var(--surface-2); font-weight: 700; font-size: 14px;
+      letter-spacing: 0.02em;
+      transition: background .25s ease, color .25s ease;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim);
+           transition: background .2s ease, box-shadow .2s ease; }
+    .dot.on { background: var(--good); box-shadow: 0 0 0 4px rgba(48,209,88,.18); }
+
+    /* ---- Controls ------------------------------------------------------- */
+    .controls { padding: 18px 20px; display: grid; gap: 16px; }
+
+    label.field { display: grid; gap: 8px; font-size: 13px; color: var(--text-dim); }
+    select {
+      appearance: none; -webkit-appearance: none;
+      background: var(--surface-2); color: var(--text);
+      border: 1px solid var(--hairline); border-radius: 12px;
+      padding: 11px 14px; font-size: 15px; font-weight: 600;
+      background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8'><path d='M1 1l5 5 5-5' fill='none' stroke='%239aa0ad' stroke-width='1.6' stroke-linecap='round'/></svg>");
+      background-repeat: no-repeat; background-position: right 14px center;
+    }
+
+    /* Vertical altitude slider — flipped so up = higher altitude.            */
+    .alt-slider {
+      writing-mode: vertical-lr;            /* modern vertical range          */
+      direction: rtl;
+      width: 36px; height: 220px; margin: 0 auto;
+      accent-color: var(--accent);
+    }
+
+    .btn {
+      appearance: none; border: none; cursor: pointer;
+      background: var(--accent); color: white;
+      font-size: 16px; font-weight: 600; letter-spacing: -0.01em;
+      padding: 13px 16px; border-radius: 13px;
+      transition: transform .12s cubic-bezier(.2,.8,.2,1), filter .2s ease, opacity .2s ease;
+    }
+    .btn:hover { filter: brightness(1.06); }
+    .btn:active { transform: scale(.97); }
+    .btn.secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--hairline); }
+    .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+    .hint { color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
+
+    /* The audio-unlock banner; hides itself once the AudioContext is live.   */
+    #audioGate {
+      display: flex; align-items: center; gap: 12px;
+      padding: 14px 16px; border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(10,132,255,.16), rgba(10,132,255,.06));
+      border: 1px solid rgba(10,132,255,.35);
+    }
+    #audioGate.hidden { display: none; }
+    #audioGate .txt { font-size: 13.5px; color: var(--text); }
+
+    /* Fade-in for the whole stage once WASM is ready.                        */
+    .stage { opacity: 0; transition: opacity .5s ease; }
+    .stage.ready { opacity: 1; }
+
+    .loading {
+      position: fixed; inset: 0; display: grid; place-items: center;
+      color: var(--text-dim); font-size: 15px; letter-spacing: .01em;
+    }
+    .loading.hidden { display: none; }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <header>
+      <h1>LidarAGL Emulator</h1>
+      <span class="sub">real firmware logic · running in WebAssembly</span>
+    </header>
+
+    <!-- Autoplay gate: the browser won't let us make sound until the user
+         interacts, so we surface an explicit Start control. -->
+    <div id="audioGate">
+      <button id="startBtn" class="btn">Start audio</button>
+      <span class="txt">Click to unlock sound, then drag the aircraft to fly. You can also just start dragging.</span>
+    </div>
+
+    <div class="stage" id="stage">
+      <!-- Left: the altitude tape canvas. -->
+      <div class="panel tape-panel">
+        <canvas id="tape"></canvas>
+      </div>
+
+      <!-- Right: live readouts + controls. -->
+      <div class="side">
+        <div class="panel card">
+          <h2>Telemetry</h2>
+          <div class="rows">
+            <div class="row">
+              <span class="k">State</span>
+              <span class="state-pill" id="statePill">
+                <span class="dot" id="stateDot"></span><span id="stateName">—</span>
+              </span>
+            </div>
+            <div class="row"><span class="k">AGL</span><span class="v" id="aglVal">— ft</span></div>
+            <div class="row"><span class="k">Vertical trend</span><span class="v" id="trendVal">—</span></div>
+            <div class="row"><span class="k">Tone</span><span class="v" id="toneVal">off</span></div>
+            <div class="row"><span class="k">Tone pitch</span><span class="v" id="hzVal">— Hz</span></div>
+            <div class="row"><span class="k">Tone level</span><span class="v" id="dbVal">— dB</span></div>
+            <div class="row"><span class="k">Poll period</span><span class="v" id="pollVal">— ms</span></div>
+            <div class="row"><span class="k">Last callout</span><span class="v" id="calloutVal">—</span></div>
+          </div>
+        </div>
+
+        <div class="panel controls">
+          <label class="field">
+            Sensor profile
+            <select id="profileSel">
+              <option value="0">SF30/C — callouts 200…10</option>
+              <option value="1">SF30/D — callouts 500…10</option>
+            </select>
+          </label>
+
+          <div class="btn-row">
+            <button class="btn secondary" id="resetBtn">Reset to ground</button>
+            <button class="btn secondary" id="cruiseBtn">Jump to cruise</button>
+          </div>
+
+          <p class="hint">
+            Drag the aircraft on the tape (or use the slider that appears on the
+            tape) to climb and descend. Callouts arm only after you climb through
+            the dashed <b>ARM</b> line, then fire on the way <b>down</b>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="loading" id="loading">Loading firmware…</div>
+
+  <!-- The whole app. Loads the Emscripten module and drives it. -->
+  <script type="module" src="./sim.js"></script>
+</body>
+</html>
