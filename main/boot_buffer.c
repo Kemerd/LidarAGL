@@ -194,6 +194,70 @@ void config_wipe_start_alt(void)
     ESP_LOGW(TAG, "start-altitude wiped (will use profile default)");
 }
 
+/* ---- Master volume offset (dB, layered on the analog pot) ---------------- */
+
+float config_load_volume_offset(void)
+{
+    /* Stored as a u8 CUT magnitude (|dB|): 0 == no cut, 6 == -6 dB. Absent /
+     * unreadable / out-of-range -> the default (0 dB), so a bad value can never
+     * silence the box or push it louder than the schedule intends.            */
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return DEFAULT_VOLUME_OFFSET_DB;
+    }
+    uint8_t cut = 0;
+    esp_err_t err = nvs_get_u8(h, NVS_KEY_VOLOFS, &cut);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return DEFAULT_VOLUME_OFFSET_DB;
+    }
+    /* Convert the magnitude back to a (negative) offset and clamp to the floor. */
+    float db = -(float)cut;
+    if (db < VOLUME_OFFSET_DB_MIN) {
+        db = VOLUME_OFFSET_DB_MIN;
+    }
+    if (db > 0.0f) {
+        db = 0.0f;
+    }
+    return db;
+}
+
+void config_save_volume_offset(float db)
+{
+    /* Clamp to [VOLUME_OFFSET_DB_MIN, 0], then store the rounded CUT magnitude. */
+    if (db > 0.0f) {
+        db = 0.0f;
+    }
+    if (db < VOLUME_OFFSET_DB_MIN) {
+        db = VOLUME_OFFSET_DB_MIN;
+    }
+    uint8_t cut = (uint8_t)(-db + 0.5f);    /* -3 dB -> 3 */
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed; volume offset not persisted");
+        return;
+    }
+    if (nvs_set_u8(h, NVS_KEY_VOLOFS, cut) == ESP_OK) {
+        nvs_commit(h);
+        ESP_LOGI(TAG, "volume offset saved: -%u dB", cut);
+    } else {
+        ESP_LOGE(TAG, "nvs_set_u8 failed; volume offset not persisted");
+    }
+    nvs_close(h);
+}
+
+void config_wipe_volume_offset(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, NVS_KEY_VOLOFS);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "volume offset wiped (will use 0 dB)");
+}
+
 /* ---- Load / commit ------------------------------------------------------- */
 
 size_t boot_buffer_load(boot_entry_t *out, size_t cap)

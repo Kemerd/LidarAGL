@@ -74,6 +74,19 @@ static float s_tone_agl_smooth = TONE_START_FT;   /* drives pitch + level       
 static float s_gain_cur        = 0.0f;            /* current linear tone gain    */
 static float s_duck_cur        = 1.0f;            /* current duck multiplier     */
 
+/*  Pilot's master volume offset as a LINEAR gain (1.0 == 0 dB == no cut). Set
+ *  from NVS at boot (and live by the config-menu preview) via audio_set_master_db.
+ *  Multiplied into BOTH channels every sample so it trims tone AND voice equally
+ *  — a true master volume on top of the analog pot. Atomic single-float write,
+ *  so the render loop can read it lock-free.                                     */
+static volatile float s_master_gain = 1.0f;
+
+/*  Steady baseline trim applied to the presence tone whenever the active mode
+ *  plays callouts (TONE_TRIM_WITH_VOICE_DB). Resolved once at init from
+ *  s_cfg.callouts_enabled into a linear gain so the per-sample path is a bare
+ *  multiply; 1.0 (no trim) in tone-only modes.                                   */
+static float s_tone_trim = 1.0f;
+
 /*  Flare fade multiplier: 1.0 = tone fully present, 0.0 = faded out under the
  *  flare. It slews toward 0 (slowly) below FLARE_FADE_FT and back toward 1
  *  (quickly) above it. Multiplied into the tone gain so a re-cross part-way
@@ -93,6 +106,13 @@ static size_t         s_clip_pos  = 0;
 static float s_gain_step = 0.0f;
 /*  Max smoothed-AGL change per sample for the pitch (slower => more stable).   */
 static float s_agl_step  = 0.0f;
+
+/*  Voice-duck envelope steps (per sample). The duck has an ASYMMETRIC shape: a
+ *  very fast ATTACK so the tone is already out of the way as a word begins, and a
+ *  gentle RELEASE so the tone eases back without a pump. A full duck swing takes
+ *  DUCK_ATTACK_MS down and DUCK_RELEASE_MS back up (see config.h).               */
+static float s_duck_attack_step  = 0.0f;   /* toward the ducked level (fast) */
+static float s_duck_release_step = 0.0f;   /* back toward full      (slow) */
 
 /*  Flare-fade slew steps (per sample): a full 1->0 swing takes FLARE_FADE_OUT_MS
  *  on the way DOWN, and FLARE_FADE_IN_MS on the way UP. The asymmetry is what
@@ -122,6 +142,11 @@ static float s_lpf_r    = 0.0f;        /* last LPF output, RIGHT channel        
  *  center image with gentle separation. At STEREO_PAN = 0.15 it is ~0.92/~0.27. */
 #define PAN_NEAR  (sqrtf(1.0f - 0.5f * (STEREO_PAN)))   /* dominant side         */
 #define PAN_FAR   (sqrtf(0.5f * (STEREO_PAN)))          /* bled-across side      */
+
+/*  Forward declaration: the single-NCO sine stepper (defined with the render
+ *  loop's oscillator helpers below) is also used by the blocking volume-preview
+ *  tone, which appears earlier in the file.                                      */
+static inline float nco_advance(float *phase, float freq_hz);
 
 /* ---------------------------------------------------------------------------
  *  Init
@@ -167,6 +192,21 @@ void audio_init(const audio_config_t *cfg)
     /* Allow the smoothed AGL to traverse the full 100 ft band in ~250 ms. */
     float agl_ramp_samples = 0.25f * (float)SAMPLE_RATE;
     s_agl_step = TONE_START_FT / agl_ramp_samples;
+
+    /* Voice-duck envelope steps: a full duck swing covers DUCK_ATTACK_MS on the
+     * way down (fast) and DUCK_RELEASE_MS on the way up (slow). The asymmetry is
+     * what makes the tone clear instantly for the first syllable yet ease back in
+     * without an audible pump (see config.h).                                   */
+    float duck_atk_samples = (DUCK_ATTACK_MS  / 1000.0f) * (float)SAMPLE_RATE;
+    float duck_rel_samples = (DUCK_RELEASE_MS / 1000.0f) * (float)SAMPLE_RATE;
+    s_duck_attack_step  = (duck_atk_samples > 0) ? (1.0f / duck_atk_samples) : 1.0f;
+    s_duck_release_step = (duck_rel_samples > 0) ? (1.0f / duck_rel_samples) : 1.0f;
+
+    /* Resolve the steady tone trim once: a constant cut while callouts are on so
+     * the voice always reads a touch clearer over the presence tone; no trim at
+     * all in a tone-only mode (nothing to make room for).                       */
+    s_tone_trim = s_cfg.callouts_enabled ? db_to_gain(TONE_TRIM_WITH_VOICE_DB)
+                                         : 1.0f;
 
     /* Flare-fade steps: a full 0..1 swing covers the configured fade time. The
      * out-step is the SLOW 3 s fade under the flare; the in-step is the QUICK
@@ -234,6 +274,18 @@ void audio_set_params(float tone_agl, bool tone_active)
     }
 }
 
+void audio_set_master_db(float db)
+{
+    /* Clamp to attenuation only (never boost past the schedule), convert once to
+     * a linear gain. A single volatile float write — no mutex needed; the render
+     * loop reads whatever is current, and a half-updated float can't occur for a
+     * 32-bit aligned store on the S3.                                            */
+    if (db > 0.0f) {
+        db = 0.0f;
+    }
+    s_master_gain = db_to_gain(db);
+}
+
 void audio_request_callout(callout_id_t id)
 {
     /* The logic task posts the id; the audio task picks it up and starts the
@@ -271,19 +323,79 @@ void audio_play_clip_blocking(const clip_t *c)
     size_t n = c->len_bytes / 2;       /* mono s16 samples */
     size_t written_total = 0;
 
+    /* Apply the pilot's master volume offset so config-menu prompts (and the
+     * volume preview's spoken number) play at exactly the level the running box
+     * will use. 1.0 == 0 dB == unchanged.                                       */
+    float mg = s_master_gain;
+
     /* Write in small interleaved blocks so we don't hold a huge stack buffer. */
     int16_t buf[AUDIO_FRAME_LEN * AUDIO_CH];
     while (written_total < n) {
         size_t chunk = n - written_total;
         if (chunk > AUDIO_FRAME_LEN) chunk = AUDIO_FRAME_LEN;
         for (size_t i = 0; i < chunk; ++i) {
-            buf[2 * i]     = pcm[written_total + i];   /* L */
-            buf[2 * i + 1] = pcm[written_total + i];   /* R */
+            int16_t s = (int16_t)((float)pcm[written_total + i] * mg);
+            buf[2 * i]     = s;   /* L */
+            buf[2 * i + 1] = s;   /* R */
         }
         size_t wrote = 0;
         i2s_channel_write(s_tx, buf, chunk * AUDIO_CH * sizeof(int16_t),
                           &wrote, portMAX_DELAY);
         written_total += chunk;
+    }
+}
+
+void audio_play_tone_blocking(float freq_hz, int ms, float level_db)
+{
+    /* A standalone NCO so the menu preview never disturbs the render loop's tone
+     * phase. Mirrors the firmware tone chain at a FIXED pitch: dB level -> linear
+     * gain, equal-loudness flattening at this frequency (so 1 kHz here sounds the
+     * same loudness it would in flight), then the pilot's master offset. Short
+     * raised-cosine fades top and tail the burst so there is no click.          */
+    if (!s_running || ms <= 0 || freq_hz <= 0.0f) {
+        return;
+    }
+    if (level_db > 0.0f) {
+        level_db = 0.0f;
+    }
+
+    float gain = db_to_gain(level_db + equal_loudness_db(freq_hz)) * s_master_gain;
+
+    size_t total = (size_t)((float)ms / 1000.0f * (float)SAMPLE_RATE);
+    /* Fade window: a few ms each end, never more than a third of the burst. */
+    size_t fade = (size_t)(0.004f * (float)SAMPLE_RATE);
+    if (fade > total / 3) {
+        fade = total / 3;
+    }
+
+    float phase = 0.0f;
+    size_t done = 0;
+    int16_t buf[AUDIO_FRAME_LEN * AUDIO_CH];
+    while (done < total) {
+        size_t chunk = total - done;
+        if (chunk > AUDIO_FRAME_LEN) chunk = AUDIO_FRAME_LEN;
+        for (size_t i = 0; i < chunk; ++i) {
+            size_t idx = done + i;
+
+            /* Raised-cosine edges (reuse the shared shaper for click-free ends). */
+            float env = 1.0f;
+            if (fade > 0) {
+                if (idx < fade) {
+                    env = raised_cosine((float)idx / (float)fade);
+                } else if (idx >= total - fade) {
+                    env = raised_cosine((float)(total - 1 - idx) / (float)fade);
+                }
+            }
+
+            float s = nco_advance(&phase, freq_hz) * gain * env;
+            int16_t v = (int16_t)(s * 32767.0f);
+            buf[2 * i]     = v;   /* L */
+            buf[2 * i + 1] = v;   /* R */
+        }
+        size_t wrote = 0;
+        i2s_channel_write(s_tx, buf, chunk * AUDIO_CH * sizeof(int16_t),
+                          &wrote, portMAX_DELAY);
+        done += chunk;
     }
 }
 
@@ -456,10 +568,17 @@ void audio_task(void *arg)
             /* Slew the smoothed AGL toward the target so pitch glides. */
             s_tone_agl_smooth = slew_limit(s_tone_agl_smooth, tone_agl, s_agl_step);
 
-            /* Slew the tone gain and the duck multiplier (raised-cosine feel via
-             * the linear slew is adequate at these short ramp times).          */
+            /* Slew the tone gain (raised-cosine feel via the linear slew is
+             * adequate at these short ramp times).                             */
             s_gain_cur = slew_limit(s_gain_cur, target_gain, s_gain_step);
-            s_duck_cur = slew_limit(s_duck_cur, duck_target, s_gain_step);
+
+            /* Slew the duck with the ASYMMETRIC envelope: a fast attack toward the
+             * ducked level (duck_target < current) so the tone clears instantly as
+             * a word begins, then a gentle release back to full (duck_target >
+             * current) so it eases in without pumping. Pick the step by direction. */
+            float duck_step = (duck_target < s_duck_cur) ? s_duck_attack_step
+                                                         : s_duck_release_step;
+            s_duck_cur = slew_limit(s_duck_cur, duck_target, duck_step);
 
             /* Slew the flare fade toward its target. Asymmetric step: slow out
              * under the flare, fast in on a climb-back-up. The fade-out step is
@@ -476,9 +595,12 @@ void audio_task(void *arg)
             float eql_gain = db_to_gain(equal_loudness_db(f));
 
             /* s_flare_fade silences the tone under the flare (see config.h).
-             * tone_sample() = fundamental + small 2nd harmonic (warmth).        */
+             * tone_sample() = fundamental + small 2nd harmonic (warmth).
+             * s_tone_trim holds the tone a constant TONE_TRIM_WITH_VOICE_DB down
+             * while callouts are enabled so the voice reads clearer over it (it
+             * is 1.0 in tone-only modes).                                        */
             float tone = tone_sample(f) * s_gain_cur * s_duck_cur * eql_gain
-                         * s_flare_fade;
+                         * s_flare_fade * s_tone_trim;
 
             /* Mix the voice clip (already at a comfortable level) if playing.
              * voice_active tracks PRESENCE (not amplitude): a clip mid-stream can
@@ -519,8 +641,12 @@ void audio_task(void *arg)
             left  = s_lpf_l;
             right = s_lpf_r;
 
-            frame[2 * i]     = (int16_t)(left  * 32767.0f);   /* L */
-            frame[2 * i + 1] = (int16_t)(right * 32767.0f);   /* R */
+            /* Pilot's master volume offset (tone + voice together) applied LAST,
+             * after the limiter + LPF, so it is a true master trim on top of the
+             * analog pot and never changes the soft-clip threshold above.        */
+            float mg = s_master_gain;
+            frame[2 * i]     = (int16_t)(left  * mg * 32767.0f);   /* L */
+            frame[2 * i + 1] = (int16_t)(right * mg * 32767.0f);   /* R */
         }
 
         /* Blocking write paces the loop to real time (the DMA backpressures). */

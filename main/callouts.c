@@ -57,6 +57,7 @@ DECLARE_CLIP(_binary_callouts_and_tone_pcm);
 DECLARE_CLIP(_binary_callouts_only_pcm);
 DECLARE_CLIP(_binary_tone_only_pcm);
 DECLARE_CLIP(_binary_callout_start_altitude_pcm);
+DECLARE_CLIP(_binary_volume_adjustment_pcm);
 
 /* Compute the byte length of an embedded clip, or 0 if it is absent. */
 #define CLIP_LEN(sym) ((sym##_start && sym##_end) \
@@ -118,6 +119,7 @@ static void build_manifest(void)
     s_cfg_pieces[CFG_PIECE_CALLOUTS_ONLY]     = make_clip(_binary_callouts_only_pcm_start,          _binary_callouts_only_pcm_end,          "callouts only");
     s_cfg_pieces[CFG_PIECE_TONE_ONLY]         = make_clip(_binary_tone_only_pcm_start,              _binary_tone_only_pcm_end,              "tone only");
     s_cfg_pieces[CFG_PIECE_START_ALT]         = make_clip(_binary_callout_start_altitude_pcm_start, _binary_callout_start_altitude_pcm_end, "callout start altitude");
+    s_cfg_pieces[CFG_PIECE_VOLUME_ADJ]        = make_clip(_binary_volume_adjustment_pcm_start,      _binary_volume_adjustment_pcm_end,      "volume adjustment");
 
     s_built = true;
 }

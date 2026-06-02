@@ -120,6 +120,30 @@ void config_save_start_alt(float ft);
 void config_wipe_start_alt(void);
 
 /**
+ * @brief Load the saved master volume offset (dB) from NVS.
+ *
+ * @details The offset is a MASTER attenuation layered on the analog pot: 0 dB is
+ *          no cut (the default), down to VOLUME_OFFSET_DB_MIN. It is stored as a
+ *          small non-negative CUT magnitude (a u8 of |dB|, e.g. 3 == -3 dB) so a
+ *          corrupt/absent value can never silence or over-boost the box.
+ *
+ * @return The stored offset in dB (<= 0), or DEFAULT_VOLUME_OFFSET_DB if absent.
+ */
+float config_load_volume_offset(void);
+
+/**
+ * @brief Persist the chosen master volume offset (dB) to NVS.
+ * @param db  Offset in dB (<= 0); clamped to [VOLUME_OFFSET_DB_MIN, 0] and
+ *            stored as a u8 cut magnitude.
+ */
+void config_save_volume_offset(float db);
+
+/**
+ * @brief Erase the saved volume offset (the next load returns the default 0 dB).
+ */
+void config_wipe_volume_offset(void);
+
+/**
  * @brief Load the stored ground readings.
  * @param out  Destination array (capacity @p cap).
  * @param cap  Capacity in entries.

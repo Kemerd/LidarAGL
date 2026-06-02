@@ -60,6 +60,20 @@ void audio_init(const audio_config_t *cfg);
 void audio_set_params(float tone_agl, bool tone_active);
 
 /**
+ * @brief Set the pilot's master volume offset (dB), applied to the WHOLE mix.
+ *
+ * @param db  Offset in dB (<= 0). A master attenuation layered on top of the
+ *            analog trim pot, so it lowers the presence tone AND the voice
+ *            callouts equally. Converted once to a linear gain and multiplied
+ *            into both channels every sample. Values > 0 are clamped to 0.
+ *
+ * @details Set once at boot from the value the config menu stored in NVS, and
+ *          also driven live by the menu's per-step preview so the pilot can hear
+ *          each setting before committing. Cheap and lock-free (a single float).
+ */
+void audio_set_master_db(float db);
+
+/**
  * @brief Request a voice callout (called by the logic task).
  * @param id  The callout to play. Missing clips are skipped gracefully.
  */
@@ -81,6 +95,23 @@ void audio_play_chirp(void);
  *          stereo hardware frame); pan settings do not apply to prompts.
  */
 void audio_play_clip_blocking(const clip_t *c);
+
+/**
+ * @brief Synchronously play a fixed-frequency sine burst (config-menu preview).
+ *
+ * @param freq_hz  Tone frequency in Hz.
+ * @param ms       Burst length in milliseconds.
+ * @param level_db Burst level in dB relative to full scale (<= 0).
+ *
+ * @details Used by the boot volume menu to voice the example tone in
+ *          "tone .. <number> .. tone" so the pilot hears the chosen level. Like
+ *          audio_play_clip_blocking() it runs before the render tasks exist and
+ *          is always mono-centered. The CURRENT master volume offset (set via
+ *          audio_set_master_db) is applied, so the preview matches exactly what
+ *          the box will sound like after the menu commits. Short raised-cosine
+ *          fades top and tail the burst so there is no click.
+ */
+void audio_play_tone_blocking(float freq_hz, int ms, float level_db);
 
 /**
  * @brief Pause the I2S channel (before MCU light-sleep in GROUND/CRUISE).

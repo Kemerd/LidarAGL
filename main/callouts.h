@@ -58,6 +58,7 @@ typedef enum {
     CFG_PIECE_CALLOUTS_ONLY,     /**< "Callouts Only"                            */
     CFG_PIECE_TONE_ONLY,         /**< "Tone Only"                                */
     CFG_PIECE_START_ALT,         /**< "Callout Start Altitude"                   */
+    CFG_PIECE_VOLUME_ADJ,        /**< "Volume Adjustment"                        */
     CFG_PIECE_COUNT
 } config_piece_t;
 

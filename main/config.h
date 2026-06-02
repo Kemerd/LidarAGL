@@ -190,6 +190,47 @@
 #define VOICE_DUCK_DB     4.0f        /* duck the tone this much under a callout  */
 #define GAIN_RAMP_MS      40          /* raised-cosine envelope time (>=30–50ms)  */
 
+/* ---- Audio: voice-duck envelope (fast attack, slow release) -------------- */
+/*  When a callout starts, the tone ducks by VOICE_DUCK_DB. Rather than slewing
+ *  that duck symmetrically (which would attack as slowly as it releases and let
+ *  the first syllable fight the un-ducked tone), we shape the duck with a tiny
+ *  ASYMMETRIC envelope: a very fast ATTACK so the tone is already out of the way
+ *  the instant the word begins, then a gentle RELEASE so the tone eases back in
+ *  without a pump. Kept intentionally short so it helps speech intelligibility
+ *  without being audible as an effect. Applied per-sample in audio.c to s_duck_cur. */
+#define DUCK_ATTACK_MS    2.5f        /* tone -> ducked (very fast, just clears it)*/
+#define DUCK_RELEASE_MS   8.0f        /* ducked -> full (gentle, no pump)          */
+
+/* ---- Audio: baseline tone trim when callouts are enabled ----------------- */
+/*  Even with the voice ducking the tone during a callout, the steady presence
+ *  tone is loud enough that the spoken numbers can FEEL quiet by contrast — a
+ *  loudness illusion, not an actual level problem. So whenever the active mode
+ *  plays callouts we hold the presence tone a constant TONE_TRIM_WITH_VOICE_DB
+ *  below its schedule for the WHOLE descent (not just under a word), giving the
+ *  voice a touch more room across the board. It stacks with VOICE_DUCK_DB during
+ *  an actual callout. In a tone-only mode there are no callouts to clear, so the
+ *  trim is not applied and the tone runs at its full scheduled level.            */
+#define TONE_TRIM_WITH_VOICE_DB  -1.0f  /* steady tone cut while callouts are on   */
+
+/* ---- Audio: master volume offset (boot config menu, perceptual dB) -------- */
+/*  A pilot-set MASTER trim, layered ON TOP of the builder's analog pot, chosen
+ *  in the boot config menu and stored in NVS. It attenuates the WHOLE mix —
+ *  presence tone AND voice callouts equally — so it behaves like a true volume
+ *  knob, not a tone/voice balance. The range is 0 dB (no cut, the default) down
+ *  to VOLUME_OFFSET_DB_MIN in VOLUME_OFFSET_DB_STEP increments; the menu cycles
+ *  through every step. Stored as a small NON-NEGATIVE magnitude in NVS (the cut
+ *  in dB, e.g. 3 == -3 dB) so it packs into a u8 cleanly.                        */
+#define VOLUME_OFFSET_DB_MIN   -6.0f  /* deepest cut the menu offers              */
+#define VOLUME_OFFSET_DB_STEP   1.0f  /* 0,-1,-2,...,-6 dB (1 dB ~ just-noticeable)*/
+#define DEFAULT_VOLUME_OFFSET_DB 0.0f /* no cut until the pilot lowers it         */
+
+/*  The 1 kHz example tone the volume menu plays at each step so the pilot can
+ *  judge the chosen level by ear ("tone .. <number> .. tone"). 1 kHz is the
+ *  equal-loudness reference and sits squarely in the speech band.                */
+#define VOLUME_PREVIEW_HZ      1000.0f
+#define VOLUME_PREVIEW_MS      350    /* length of each preview tone burst (ms)    */
+#define VOLUME_PREVIEW_DB      -6.0f  /* preview tone level (== TONE_FULL_DB)      */
+
 /* ---- Audio: flare fade-out (distraction guard under the flare) ----------- */
 /*  Once the aircraft settles below FLARE_FADE_FT the presence tone is no longer
  *  giving the pilot useful new information (the last callout — "ten" — has
@@ -254,6 +295,7 @@
 #define NVS_KEY_GROUNDBUF "groundbuf"  /* blob: BOOT_BUFFER_N x boot_entry_t     */
 #define NVS_KEY_AUDIOCFG  "audiocfg"   /* u8: selected AUDIO_MODE_* (config menu) */
 #define NVS_KEY_STARTALT  "startalt"   /* u16: callout start-altitude cap in ft   */
+#define NVS_KEY_VOLOFS    "volofs"     /* u8: master volume CUT magnitude in dB    */
 
 /* ---- FreeRTOS task stacks (BYTES in ESP-IDF) & priorities ---------------- */
 #define SENSOR_TASK_STACK 3072
