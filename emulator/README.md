@@ -64,8 +64,16 @@ start dragging), and fly.
 
 ## What to try
 
-With **SF30/C** selected, drag the aircraft from the ground up past the dashed
-**ARM** line to cruise, then back down:
+The fastest demo: hit **Fly approach · 85 kt ILS**. It auto-flies a scripted,
+physics-real approach — a constant-speed 85 kt run down a standard **3° ILS
+glideslope** (≈7.5 ft/s, ~450 ft/min sink) from just above CRUISE, then an
+**exponential flare** that bleeds the sink off to a soft touchdown. The numbers
+move themselves; the firmware still makes every callout/tone/flare-fade decision,
+so you hear its **natural landing cadence** hands-free. Tap again (or grab the
+aircraft) to cancel and take over.
+
+To hand-fly it instead: with **SF30/C** selected, drag the aircraft from the
+ground up past the dashed **ARM** line to cruise, then back down:
 
 - **Silent climb-out** — no callouts on the way up.
 - **Descent ladder** — on the way down you hear `200, 100, 50, 40, 30, 20, 10`,

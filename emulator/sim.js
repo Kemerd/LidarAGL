@@ -56,6 +56,47 @@ const AUDIO_MODE_META = [
 // always fed the RAW target AGL; this just makes the on-screen motion glide.
 const DISPLAY_EASE = 0.18;
 
+/* -----------------------------------------------------------------------------
+ *  Simulated-approach physics
+ * ---------------------------------------------------------------------------
+ *  A scripted ILS approach so you can hear the firmware's natural callout cadence
+ *  without hand-flying the slider. The numbers below are real-world textbook, not
+ *  invented: a light aircraft tracking the glideslope at 85 kt and a standard 3°
+ *  ILS path, then a conventional exponential flare to a soft touchdown.
+ *
+ *  All this code does is move targetAgl over time; the REAL firmware still makes
+ *  every callout / tone / flare-fade decision off that altitude, exactly as if a
+ *  human were dragging the aircraft down the tape.
+ * ------------------------------------------------------------------------------ */
+
+// Groundspeed → feet per second. 1 knot = 1.68781 ft/s; 85 kt ≈ 143.5 ft/s.
+const APPROACH_KNOTS   = 85;
+const KT_TO_FTS        = 1.68781;
+const APPROACH_GS_FTS  = APPROACH_KNOTS * KT_TO_FTS;
+
+// Standard ILS glideslope. Descent rate on the slope = groundspeed · tan(γ).
+// 143.5 · tan(3°) ≈ 7.52 ft/s ≈ 451 ft/min — the classic "rule-of-thumb" sink
+// for this speed/angle, so the callout spacing lands right where a pilot expects.
+const GLIDESLOPE_DEG   = 3.0;
+const GLIDESLOPE_SINK  = APPROACH_GS_FTS * Math.tan(GLIDESLOPE_DEG * Math.PI / 180);
+
+// Flare model. At FLARE_START_FT the pilot arrests the glideslope sink and lets
+// it decay exponentially toward a gentle touchdown sink, giving the float-and-
+// settle feel of a real flare. tau is the time-constant of that decay (s); a
+// larger tau = a longer, lazier float.
+const FLARE_START_FT   = 20.0;   // height AGL where the flare begins
+const FLARE_TOUCHDOWN_SINK = 1.5; // residual sink at the wheels (ft/s, gentle)
+const FLARE_TAU        = 1.6;    // exponential time-constant of the flare (s)
+
+// Where the scripted approach begins, in feet above the highest callout-ceiling
+// the sensor can see. We start a touch above the profile's CRUISE band so the run
+// opens in CRUISE, breaks into DESCENT through the ladder, and ends on the ground.
+const APPROACH_START_MARGIN_FT = 15.0;
+
+// A brief hold once the wheels are down before the run auto-clears, so the final
+// "10" callout and the flare-fade tail can finish playing.
+const APPROACH_HOLD_FT = 0.3;    // treat at/below this as "on the ground"
+
 /* =============================================================================
  *  Module-level state
  * ===========================================================================*/
@@ -70,6 +111,11 @@ let lastTs     = 0;      // previous rAF timestamp (ms)
 let profileIdx = 0;      // 0 = SF30/C, 1 = SF30/D
 let cfg        = null;   // cached profile + constant readouts (see readConfig)
 let lastFiredFt = null;  // most recent callout height fired (for the readout)
+
+// Scripted-approach runner. Null when idle; an object { sink } while flying. The
+// sink (ft/s) is integrated into targetAgl each frame and morphs from the glide-
+// slope rate into the exponential flare as the aircraft nears the ground.
+let approach = null;
 
 // Flare-fade multiplier, mirroring audio.c's s_flare_fade. 1 = tone fully
 // present, 0 = faded out under the flare. Slewed every frame with the firmware's
@@ -375,11 +421,98 @@ function commitConfigMenu() {
  * fade. Used by Commit and reusable elsewhere.
  */
 function calibrateToGround() {
+  cancelApproach();            // a zeroing always supersedes a running approach
   targetAgl  = 0;
-  displayAgl = 0;               // snap the glyph instantly — this is a zeroing
+  displayAgl = 0;              // snap the glyph instantly — this is a zeroing
   api.init(0 /* ST_GROUND */);
   lastFiredFt = null;
   flareFade = 1;
+}
+
+/* =============================================================================
+ *  Simulated approach
+ *
+ *  Kicks off a scripted, physics-driven landing: park just above CRUISE, then let
+ *  the runner in stepApproach() walk targetAgl down the 3° glideslope and through
+ *  the flare. The firmware does all the rest. Any manual input (drag, Reset, Jump
+ *  to cruise, profile change, config commit) cancels the run via cancelApproach().
+ * ===========================================================================*/
+
+/**
+ * Begin a simulated approach. Snaps the aircraft to the start altitude (just above
+ * the profile's CRUISE band so the run opens high and clean), restarts the state
+ * machine there, and arms the runner. Unlocks audio so you actually hear it.
+ */
+function startApproach() {
+  unlockAudio();                          // first-class user gesture: enable sound
+
+  // Start a hair above CRUISE so the firmware boots into CRUISE and then breaks
+  // into DESCENT as we sink through the ladder — the full state arc on one run.
+  const startFt = cfg.cruiseFt + APPROACH_START_MARGIN_FT;
+
+  targetAgl  = startFt;
+  displayAgl = startFt;                   // snap the glyph; the run glides from here
+  api.init(0 /* ST_GROUND */);            // clean restart...
+  api.step(startFt, 0.001);               // ...then seat the machine at altitude
+  lastFiredFt = null;
+  flareFade   = 1;                        // re-arm the flare fade for the descent
+
+  approach = { sink: GLIDESLOPE_SINK };   // open on the glideslope sink rate
+  updateApproachButton();
+}
+
+/** Stop a running approach and hand control back to the user. Safe if idle. */
+function cancelApproach() {
+  if (!approach) return;
+  approach = null;
+  updateApproachButton();
+}
+
+/**
+ * Advance the scripted approach by dt seconds, driving targetAgl. Above the flare
+ * we hold the constant glideslope sink; at/below FLARE_START_FT we relax the sink
+ * exponentially toward a soft touchdown rate, reproducing the float-and-settle of
+ * a real flare. When the wheels are effectively down we park at 0 and end the run.
+ *
+ * @param {number} dt  Frame time in seconds (already clamped by frame()).
+ */
+function stepApproach(dt) {
+  if (!approach) return;
+
+  // Choose the target sink rate for THIS height. On the glideslope it's constant;
+  // inside the flare it eases from the current sink toward the touchdown sink with
+  // a first-order (exponential) approach — the standard flare feel.
+  let targetSink;
+  if (targetAgl > FLARE_START_FT) {
+    targetSink = GLIDESLOPE_SINK;
+  } else {
+    targetSink = FLARE_TOUCHDOWN_SINK;
+  }
+
+  // First-order relaxation of the live sink toward the target. The 1 - e^(-dt/tau)
+  // factor makes the transition frame-rate independent and smoothly continuous as
+  // we cross into the flare, so there's no kink in the descent.
+  const k = 1 - Math.exp(-dt / FLARE_TAU);
+  approach.sink += (targetSink - approach.sink) * k;
+
+  // Integrate altitude. Sink is positive-down, so subtract it from the target AGL.
+  targetAgl = Math.max(0, targetAgl - approach.sink * dt);
+
+  // Touchdown: once we're on the ground, hold at 0 and let the run finish. We keep
+  // approach alive for one settle frame so the final low callout + flare-fade tail
+  // can play, then clear it on the next pass.
+  if (targetAgl <= APPROACH_HOLD_FT) {
+    targetAgl = 0;
+    cancelApproach();
+  }
+}
+
+/** Reflect the run state on the Fly-approach button (label + cancel affordance). */
+function updateApproachButton() {
+  const btn = document.getElementById('approachBtn');
+  if (!btn) return;
+  btn.textContent = approach ? 'Cancel approach' : 'Fly approach · 85 kt ILS';
+  btn.classList.toggle('secondary', !!approach);
 }
 
 /* =============================================================================
@@ -504,6 +637,10 @@ function frame(ts) {
   if (!(dt > 0)) dt = 0.001;        // first frame / clock weirdness
   if (dt > 0.1) dt = 0.1;           // ~100 ms ceiling
 
+  // Drive the scripted approach (if any) BEFORE stepping the machine, so the
+  // firmware sees the freshly-integrated glideslope/flare altitude this frame.
+  stepApproach(dt);
+
   // Step the REAL state machine with the raw target altitude.
   api.step(targetAgl, dt);
 
@@ -557,7 +694,11 @@ function frame(ts) {
   }
 
   // --- Visuals: ease the glyph toward target, then paint --------------------
-  displayAgl += (targetAgl - displayAgl) * DISPLAY_EASE;
+  // During a scripted approach the target moves smoothly already, so track it
+  // tightly (a hard ease would trail a fast descent); otherwise keep the gentle
+  // glide that makes manual drags feel fluid.
+  const ease = approach ? 0.6 : DISPLAY_EASE;
+  displayAgl += (targetAgl - displayAgl) * ease;
   draw(st, toneAgl, toneOn, pollMs);
   updateTelemetry(st, toneAgl, toneOn, pollMs);
 
@@ -789,6 +930,7 @@ function onPointerDown(e) {
   dragging = true;
   canvas.classList.add('dragging');
   canvas.setPointerCapture?.(e.pointerId);
+  cancelApproach();              // grabbing the aircraft takes over from the script
   unlockAudio();                 // first interaction also unlocks sound
   setTargetFromPointer(e);
 }
@@ -814,6 +956,7 @@ function setupDom() {
   document.getElementById('startBtn').addEventListener('click', unlockAudio);
 
   document.getElementById('profileSel').addEventListener('change', (e) => {
+    cancelApproach();              // ladder is changing out from under the run
     profileIdx = parseInt(e.target.value, 10) || 0;
     api.setProfile(profileIdx);
     api.init(0 /* ST_GROUND */);   // clean restart under the new ladder
@@ -823,6 +966,7 @@ function setupDom() {
   });
 
   document.getElementById('resetBtn').addEventListener('click', () => {
+    cancelApproach();
     targetAgl = 0;
     api.init(0 /* ST_GROUND */);
     lastFiredFt = null;
@@ -830,9 +974,17 @@ function setupDom() {
   });
 
   document.getElementById('cruiseBtn').addEventListener('click', () => {
+    cancelApproach();
     // Snap the aircraft up to just above cruise so you can demo a full approach.
     targetAgl = cfg.cruiseFt + 20;
     displayAgl = targetAgl;        // jump the glyph too, no long glide
+  });
+
+  // Fly approach: a one-tap scripted 85 kt / 3° ILS descent + flare. Toggles to
+  // a cancel control while running so a second tap hands control back.
+  document.getElementById('approachBtn').addEventListener('click', () => {
+    if (approach) cancelApproach();
+    else          startApproach();
   });
 
   // --- Config menu (Calibrate) --------------------------------------------
