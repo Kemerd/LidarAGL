@@ -201,6 +201,18 @@ EMSCRIPTEN_KEEPALIVE
 float sim_eql_db(float agl_ft) { return equal_loudness_db(agl_to_pitch_hz(agl_ft)); }
 
 /**
+ * @brief Equal-loudness correction (dB) at a RAW frequency (not via AGL).
+ *
+ * @details The volume-preview tone is a fixed 1 kHz burst, not a swept AGL pitch,
+ *          so the emulator needs the ISO-226 flattening AT a frequency directly —
+ *          the same equal_loudness_db(freq_hz) the firmware folds into
+ *          audio_play_tone_blocking(). Exposing it keeps the preview's level
+ *          identical to the hardware's instead of re-deriving the curve in JS.
+ */
+EMSCRIPTEN_KEEPALIVE
+float sim_eql_db_hz(float freq_hz) { return equal_loudness_db(freq_hz); }
+
+/**
  * @brief Final linear gain for the tone at a given AGL.
  *
  * @details Combines the scheduled dB level with the equal-loudness correction at

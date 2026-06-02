@@ -42,6 +42,23 @@ const STATE_COLORS = {
 // every WAV once regardless of which profile is active.
 const ALL_CALLOUT_FT = [500, 400, 300, 200, 100, 50, 40, 30, 20, 10];
 
+// Spoken config-menu prompt pieces, mirroring the firmware's config_clip_piece
+// set (see callouts.c). Keyed by the same names the firmware uses; the value is
+// the WAV filename in original_audio/. A piece with no WAV master yet (mono,
+// config_mode are only .pcm) is simply skipped when spoken — exactly the
+// graceful "absent clip" handling the firmware does for unembedded clips.
+const CONFIG_PIECE_WAV = {
+  config_mode:        'config_mode.wav',          // (no master yet -> skipped)
+  chirp:              'chirp.wav',
+  mono:               'mono.wav',                  // (no master yet -> skipped)
+  stereo:             'stereo.wav',
+  callouts_and_tone:  'callouts_and_tone.wav',
+  callouts_only:      'callouts_only.wav',
+  tone_only:          'tone_only.wav',
+  start_alt:          'callout_start_altitude.wav',
+  volume_adjustment:  'volume_adjustment.wav',
+};
+
 // Human-facing labels for the AUDIO_MODE_* indices (config.h). The INDEX is the
 // source of truth (the flags come from the WASM glue per mode); this is only the
 // UI copy. Order matches AUDIO_MODE_MONO_BOTH..MONO_TONE = 0..3.
@@ -150,6 +167,7 @@ let mixLpfNode   = null; // BiquadFilter (lowpass) — anti-harshness mix-bus LP
 let masterGainNode = null; // GainNode — the pilot's master volume offset (tone+voice)
 let audioUnlocked = false;
 const calloutBuffers = new Map(); // height(ft) -> decoded AudioBuffer
+const configBuffers  = new Map(); // piece name -> decoded AudioBuffer (menu prompts)
 
 // Voice-duck envelope, mirroring audio.c's s_duck_cur. While a callout plays the
 // tone ducks by VOICE_DUCK_DB with a fast ATTACK and a slow RELEASE; between
@@ -196,6 +214,7 @@ async function main() {
     pitchHz:       M.cwrap('sim_pitch_hz',       num,   [num]),
     toneDb:        M.cwrap('sim_tone_db',        num,   [num]),
     eqlDb:         M.cwrap('sim_eql_db',         num,   [num]),
+    eqlDbHz:       M.cwrap('sim_eql_db_hz',      num,   [num]),
     toneGain:      M.cwrap('sim_tone_gain',      num,   [num]),
 
     armFt:         M.cwrap('sim_arm_ft',         num,   []),
@@ -460,6 +479,121 @@ function refreshCapEnabled() {
 }
 
 /**
+ * Build the master-volume range against the firmware's offset range/step, and
+ * preview each setting by ear on change — the sim analogue of LEVEL 3 in
+ * run_config_menu. The slider walks 0 dB down to VOLUME_OFFSET_DB_MIN in
+ * VOLUME_OFFSET_DB_STEP increments; moving it applies the offset LIVE (so the
+ * preview plays at that level) and plays "tone .. number .. tone".
+ */
+function buildVolumeControl() {
+  const range = document.getElementById('volRange');
+  const minDb  = api.volMinDb();      // e.g. -6
+  const stepDb = api.volStepDb();     // e.g. 1
+  const nSteps = Math.round(-minDb / stepDb);   // 6 steps below 0 -> 7 stops
+
+  // The slider counts CUT steps (0..nSteps); 0 == no cut (0 dB), nSteps == min.
+  range.min = 0;
+  range.max = nSteps;
+  range.step = 1;
+  range.value = Math.round(-pendingVolDb / stepDb);
+  updateVolLabel(pendingVolDb);
+
+  range.oninput = () => {
+    pendingVolDb = -parseInt(range.value, 10) * stepDb;
+    updateVolLabel(pendingVolDb);
+    // Apply live + preview, exactly like the firmware menu applies each tap before
+    // committing, so the user hears the chosen level immediately.
+    unlockAudio().then(() => {
+      applyVolume(pendingVolDb);
+      previewVolume();
+    });
+  };
+}
+
+/** Show the chosen offset, flagging 0 dB as "full". */
+function updateVolLabel(db) {
+  const el = document.getElementById('volVal');
+  el.textContent = db >= 0 ? '0 dB · full' : `${db} dB`;
+}
+
+/**
+ * Preview the current master volume by ear: "tone .. number .. tone", mirroring
+ * app_main.c's preview_volume(). A short 1 kHz WebAudio burst (at the firmware's
+ * preview level + equal-loudness), then the spoken "30" callout, then the burst
+ * again — all downstream of masterGainNode, so the live offset trims them just
+ * like the running box. No-op until audio is unlocked.
+ */
+function previewVolume() {
+  if (!audioUnlocked || !audioCtx) return;
+
+  const hz   = api.volPreviewHz();
+  const ms   = api.volPreviewMs();
+  const db   = api.volPreviewDb();
+  const gap  = 0.09;                 // 90 ms between pieces, matching the firmware
+  let when   = audioCtx.currentTime + 0.02;
+
+  when = scheduleTone(hz, ms, db, when) + gap;   // tone
+  when = scheduleCalloutAt(30, when) + gap;      // "30"
+  scheduleTone(hz, ms, db, when);                // tone
+}
+
+/**
+ * Schedule a fixed-frequency sine burst through the master node, returning the
+ * audioCtx time it ENDS. Mirrors audio_play_tone_blocking(): the burst level is
+ * db + equal-loudness at this frequency, with short raised-cosine-ish fades (a
+ * linear ramp is a close, click-free analogue) top and tail.
+ *
+ * @param {number} hz    Tone frequency.
+ * @param {number} ms    Burst length in ms.
+ * @param {number} db    Burst level in dB before equal-loudness + master.
+ * @param {number} when  audioCtx time to start at.
+ * @returns {number}     audioCtx time the burst ends.
+ */
+function scheduleTone(hz, ms, db, when) {
+  const dur = ms / 1000;
+  const o = audioCtx.createOscillator();
+  o.type = 'sine';
+  o.frequency.value = hz;
+
+  // Level = scheduled dB + equal-loudness flattening at this pitch (the firmware
+  // folds equal_loudness_db into the preview gain), then -> linear gain.
+  const g = audioCtx.createGain();
+  const peak = api.masterGain(db + api.eqlDbHz(hz));
+  const fade = Math.min(0.004, dur / 3);   // few-ms click-free edges
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(peak, when + fade);
+  g.gain.setValueAtTime(peak, when + dur - fade);
+  g.gain.linearRampToValueAtTime(0.0001, when + dur);
+
+  o.connect(g).connect(masterGainNode);   // through master -> offset applies
+  o.start(when);
+  o.stop(when + dur + 0.01);
+  return when + dur;
+}
+
+/**
+ * Schedule the spoken callout for a height at a specific time, returning the time
+ * it ends. Like playCallout() but time-anchored (for the volume preview sequence)
+ * and NOT gated by modeCallouts — the preview always voices its number so the
+ * pilot can judge voice-vs-tone balance even while auditioning a tone-only setup.
+ *
+ * @param {number} ft    Callout height whose WAV to play.
+ * @param {number} when  audioCtx time to start at.
+ * @returns {number}     audioCtx time it ends (start + buffer duration).
+ */
+function scheduleCalloutAt(ft, when) {
+  const buf = calloutBuffers.get(ft);
+  if (!buf) return when;                   // missing clip -> no gap added
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  // Centre the preview number (pan is a balance cue, not relevant to a level audit).
+  src.connect(masterGainNode);
+  src.start(when);
+  return when + buf.duration;
+}
+
+/**
  * Apply the pending picks and recalibrate to ground. This is the sim analogue of
  * the firmware committing the menu and rebooting: the audio mode + cap take
  * effect, the state machine restarts cleanly on the ground, and the aircraft
@@ -468,6 +602,7 @@ function refreshCapEnabled() {
 function commitConfigMenu() {
   applyAudioMode(pendingMode);
   startAltFt = pendingCapFt;
+  applyVolume(pendingVolDb);     // master volume offset (tone + voice)
 
   calibrateToGround();          // zero the box (shared with the Calibrate path)
   closeConfigMenu();
@@ -487,6 +622,204 @@ function calibrateToGround() {
   flareFade = 1;
   duckCur = 1;                 // un-duck (no callout in flight after a zeroing)
   duckActiveUntil = 0;
+}
+
+/* =============================================================================
+ *  Manual config-menu simulation (single button)
+ *
+ *  A faithful re-enactment of the firmware's hold-at-boot run_config_menu()
+ *  (app_main.c), driven by ONE button exactly as the box's single config button
+ *  is: a TAP cycles the current option, a DOUBLE-TAP confirms it (the firmware
+ *  also auto-confirms after CONFIG_COMMIT_MS of silence — we keep the double-tap
+ *  as the explicit confirm here). The level order, the spoken prompts, the
+ *  preview tones, and the chirps are the SAME as the firmware's; we cannot run
+ *  app_main.c itself in WASM (it pulls in ESP-IDF/I2S), so this JS walks the
+ *  identical sequence and commits into the SAME live config vars + persists by
+ *  recalibrating to ground, just like the real menu reboots on commit.
+ *
+ *  Implemented as an explicit step list so the flow reads top-to-bottom like the
+ *  firmware function: enter -> LEVEL 1 (mode) -> LEVEL 2 (start-alt, skipped for
+ *  tone-only) -> LEVEL 3 (volume) -> commit. A small interpreter advances on each
+ *  tap/double-tap and narrates the current selection in the popup.
+ * ===========================================================================*/
+
+const DTAP_MS = 350;     // two taps within this window == a double-tap (confirm)
+
+let manualOpen   = false;   // is the manual menu modal showing?
+let manualLevel  = 0;       // 0 = mode, 1 = start-alt, 2 = volume, 3 = committed
+let manualLastTap = 0;      // performance.now() of the last tap (double-tap detect)
+let manualTapTimer = null;  // pending single-tap resolution timer
+
+// Working picks for the in-progress walk (committed only at the end), seeded from
+// the live config when the menu opens — same as the firmware starting from its
+// saved/default values.
+let manMode  = 1;
+let manCapIdx = 0;          // index into the ascending callout ladder
+let manVolDb = 0;
+
+/** Open the manual menu: reset to LEVEL 1 and speak the entry + first option. */
+function openManualMenu() {
+  unlockAudio().then(() => {
+    manualOpen  = true;
+    manualLevel = 0;
+    manMode     = audioMode;
+    manVolDb    = volumeDb;
+
+    // Cap index seeded from the live cap against the ascending ladder.
+    const asc = [...cfg.callouts].sort((a, b) => a - b);
+    const liveCap = isFinite(startAltFt) ? startAltFt : asc[asc.length - 1];
+    manCapIdx = Math.max(0, asc.indexOf(liveCap));
+    if (manCapIdx < 0) manCapIdx = asc.length - 1;
+
+    document.getElementById('manualBackdrop').classList.add('open');
+
+    // Entry: chirp + "config mode" (config_mode has no WAV master -> skipped),
+    // then announce the starting mode, mirroring run_config_menu()'s opening.
+    let when = audioCtx.currentTime + 0.05;
+    when = schedulePieceAt('chirp', when) + 0.08;
+    when = schedulePieceAt('config_mode', when) + 0.12;
+    announceModeManual(when);
+    renderManual();
+  });
+}
+
+/** Close the manual menu without committing. */
+function closeManualMenu() {
+  manualOpen = false;
+  if (manualTapTimer) { clearTimeout(manualTapTimer); manualTapTimer = null; }
+  document.getElementById('manualBackdrop').classList.remove('open');
+}
+
+/** Speak an audio mode as channel + stream pieces (mirrors announce_mode()). */
+function announceModeManual(startWhen) {
+  let when = startWhen ?? (audioCtx.currentTime + 0.05);
+  const channel = api.modeStereo(manMode) === 1 ? 'stereo' : 'mono';
+  let stream = 'callouts_and_tone';
+  if (api.modeCallouts(manMode) === 0)      stream = 'tone_only';
+  else if (api.modeTone(manMode) === 0)     stream = 'callouts_only';
+  when = schedulePieceAt(channel, when) + 0.12;   // small gap, like the firmware
+  schedulePieceAt(stream, when);
+}
+
+/** Speak a callout height for the start-alt level via its number WAV. */
+function announceCapManual() {
+  const asc = [...cfg.callouts].sort((a, b) => a - b);
+  scheduleCalloutAt(asc[manCapIdx], audioCtx.currentTime + 0.05);
+}
+
+/** A single tap: cycle the current level's option (+ announce/preview it). */
+function manualTap() {
+  if (!manualOpen) return;
+  switch (manualLevel) {
+    case 0:   // audio mode
+      manMode = (manMode + 1) % api.audioModeCount();
+      applyAudioMode(manMode);          // apply live so prompts honour the mode
+      announceModeManual();
+      break;
+    case 1: { // start altitude (only reached when callouts are enabled)
+      const asc = [...cfg.callouts].sort((a, b) => a - b);
+      // Firmware steps DOWN the descending ladder; on the ascending slider that is
+      // a step toward index 0, wrapping to the top.
+      manCapIdx = (manCapIdx - 1 + asc.length) % asc.length;
+      announceCapManual();
+      break;
+    }
+    case 2:   // master volume
+      manVolDb -= api.volStepDb();
+      if (manVolDb < api.volMinDb() - 0.001) manVolDb = 0;   // wrap to no-cut
+      applyVolume(manVolDb);            // apply live so the preview is at-level
+      previewVolume();
+      break;
+  }
+  renderManual();
+}
+
+/** A double-tap: confirm the current level and advance (mirrors TAP_DOUBLE). */
+function manualConfirm() {
+  if (!manualOpen) return;
+  schedulePieceAt('chirp', audioCtx.currentTime + 0.03);   // confirm chirp
+
+  if (manualLevel === 0) {
+    // Committed the mode. LEVEL 2 is skipped entirely for a tone-only mode (no
+    // callouts to gate), exactly like the firmware.
+    applyAudioMode(manMode);
+    if (api.modeCallouts(manMode) === 1) {
+      manualLevel = 1;
+      // Announce "Callout Start Altitude" + the starting (top) height.
+      let when = schedulePieceAt('start_alt', audioCtx.currentTime + 0.12) + 0.12;
+      const asc = [...cfg.callouts].sort((a, b) => a - b);
+      scheduleCalloutAt(asc[manCapIdx], when);
+    } else {
+      enterVolumeLevel();
+    }
+  } else if (manualLevel === 1) {
+    enterVolumeLevel();
+  } else if (manualLevel === 2) {
+    commitManualMenu();
+    return;
+  }
+  renderManual();
+}
+
+/** Advance into LEVEL 3 (volume): announce "Volume Adjustment" + preview. */
+function enterVolumeLevel() {
+  manualLevel = 2;
+  manVolDb = 0;                         // firmware starts LEVEL 3 at 0 dB
+  applyVolume(manVolDb);
+  const when = schedulePieceAt('volume_adjustment', audioCtx.currentTime + 0.12) + 0.12;
+  // Preview after the announcement finishes.
+  setTimeout(() => { if (manualOpen) previewVolume(); },
+             Math.max(0, (when - audioCtx.currentTime) * 1000));
+}
+
+/** Commit the manual walk: apply all picks + recalibrate to ground, like reboot. */
+function commitManualMenu() {
+  applyAudioMode(manMode);
+  const asc = [...cfg.callouts].sort((a, b) => a - b);
+  startAltFt = api.modeCallouts(manMode) === 1 ? asc[manCapIdx] : cfg.callouts[0];
+  applyVolume(manVolDb);
+  calibrateToGround();
+  closeManualMenu();
+}
+
+/** Route a button press through tap / double-tap detection (single button). */
+function manualButtonPress() {
+  const now = performance.now();
+  if (now - manualLastTap < DTAP_MS) {
+    // Second press inside the window -> double-tap (confirm). Cancel the pending
+    // single-tap so it doesn't also cycle.
+    if (manualTapTimer) { clearTimeout(manualTapTimer); manualTapTimer = null; }
+    manualLastTap = 0;
+    manualConfirm();
+  } else {
+    // First press: wait DTAP_MS to see if a second arrives; if not, it's a tap.
+    manualLastTap = now;
+    manualTapTimer = setTimeout(() => {
+      manualTapTimer = null;
+      manualLastTap = 0;
+      manualTap();
+    }, DTAP_MS);
+  }
+}
+
+/** Paint the manual menu's status text from the current level + working picks. */
+function renderManual() {
+  const levelEl = document.getElementById('manualLevel');
+  const valueEl = document.getElementById('manualValue');
+  const LEVELS = ['Audio mode', 'Start-altitude cap', 'Volume adjustment'];
+  levelEl.textContent = `Step ${manualLevel + 1} of 3 · ${LEVELS[manualLevel] ?? '—'}`;
+
+  let v = '—';
+  if (manualLevel === 0) {
+    v = AUDIO_MODE_META[manMode]?.title ?? `mode ${manMode}`;
+  } else if (manualLevel === 1) {
+    const asc = [...cfg.callouts].sort((a, b) => a - b);
+    const ft = asc[manCapIdx];
+    v = ft >= cfg.callouts[0] ? `${ft} ft · all` : `${ft} ft`;
+  } else if (manualLevel === 2) {
+    v = manVolDb >= 0 ? '0 dB · full' : `${manVolDb} dB`;
+  }
+  valueEl.textContent = v;
 }
 
 /* =============================================================================
@@ -659,6 +992,38 @@ async function loadCallouts() {
       console.warn(`callout ${ft}.wav unavailable:`, e.message);
     }
   }));
+
+  // Also decode the spoken config-menu prompt pieces (mono/config_mode have no
+  // WAV master yet and are silently skipped, like an absent firmware clip).
+  await Promise.all(Object.entries(CONFIG_PIECE_WAV).map(async ([name, file]) => {
+    try {
+      const res = await fetch(`${AUDIO_BASE}/${file}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buf = await audioCtx.decodeAudioData(await res.arrayBuffer());
+      configBuffers.set(name, buf);
+    } catch (e) {
+      console.warn(`config piece ${file} unavailable:`, e.message);
+    }
+  }));
+}
+
+/**
+ * Schedule a config-menu prompt piece at a time, returning when it ends. Plays
+ * through the master node so the live volume offset trims it (the menu prompts
+ * go through the same DAC path on hardware). A missing piece adds no gap.
+ *
+ * @param {string} name  Key into CONFIG_PIECE_WAV / configBuffers.
+ * @param {number} when  audioCtx time to start at.
+ * @returns {number}     audioCtx time it ends.
+ */
+function schedulePieceAt(name, when) {
+  const buf = configBuffers.get(name);
+  if (!buf || !audioCtx) return when;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(masterGainNode);
+  src.start(when);
+  return when + buf.duration;
 }
 
 /** Fire a one-shot callout clip at the given height (no-op if not loaded). */
@@ -862,6 +1227,10 @@ function updateTelemetry(st, toneAgl, toneOn, pollMs) {
   const capTop = cfg.callouts[0];
   document.getElementById('capValTelem').textContent =
     (!isFinite(startAltFt) || startAltFt >= capTop) ? 'all' : `${Math.round(startAltFt)} ft`;
+
+  // Master volume offset (0 dB == full).
+  document.getElementById('volValTelem').textContent =
+    volumeDb >= 0 ? 'full' : `${volumeDb} dB`;
 }
 
 /* =============================================================================
@@ -1098,9 +1467,18 @@ function setupDom() {
     if (e.target.id === 'configBackdrop') closeConfigMenu();
   });
 
-  // Esc closes the sheet too, matching native sheet behaviour.
+  // --- Manual config menu (single-button, drives the firmware sequence) ----
+  document.getElementById('manualBtn').addEventListener('click', openManualMenu);
+  document.getElementById('manualDoneBtn').addEventListener('click', closeManualMenu);
+  // The single config button: tap to cycle, double-tap to confirm/advance.
+  document.getElementById('manualTapBtn').addEventListener('click', manualButtonPress);
+  document.getElementById('manualBackdrop').addEventListener('click', (e) => {
+    if (e.target.id === 'manualBackdrop') closeManualMenu();
+  });
+
+  // Esc closes whichever sheet is open, matching native sheet behaviour.
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeConfigMenu();
+    if (e.key === 'Escape') { closeConfigMenu(); closeManualMenu(); }
   });
 }
 

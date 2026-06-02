@@ -86,6 +86,20 @@ ground up past the dashed **ARM** line to cruise, then back down:
 - **Profile switch** — pick **SF30/D** and the tape gains 500/400/300 ticks, the
   cruise line jumps to 500, and a high descent fires those extra callouts. The
   SF30/C never does — proof the real per-profile C table is in charge.
+- **Config menu** — **Calibrate** opens the instant sheet: audio mode, the
+  start-altitude cap, and the **Volume adjustment** trim (0 dB → −6 dB) that lowers
+  the tone *and* voice together. Drag the volume slider to audition each level by
+  ear as *"tone .. number .. tone"*, exactly the firmware's LEVEL 3 preview.
+- **Simulate config button** — re-enacts the box's hold-at-boot menu on **one
+  button**: *tap* cycles the current option, *double-tap* confirms and advances
+  (mode → start-alt → volume), playing the same spoken prompts and preview tones
+  the firmware would. The level order and timing match `run_config_menu()`.
+- **Voice clarity** — when callouts are enabled the presence tone sits a steady
+  **−1 dB** lower so the numbers read clearer, and ducks with a fast-attack /
+  slow-release envelope under each callout — both mirrored from `audio.c`.
+- **Taxi-back disarm** — sit on the ground for **30 s** and the box disarms as if
+  rebooted; the next takeoff is silent until you climb back through **ARM** (a
+  quick touch-and-go inside the window keeps the callouts armed).
 
 Every number you hear and every state you see comes from the compiled
 `sm_step()` / `audio_math` — the firmware brain, running in your browser.
@@ -99,3 +113,8 @@ Every number you hear and every state you see comes from the compiled
   profile's callout list.
 - No existing firmware source is modified; the `emulator/` directory is invisible
   to the ESP-IDF build (`main/CMakeLists.txt` uses an explicit source list).
+- The manual config menu speaks its prompts from the WAV masters in
+  `assets/original_audio/`. Two pieces (`mono`, `config_mode`) currently exist
+  only as `.pcm`, with no `.wav` master — those words are silently skipped (the
+  same graceful handling the firmware applies to an unembedded clip). Add
+  `mono.wav` / `config_mode.wav` masters to have them spoken in the sim too.

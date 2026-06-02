@@ -263,6 +263,47 @@
     .cap-hint { color: var(--text-dim); font-size: 11.5px; line-height: 1.45; }
 
     .sheet-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+    /* ---- Manual config menu (single-button re-enactment) ----------------- */
+    /*  Shares the sheet's frosted look + spring entrance with #configBackdrop.  */
+    #manualBackdrop {
+      position: fixed; inset: 0; z-index: 40;
+      display: grid; place-items: center;
+      padding: 20px;
+      background: rgba(4, 5, 8, .55);
+      -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+      opacity: 0; pointer-events: none;
+      transition: opacity .28s ease;
+    }
+    #manualBackdrop.open { opacity: 1; pointer-events: auto; }
+    #manualBackdrop .config-sheet {
+      transform: scale(.92) translateY(12px); opacity: 0;
+      transition: transform .42s cubic-bezier(.34, 1.56, .64, 1), opacity .3s ease;
+    }
+    #manualBackdrop.open .config-sheet { transform: scale(1) translateY(0); opacity: 1; }
+
+    /* The big live value the current step is sitting on. */
+    .manual-value {
+      font-size: 22px; font-weight: 700; letter-spacing: -0.02em;
+      color: var(--accent); margin: 2px 0 18px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* The single config button — a tactile circular target with a press spring. */
+    .manual-tap {
+      appearance: none; border: none; cursor: pointer;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 2px;
+      width: 132px; height: 132px; margin: 0 auto 20px; border-radius: 50%;
+      background: radial-gradient(120% 120% at 50% 30%, #1e88ff 0%, var(--accent) 55%, #0066d6 100%);
+      color: white; box-shadow: 0 10px 30px rgba(10,132,255,.4), inset 0 1px 0 rgba(255,255,255,.25);
+      transition: transform .1s cubic-bezier(.2,.8,.2,1), filter .2s ease;
+      user-select: none; -webkit-user-select: none;
+    }
+    .manual-tap:hover { filter: brightness(1.06); }
+    .manual-tap:active { transform: scale(.94); }
+    .manual-tap .mt-label { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
+    .manual-tap .mt-sub { font-size: 11px; font-weight: 500; opacity: .85; }
   </style>
 </head>
 
@@ -307,6 +348,7 @@
             <div class="row"><span class="k">Last callout</span><span class="v" id="calloutVal">—</span></div>
             <div class="row"><span class="k">Audio mode</span><span class="v" id="modeVal">—</span></div>
             <div class="row"><span class="k">Callout cap</span><span class="v" id="capValTelem">—</span></div>
+            <div class="row"><span class="k">Volume</span><span class="v" id="volValTelem">—</span></div>
           </div>
         </div>
 
@@ -337,6 +379,13 @@
                the firmware's hold-at-boot calibration that reboots to 0 ft. -->
           <button class="btn" id="calibrateBtn" style="margin-top:10px; width:100%;">
             Calibrate · open config menu
+          </button>
+
+          <!-- Manual config: re-enacts the firmware's hold-at-boot menu driven by
+               a single button — tap to cycle, double-tap to confirm — playing the
+               same spoken prompts and preview tones the box would. -->
+          <button class="btn secondary" id="manualBtn" style="margin-top:10px; width:100%;">
+            Simulate config button
           </button>
 
           <p class="hint">
@@ -376,9 +425,50 @@
         </p>
       </div>
 
+      <!-- Master volume offset (LEVEL 3 of the firmware menu). A trim on top of
+           the analog pot that lowers tone + voice together. Dragging it auditions
+           the level by ear as "tone .. number .. tone", just like the box. -->
+      <div class="cap-row" id="volRow">
+        <div class="cap-head">
+          <span class="config-group-label" style="margin:0;">Volume adjustment</span>
+          <span class="cap-val" id="volVal">—</span>
+        </div>
+        <input type="range" id="volRange" min="0" max="0" step="1" value="0" />
+        <p class="cap-hint">
+          Master trim layered on the analog volume pot — lowers the tone and the
+          voice together (0&nbsp;dB to −6&nbsp;dB). Drag to audition each level.
+        </p>
+      </div>
+
       <div class="sheet-actions">
         <button class="btn secondary" id="cfgCancelBtn">Cancel</button>
         <button class="btn" id="cfgCommitBtn">Commit &amp; calibrate</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Manual config menu: the firmware's hold-at-boot sequence, driven by ONE
+       button. Tap = cycle the current option; double-tap = confirm and advance.
+       Plays the same spoken prompts + preview tones the box would. -->
+  <div id="manualBackdrop">
+    <div class="config-sheet" role="dialog" aria-modal="true" aria-labelledby="manTitle">
+      <h2 id="manTitle">Config button</h2>
+      <p class="sheet-sub">
+        The real hold-at-boot menu, on one button. <b>Tap</b> to cycle the current
+        option; <b>double-tap</b> to confirm it and move on. Same prompts, same
+        preview tones, same order the box walks — listen as you go.
+      </p>
+
+      <p class="config-group-label" id="manualLevel">Step 1 of 3 · Audio mode</p>
+      <div class="manual-value" id="manualValue">—</div>
+
+      <button class="manual-tap" id="manualTapBtn">
+        <span class="mt-label">Tap</span>
+        <span class="mt-sub">double-tap to confirm</span>
+      </button>
+
+      <div class="sheet-actions" style="grid-template-columns:1fr;">
+        <button class="btn secondary" id="manualDoneBtn">Close</button>
       </div>
     </div>
   </div>
