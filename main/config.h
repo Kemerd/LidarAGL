@@ -153,6 +153,34 @@
 #define F_CLAMP_HI        3000.0f     /* never above this                        */
 #define TONE_LOG_SWEEP    1           /* 1 = musical log glide, 0 = linear Hz     */
 
+/* ---- Audio: timbre shaping (warmth + anti-harshness) --------------------- */
+/*  A PURE sine has exactly one frequency and zero overtones, so it can sound
+ *  thin, sterile and "ice-pick" sharp — like a hearing-test beep — especially
+ *  sitting on the ear's most-sensitive shelf near the top of the sweep. Three
+ *  cheap, complementary moves round the tone off without losing the
+ *  fundamental's noise cut-through (all per-sample, all in audio.c):
+ *
+ *    1) A small 2nd-harmonic mix. An EVEN-order overtone (one octave up) reads
+ *       as "warm / organ-like" rather than buzzy; it adds body so the tone is
+ *       a voice, not a test tone. Kept low so the fundamental still dominates
+ *       (that is the part that survives cockpit noise and ANR headsets).
+ *
+ *    2) A 1-pole low-pass on the final mix. It does NOTHING to the pure sine
+ *       itself, but it tames the small ODD harmonics the tanh() soft-clip
+ *       generates and softens the 2nd-harmonic's own edge, so the top end is
+ *       silk instead of glass. fc sits above the whole sweep + 2nd harmonic.
+ *
+ *    3) Conditional soft-clip — see TONE_SOFTCLIP_ONLY_WITH_VOICE below.       */
+#define TONE_HARMONIC2_LVL  0.18f     /* 2nd-harmonic mix (0 = pure sine)        */
+#define MIX_LPF_FC_HZ       3500.0f   /* 1-pole LPF corner on the L/R mix bus    */
+
+/*  The solo presence tone is scheduled to peak around -6 dBFS, so on its OWN it
+ *  never needs limiting — running it through tanh() only ADDS odd-harmonic edge
+ *  for no benefit. We therefore soft-clip ONLY when a voice clip is also playing
+ *  (the one time tone+voice can sum past full scale); a solo tone passes through
+ *  linearly and clean. Set 0 to always soft-clip (the old behaviour).           */
+#define TONE_SOFTCLIP_ONLY_WITH_VOICE 1
+
 /* ---- Audio: dB-scheduled volume (perceptual, never linear amplitude) ----- */
 /*  Levels are relative to full-scale output. The builder sets the ABSOLUTE
  *  level with the analog trim pot; firmware only provides the ramp shape.

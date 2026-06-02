@@ -288,6 +288,14 @@ int sim_default_audio_mode(void) { return DEFAULT_AUDIO_MODE; }
 EMSCRIPTEN_KEEPALIVE
 float sim_stereo_pan(void) { return STEREO_PAN; }
 
+/** @brief 2nd-harmonic mix level for tone warmth (TONE_HARMONIC2_LVL). */
+EMSCRIPTEN_KEEPALIVE
+float sim_tone_harmonic2(void) { return TONE_HARMONIC2_LVL; }
+
+/** @brief Corner frequency (Hz) of the anti-harshness mix LPF (MIX_LPF_FC_HZ). */
+EMSCRIPTEN_KEEPALIVE
+float sim_mix_lpf_fc(void) { return MIX_LPF_FC_HZ; }
+
 /**
  * @brief 1 if @p mode pans the two streams apart (stereo), 0 if it duplicates L=R.
  * @details Mirrors audio_config_from_mode().stereo for the given AUDIO_MODE_*.

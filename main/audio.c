@@ -64,6 +64,11 @@ static float s_sine_lut[LUT_SIZE];
 /*  NCO phase accumulator in [0,1). We advance it by f/SAMPLE_RATE each sample. */
 static float s_phase = 0.0f;
 
+/*  Separate accumulator for the 2nd-harmonic oscillator (see TONE_HARMONIC2_LVL
+ *  in config.h). It runs at 2*f and MUST keep its own phase — sharing s_phase
+ *  would make the two partials' relative phase jump every sample and warble.    */
+static float s_phase2 = 0.0f;
+
 /*  Smoothed/slew-limited values so pitch and gain never jump (warble/clicks).  */
 static float s_tone_agl_smooth = TONE_START_FT;   /* drives pitch + level       */
 static float s_gain_cur        = 0.0f;            /* current linear tone gain    */
@@ -95,6 +100,15 @@ static float s_agl_step  = 0.0f;
  *  flare -> tone eases out" stays gentle.                                       */
 static float s_fade_out_step = 0.0f;   /* toward silence (slow) */
 static float s_fade_in_step  = 0.0f;   /* toward full   (fast) */
+
+/* ---- Mix-bus low-pass (anti-harshness) ----------------------------------- */
+/*  One-pole LPF state, one running value per channel (the previous output). The
+ *  filter is y += a*(x - y); 'a' is the smoothing coefficient derived from
+ *  MIX_LPF_FC_HZ at init. Softens the tanh() odd harmonics + the 2nd-harmonic
+ *  edge so the high end of the sweep is silk, not glass (see config.h).         */
+static float s_lpf_a    = 1.0f;        /* coefficient (1.0 == filter disabled)  */
+static float s_lpf_l    = 0.0f;        /* last LPF output, LEFT  channel        */
+static float s_lpf_r    = 0.0f;        /* last LPF output, RIGHT channel        */
 
 /* ---- Stereo pan weights (compile-time constants) ------------------------- */
 /*  Equal-power pan used when s_cfg.stereo is set: a stream's energy is split so
@@ -161,6 +175,18 @@ void audio_init(const audio_config_t *cfg)
     float fade_in_samples  = (FLARE_FADE_IN_MS  / 1000.0f) * (float)SAMPLE_RATE;
     s_fade_out_step = (fade_out_samples > 0) ? (1.0f / fade_out_samples) : 1.0f;
     s_fade_in_step  = (fade_in_samples  > 0) ? (1.0f / fade_in_samples)  : 1.0f;
+
+    /* One-pole mix-bus LPF coefficient: a = 1 - exp(-2*pi*fc/fs). At fc == the
+     * Nyquist-ish ceiling 'a' approaches 1 (pass-through); lower fc => smaller a
+     * => more smoothing. We clamp to (0,1] so the filter is always stable.       */
+    float lpf_rc = expf(-2.0f * (float)M_PI * MIX_LPF_FC_HZ / (float)SAMPLE_RATE);
+    s_lpf_a = 1.0f - lpf_rc;
+    if (s_lpf_a <= 0.0f || s_lpf_a > 1.0f) {
+        s_lpf_a = 1.0f;                 /* degenerate fc => disable (pass-through) */
+    }
+    /* Start the filter memories at silence so the very first frame has no step. */
+    s_lpf_l = 0.0f;
+    s_lpf_r = 0.0f;
 
     /* --- I2S standard mode, TX only, 16-bit. The hardware ALWAYS runs stereo
      * (interleaved L/R) so the unit works however the panel is wired; whether we
@@ -279,6 +305,11 @@ void audio_suspend(void)
         /* Reset the tone gain so it ramps cleanly back from silence on resume. */
         s_gain_cur = 0.0f;
         s_phase    = 0.0f;
+        s_phase2   = 0.0f;     /* keep the 2nd harmonic in step with the fundamental */
+        /* Drain the mix LPF so a resumed landing starts from silence, not from a
+         * stale filter level left over from the previous descent.                */
+        s_lpf_l    = 0.0f;
+        s_lpf_r    = 0.0f;
         /* Re-arm the flare fade: suspend only happens in GROUND/CRUISE (well
          * above FLARE_FADE_FT), so the next active descent must start with the
          * tone fully present, not stuck faded-out from a previous landing.      */
@@ -298,19 +329,35 @@ void audio_resume(void)
  *  NCO + interpolated LUT lookup
  * ------------------------------------------------------------------------- */
 
-static inline float nco_sample(float freq_hz)
+/*  Advance one NCO (its *phase accumulator passed by ref) by freq_hz and return
+ *  the interpolated sine. Pulling the accumulator out as a parameter lets the
+ *  fundamental and the 2nd harmonic each keep an independent phase.             */
+static inline float nco_advance(float *phase, float freq_hz)
 {
-    /* Advance phase. */
-    s_phase += freq_hz / (float)SAMPLE_RATE;
-    if (s_phase >= 1.0f) {
-        s_phase -= 1.0f;
+    /* Advance phase, wrapping into [0,1). */
+    *phase += freq_hz / (float)SAMPLE_RATE;
+    if (*phase >= 1.0f) {
+        *phase -= 1.0f;
     }
     /* Linear-interpolated LUT read (sine is smooth, so 1024 + interp is clean). */
-    float x   = s_phase * (float)LUT_SIZE;
+    float x   = *phase * (float)LUT_SIZE;
     int   i0  = (int)x;
     int   i1  = (i0 + 1) & (LUT_SIZE - 1);
     float frac = x - (float)i0;
     return s_sine_lut[i0] * (1.0f - frac) + s_sine_lut[i1] * frac;
+}
+
+/*  The presence tone's full waveform at frequency f: the fundamental plus a
+ *  small EVEN (2nd) harmonic for warmth. The pair is normalised by (1 + level)
+ *  so adding body never raises the peak amplitude — the dB schedule and the
+ *  equal-loudness correction keep meaning exactly what they did for a pure sine.
+ *  With TONE_HARMONIC2_LVL == 0 this degenerates to the original clean sine.    */
+static inline float tone_sample(float freq_hz)
+{
+    float fundamental = nco_advance(&s_phase,  freq_hz);
+    float harmonic2   = nco_advance(&s_phase2, freq_hz * 2.0f);
+    return (fundamental + TONE_HARMONIC2_LVL * harmonic2)
+           / (1.0f + TONE_HARMONIC2_LVL);
 }
 
 /* Soft clip / limiter: a gentle tanh keeps the summed output inside [-1,1] with
@@ -320,6 +367,22 @@ static inline float nco_sample(float freq_hz)
 static inline float soft_clip(float x)
 {
     return tanhf(x);
+}
+
+/*  Conditional limiter for the channel sum. tanh() is a nonlinearity, so it adds
+ *  ODD harmonics to whatever passes through it — harmless on a near-clipping
+ *  voice+tone sum, but pure harshness on a solo tone that never approaches full
+ *  scale. When TONE_SOFTCLIP_ONLY_WITH_VOICE is set we therefore only engage the
+ *  soft-clip while a voice clip is mixed in (the one case the sum can exceed 1);
+ *  a solo tone passes through clean. With the flag at 0 we always soft-clip.     */
+static inline float mix_limit(float x, bool voice_active)
+{
+#if TONE_SOFTCLIP_ONLY_WITH_VOICE
+    return voice_active ? soft_clip(x) : x;
+#else
+    (void)voice_active;
+    return soft_clip(x);
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -412,12 +475,17 @@ void audio_task(void *arg)
              * cue stays in the PITCH; loudness holds steady through the flare.  */
             float eql_gain = db_to_gain(equal_loudness_db(f));
 
-            /* s_flare_fade silences the tone under the flare (see config.h). */
-            float tone = nco_sample(f) * s_gain_cur * s_duck_cur * eql_gain
+            /* s_flare_fade silences the tone under the flare (see config.h).
+             * tone_sample() = fundamental + small 2nd harmonic (warmth).        */
+            float tone = tone_sample(f) * s_gain_cur * s_duck_cur * eql_gain
                          * s_flare_fade;
 
-            /* Mix the voice clip (already at a comfortable level) if playing. */
+            /* Mix the voice clip (already at a comfortable level) if playing.
+             * voice_active tracks PRESENCE (not amplitude): a clip mid-stream can
+             * pass through a zero-crossing, so we must not infer "no voice" from
+             * voice == 0 — only the soft-clip decision below relies on this.      */
             float voice = 0.0f;
+            bool  voice_active = (s_clip_pcm != NULL);
             if (s_clip_pcm != NULL) {
                 voice = (float)s_clip_pcm[s_clip_pos] / 32768.0f;
                 if (++s_clip_pos >= s_clip_len) {
@@ -433,14 +501,24 @@ void audio_task(void *arg)
                 /* Gently pan the two streams to OPPOSITE sides (PAN_NEAR/FAR):
                  * voice leans RIGHT — the right ear processes speech better, so
                  * the spoken numbers get the speech-favoured ear (lol) — and the
-                 * tone leans LEFT. Each channel soft-clips its own sum.         */
-                left  = soft_clip(tone * PAN_NEAR + voice * PAN_FAR);
-                right = soft_clip(tone * PAN_FAR  + voice * PAN_NEAR);
+                 * tone leans LEFT. Each channel limits its own sum (only when a
+                 * voice clip is present — see mix_limit()).                      */
+                left  = mix_limit(tone * PAN_NEAR + voice * PAN_FAR, voice_active);
+                right = mix_limit(tone * PAN_FAR  + voice * PAN_NEAR, voice_active);
             } else {
                 /* Mono: identical signal to both channels, so the box works even
                  * if only one channel is wired or L+R are tied together.        */
-                left = right = soft_clip(tone + voice);
+                left = right = mix_limit(tone + voice, voice_active);
             }
+
+            /* One-pole low-pass on the final mix: smooths the small odd harmonics
+             * the limiter can add and rounds the 2nd-harmonic's edge, so the high
+             * end of the sweep is silk, not glass. Per-channel running state.     */
+            s_lpf_l += s_lpf_a * (left  - s_lpf_l);
+            s_lpf_r += s_lpf_a * (right - s_lpf_r);
+            left  = s_lpf_l;
+            right = s_lpf_r;
+
             frame[2 * i]     = (int16_t)(left  * 32767.0f);   /* L */
             frame[2 * i + 1] = (int16_t)(right * 32767.0f);   /* R */
         }

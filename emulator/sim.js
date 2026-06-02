@@ -91,8 +91,11 @@ let modeTone    = true;     // resolved api.modeTone(audioMode)
 // WebAudio graph.
 let audioCtx     = null; // AudioContext (created on first gesture)
 let osc          = null; // continuous OscillatorNode for the presence tone
+let osc2         = null; // 2nd-harmonic oscillator (warmth) — runs at 2x osc
+let osc2Gain     = null; // fixed gain on osc2 == TONE_HARMONIC2_LVL / (1 + lvl)
 let toneGainNode = null; // GainNode — 0 == silent
 let tonePanNode  = null; // StereoPannerNode — leans the tone left in stereo mode
+let mixLpfNode   = null; // BiquadFilter (lowpass) — anti-harshness mix-bus LPF
 let audioUnlocked = false;
 const calloutBuffers = new Map(); // height(ft) -> decoded AudioBuffer
 
@@ -149,6 +152,9 @@ async function main() {
     audioModeCount: M.cwrap('sim_audio_mode_count',   num, []),
     defaultMode:    M.cwrap('sim_default_audio_mode', num, []),
     stereoPan:      M.cwrap('sim_stereo_pan',         num, []),
+    // Timbre shaping (warmth + anti-harshness), mirrored from audio.c (see config.h).
+    toneHarmonic2:  M.cwrap('sim_tone_harmonic2',     num, []),
+    mixLpfFc:       M.cwrap('sim_mix_lpf_fc',         num, []),
     modeStereo:     M.cwrap('sim_mode_stereo',        num, [num]),
     modeCallouts:   M.cwrap('sim_mode_callouts',      num, [num]),
     modeTone:       M.cwrap('sim_mode_tone',          num, [num]),
@@ -389,9 +395,23 @@ function setupAudioGraph() {
   if (audioCtx) return;
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
+  // Fundamental + a small 2nd harmonic, mirroring audio.c::tone_sample(): an
+  // EVEN overtone one octave up adds "warmth" so the tone reads as a voice, not
+  // a sterile test beep. Both feed the same gain node so the dB schedule, pan
+  // and gating treat them as one stream. The pair is normalised by (1 + level)
+  // exactly like the firmware, so adding body never changes the peak loudness.
+  const h2 = api.toneHarmonic2();           // TONE_HARMONIC2_LVL
+  const norm = 1 / (1 + h2);
+
   osc = audioCtx.createOscillator();
-  osc.type = 'sine';                 // pure presence tone, like the firmware NCO
+  osc.type = 'sine';                 // pure fundamental, like the firmware NCO
   osc.frequency.value = 600;         // F_AT_TONE_START; updated every frame
+
+  osc2 = audioCtx.createOscillator();
+  osc2.type = 'sine';                // 2nd harmonic, also a pure sine
+  osc2.frequency.value = 1200;       // 2 x F_AT_TONE_START; tracked every frame
+  osc2Gain = audioCtx.createGain();
+  osc2Gain.gain.value = h2 * norm;   // matches the lvl/(1+lvl) weight in C
 
   toneGainNode = audioCtx.createGain();
   toneGainNode.gain.value = 0;       // start silent
@@ -402,9 +422,24 @@ function setupAudioGraph() {
   tonePanNode = audioCtx.createStereoPanner();
   tonePanNode.pan.value = modeStereo ? -api.stereoPan() : 0;
 
-  // osc -> gain -> pan -> out. Inserting the panner is harmless in mono (pan 0).
-  osc.connect(toneGainNode).connect(tonePanNode).connect(audioCtx.destination);
+  // Anti-harshness mix-bus LPF, mirroring the firmware's 1-pole filter: rounds
+  // the high end of the sweep so it is silk, not glass. A gentle 1st-order
+  // (12 dB/oct would be Q-peaky; the default Q ~0.707 lowpass is the closest
+  // WebAudio analogue to the firmware's one-pole).
+  mixLpfNode = audioCtx.createBiquadFilter();
+  mixLpfNode.type = 'lowpass';
+  mixLpfNode.frequency.value = api.mixLpfFc();   // MIX_LPF_FC_HZ
+
+  // Fundamental feeds the gain node at the normalised weight; the harmonic feeds
+  // it through osc2Gain. Then: gain -> pan -> LPF -> out (LPF is post-pan so it
+  // shapes the final mix exactly like audio.c filters the L/R after panning).
+  const fundGain = audioCtx.createGain();
+  fundGain.gain.value = norm;        // fundamental weight (1/(1+lvl))
+  osc.connect(fundGain).connect(toneGainNode);
+  osc2.connect(osc2Gain).connect(toneGainNode);
+  toneGainNode.connect(tonePanNode).connect(mixLpfNode).connect(audioCtx.destination);
   osc.start();
+  osc2.start();
 }
 
 /**
@@ -510,7 +545,10 @@ function frame(ts) {
       // Drive the oscillator from the SAME math the firmware uses. setTargetAtTime
       // gives a short, click-free glide analogous to the raised-cosine envelope.
       // The flare fade multiplies the scheduled gain, exactly as in audio.c.
-      osc.frequency.setTargetAtTime(api.pitchHz(toneAgl), now, 0.01);
+      const fHz = api.pitchHz(toneAgl);
+      osc.frequency.setTargetAtTime(fHz, now, 0.01);
+      // Keep the 2nd-harmonic oscillator locked to 2x the fundamental as it glides.
+      osc2.frequency.setTargetAtTime(fHz * 2, now, 0.01);
       toneGainNode.gain.setTargetAtTime(api.toneGain(toneAgl) * flareFade, now, 0.01);
     } else {
       // Ramp to silence rather than cutting — no click.
