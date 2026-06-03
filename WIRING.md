@@ -31,17 +31,28 @@ hear supply-correlated whine, add a small inline aux ground-loop isolator on L/R
 
 ### SF30 lidar → ESP32-S3 (UART1, 115200 8N1)
 
-| SF30 pin | → | ESP32-S3 | config.h |
-|----------|---|----------|----------|
-| SF30 **TX** | → | GPIO **8** (UART RX) | `PIN_SF30C_RX` |
-| SF30 **RX** | → | GPIO **9** (UART TX) | `PIN_SF30C_TX` |
-| SF30 **GND** | → | common GND | — |
-| SF30 **V+** | → | shared clean 5 V rail | — |
+The SF30/C exits on a **7-conductor cable**; the wire **colors are fixed by
+LightWare** (Table 4 of the SF30/C manual). We only use four of them — TXD, RXD,
+GND, VIN — and **cap off the other three** (Alarm, Sync, Analog) unused.
 
+| SF30 pin | Wire color | SF30 function | → | ESP32-S3 | config.h |
+|----------|-----------|---------------|---|----------|----------|
+| **3** | 🟡 Yellow | **TXD** (serial transmit) | → | GPIO **8** (UART RX) | `PIN_SF30C_RX` |
+| **4** | 🟠 Orange | **RXD** (serial receive) | → | GPIO **9** (UART TX) | `PIN_SF30C_TX` |
+| **6** | ⚫ Black | **GND** (supply −, power/logic) | → | common GND | — |
+| **7** | 🔴 Red | **VIN** (+5 V supply +) | → | shared clean 5 V rail | — |
+| 1 | 🟢 Green | Alarm output | — | *unused — cap off* | — |
+| 2 | ⚪ White | Sync output | — | *unused — cap off* | — |
+| 5 | 🔵 Blue | Analog | — | *unused — cap off* | — |
+
+> **Cross TX↔RX:** the sensor's **TXD (yellow)** lands on the S3's **RX** and the
+> sensor's **RXD (orange)** lands on the S3's **TX** — receive listens to the
+> other end's transmit. UART lines are 3.3 V TTL (5 V tolerant on the SF30 side).
+>
 > One clean 5 V rail feeds everything (a separate sensor rail isn't practical in
 > the panel). The SF30 draws real current and is noisy on its supply, so add a
 > **local LC/ferrite + bulk cap** at the sensor to keep its hash off the shared
-> rail. UART lines are 3.3 V TTL (5 V tolerant on the SF30 side).
+> rail.
 
 ### PCM5102A DAC → ESP32-S3 (I2S)
 
