@@ -167,15 +167,18 @@ let mixLpfNode   = null; // BiquadFilter (lowpass) — anti-harshness mix-bus LP
 let masterGainNode = null; // GainNode — the pilot's master volume offset (tone+voice)
 let audioUnlocked = false;
 const calloutBuffers = new Map(); // height(ft) -> decoded AudioBuffer
+const calloutEnv     = new Map(); // height(ft) -> Float32Array sidechain envelope
 const configBuffers  = new Map(); // piece name -> decoded AudioBuffer (menu prompts)
 
-// Voice-duck envelope, mirroring audio.c's s_duck_cur. While a callout plays the
-// tone ducks by VOICE_DUCK_DB with a fast ATTACK and a slow RELEASE; between
-// callouts it sits at 1.0 (no duck). We slew it per frame by dt with the firmware's
-// asymmetric rates so the first syllable is never masked yet the tone eases back
-// without a pump. duckActiveUntil holds the audioCtx time a fired callout ends.
-let duckCur        = 1;   // current duck multiplier (1 = un-ducked)
-let duckActiveUntil = 0;  // audioCtx.currentTime by which the active callout ends
+// Voice-SIDECHAIN duck, mirroring audio.c's compressor. The firmware ducks the
+// tone in proportion to the voice's ACTUAL loudness (a one-pole follower over the
+// clip samples), not a fixed level — so the leading edge of a word eases the tone
+// down WITH the syllable instead of clipping it. We reproduce this exactly: each
+// callout's envelope is precomputed with the SAME follower (precomputeEnv), and
+// while it plays we read env[playbackPosition] and map it through the same soft
+// knee to a duck multiplier. activeVoice tracks the currently-sounding clip.
+let duckCur     = 1;      // current duck multiplier (1 = un-ducked), for readout
+let activeVoice = null;   // { env, startTime, durSamples } of the playing callout, or null
 
 // Canvas / layout.
 let canvas, ctx, dpr = 1;
@@ -254,6 +257,9 @@ async function main() {
     voiceDuckDb:    M.cwrap('sim_voice_duck_db',      num, []),
     duckAttackMs:   M.cwrap('sim_duck_attack_ms',     num, []),
     duckReleaseMs:  M.cwrap('sim_duck_release_ms',    num, []),
+    duckThreshold:  M.cwrap('sim_duck_threshold',     num, []),
+    duckKneeLevel:  M.cwrap('sim_duck_knee_level',    num, []),
+    duckFloor:      M.cwrap('sim_duck_floor',         num, []),
     toneTrimDb:     M.cwrap('sim_tone_trim_with_voice_db', num, []),
 
     // Ground-dwell disarm timeout (informational; the real SM enforces it).
@@ -621,7 +627,7 @@ function calibrateToGround() {
   lastFiredFt = null;
   flareFade = 1;
   duckCur = 1;                 // un-duck (no callout in flight after a zeroing)
-  duckActiveUntil = 0;
+  activeVoice = null;          // drop any in-flight sidechain follower
 }
 
 /* =============================================================================
@@ -988,6 +994,10 @@ async function loadCallouts() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = await audioCtx.decodeAudioData(await res.arrayBuffer());
       calloutBuffers.set(ft, buf);
+      // Precompute this clip's sidechain envelope with the SAME one-pole follower
+      // the firmware runs over the PCM, so the emulated duck tracks the identical
+      // voice contour the DAC would (see precomputeEnv / audio.c).
+      calloutEnv.set(ft, precomputeEnv(buf));
     } catch (e) {
       console.warn(`callout ${ft}.wav unavailable:`, e.message);
     }
@@ -1026,6 +1036,34 @@ function schedulePieceAt(name, when) {
   return when + buf.duration;
 }
 
+/**
+ * Precompute a callout's sidechain envelope — the exact one-pole peak follower the
+ * firmware runs over the voice PCM (audio.c), so the emulated duck tracks the same
+ * loudness contour the DAC produces. The follower's attack/release TIME CONSTANTS
+ * are the firmware's DUCK_ATTACK_MS / DUCK_RELEASE_MS; we derive the per-sample
+ * coefficients at THIS buffer's sample rate (so the constants mean the same wall-
+ * clock time regardless of the browser's decode rate). Channel 0 is sufficient —
+ * the clips are mono.
+ *
+ * @param {AudioBuffer} buf  Decoded callout buffer.
+ * @returns {Float32Array}   Per-sample voice envelope (same length as the buffer).
+ */
+function precomputeEnv(buf) {
+  const x  = buf.getChannelData(0);
+  const fs = buf.sampleRate;
+  // a = 1 - exp(-1/(tau_seconds * fs)) — identical form to audio_init().
+  const atkA = 1 - Math.exp(-1 / ((api.duckAttackMs()  / 1000) * fs));
+  const relA = 1 - Math.exp(-1 / ((api.duckReleaseMs() / 1000) * fs));
+  const env = new Float32Array(x.length);
+  let e = 0;
+  for (let i = 0; i < x.length; i++) {
+    const rect = Math.abs(x[i]);
+    e += (rect > e ? atkA : relA) * (rect - e);
+    env[i] = e;
+  }
+  return env;
+}
+
 /** Fire a one-shot callout clip at the given height (no-op if not loaded). */
 function playCallout(ft) {
   const buf = calloutBuffers.get(ft);
@@ -1046,10 +1084,19 @@ function playCallout(ft) {
   src.connect(pan).connect(masterGainNode);
   src.start();
 
-  // Open the duck window for this clip's duration so the frame loop ducks the
-  // tone under it (fast attack now, slow release once it ends), mirroring the
-  // firmware's s_duck_cur envelope. buf.duration is the real clip length.
-  duckActiveUntil = audioCtx.currentTime + buf.duration;
+  // Register this clip as the active sidechain source: the frame loop reads its
+  // precomputed envelope at the live playback position to derive the duck, exactly
+  // like the firmware follows the voice it is mixing. Tracked by start time so we
+  // can index env[(now - startTime) * fs]. A new callout supersedes the old one.
+  const env = calloutEnv.get(ft);
+  if (env) {
+    activeVoice = {
+      env,
+      fs: buf.sampleRate,
+      startTime: audioCtx.currentTime,
+      endTime: audioCtx.currentTime + buf.duration,
+    };
+  }
 }
 
 /**
@@ -1114,20 +1161,34 @@ function frame(ts) {
   const fadeStep   = fadeMs > 0 ? dt / (fadeMs / 1000) : 1;
   flareFade += clamp(fadeTarget - flareFade, -fadeStep, fadeStep);
 
-  // --- Voice duck: mirror audio.c's asymmetric s_duck_cur envelope ----------
-  // While a callout is sounding (we tracked its end in duckActiveUntil) the tone
-  // ducks toward db_to_gain(-VOICE_DUCK_DB); otherwise it releases back to 1.0.
-  // The ATTACK (fast) and RELEASE (slow) use the firmware's own ms constants,
-  // slewed per frame by dt — the frame-stepped equivalent of the per-sample slew
-  // — so the first syllable is cleared instantly yet the tone eases back without
-  // a pump. Only meaningful when callouts can play; otherwise it stays at 1.0.
+  // --- Voice SIDECHAIN duck: mirror audio.c's compressor --------------------
+  // The duck tracks the voice's ACTUAL loudness, not a fixed window. We read the
+  // active callout's precomputed envelope (the SAME one-pole follower the firmware
+  // runs over the PCM) at the live playback position, then map it through the same
+  // soft knee: silent (<= threshold) leaves the tone at 1.0; full voice (>= knee)
+  // pulls it to the duck floor (db_to_gain(-VOICE_DUCK_DB)); between, linear. So
+  // the leading edge of a word eases the tone down WITH the syllable — no clip.
   if (audioUnlocked) {
-    const ducking   = modeCallouts && audioCtx.currentTime < duckActiveUntil;
-    const duckTarget = ducking ? api.masterGain(-api.voiceDuckDb()) : 1; // db->gain
-    const duckMs    = duckTarget < duckCur ? api.duckAttackMs()
-                                           : api.duckReleaseMs();
-    const duckStep  = duckMs > 0 ? dt / (duckMs / 1000) : 1;
-    duckCur += clamp(duckTarget - duckCur, -duckStep, duckStep);
+    let duck = 1;
+    if (modeCallouts && activeVoice) {
+      const now = audioCtx.currentTime;
+      if (now >= activeVoice.endTime) {
+        activeVoice = null;                 // clip done; the follower tail is in env
+      } else {
+        const idx = Math.floor((now - activeVoice.startTime) * activeVoice.fs);
+        const e = (idx >= 0 && idx < activeVoice.env.length)
+                  ? activeVoice.env[idx] : 0;
+        const thr  = api.duckThreshold();
+        const knee = api.duckKneeLevel();
+        const floor = api.duckFloor();
+        if (e > thr) {
+          let t = (e - thr) / (knee - thr);
+          if (t > 1) t = 1;
+          duck = 1 + t * (floor - 1);       // 1.0 -> floor, matching audio.c
+        }
+      }
+    }
+    duckCur = duck;
   }
 
   if (audioUnlocked) {

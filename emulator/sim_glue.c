@@ -363,9 +363,21 @@ float sim_voice_duck_db(void) { return VOICE_DUCK_DB; }
 EMSCRIPTEN_KEEPALIVE
 float sim_duck_attack_ms(void) { return DUCK_ATTACK_MS; }
 
-/** @brief Duck RELEASE time (ms): ducked -> full, gentle (DUCK_RELEASE_MS). */
+/** @brief Duck RELEASE time (ms): follower fall, gentle (DUCK_RELEASE_MS). */
 EMSCRIPTEN_KEEPALIVE
 float sim_duck_release_ms(void) { return DUCK_RELEASE_MS; }
+
+/** @brief Sidechain threshold: |voice| below this == silent, no duck (DUCK_THRESHOLD). */
+EMSCRIPTEN_KEEPALIVE
+float sim_duck_threshold(void) { return DUCK_THRESHOLD; }
+
+/** @brief Sidechain knee level: |voice| at/above this == full duck (DUCK_KNEE_LEVEL). */
+EMSCRIPTEN_KEEPALIVE
+float sim_duck_knee_level(void) { return DUCK_KNEE_LEVEL; }
+
+/** @brief Full-duck linear gain floor, db_to_gain(-VOICE_DUCK_DB). */
+EMSCRIPTEN_KEEPALIVE
+float sim_duck_floor(void) { return db_to_gain(-VOICE_DUCK_DB); }
 
 /** @brief Steady tone trim (dB) held while callouts are enabled
  *         (TONE_TRIM_WITH_VOICE_DB; negative == a cut). */

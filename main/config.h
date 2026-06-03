@@ -199,16 +199,28 @@
 #define VOICE_DUCK_DB     4.0f        /* duck the tone this much under a callout  */
 #define GAIN_RAMP_MS      40          /* raised-cosine envelope time (>=30–50ms)  */
 
-/* ---- Audio: voice-duck envelope (fast attack, slow release) -------------- */
-/*  When a callout starts, the tone ducks by VOICE_DUCK_DB. Rather than slewing
- *  that duck symmetrically (which would attack as slowly as it releases and let
- *  the first syllable fight the un-ducked tone), we shape the duck with a tiny
- *  ASYMMETRIC envelope: a very fast ATTACK so the tone is already out of the way
- *  the instant the word begins, then a gentle RELEASE so the tone eases back in
- *  without a pump. Kept intentionally short so it helps speech intelligibility
- *  without being audible as an effect. Applied per-sample in audio.c to s_duck_cur. */
-#define DUCK_ATTACK_MS    2.5f        /* tone -> ducked (very fast, just clears it)*/
-#define DUCK_RELEASE_MS   8.0f        /* ducked -> full (gentle, no pump)          */
+/* ---- Audio: voice-sidechain duck (a real compressor, keyed off the voice) -- */
+/*  The tone ducks UNDER the voice the way a broadcast "voice over music" ducker
+ *  does: instead of slamming to a fixed attenuation the instant a clip starts
+ *  (which clips the leading edge, since the tone drops before the word is even
+ *  audible), we DETECT the voice's actual loudness and duck PROPORTIONALLY to it.
+ *
+ *  How it works, per sample (all in audio.c):
+ *    1) A one-pole peak FOLLOWER tracks the rectified voice |sample| — this is the
+ *       sidechain envelope, "how loud is the voice right now". It rises with the
+ *       DUCK_ATTACK_MS time constant and falls with DUCK_RELEASE_MS, so it leads
+ *       neither the syllable's onset nor lingers past its tail.
+ *    2) Above DUCK_THRESHOLD the envelope opens the duck; the duck depth scales
+ *       from 0 dB (voice at/below threshold) to the full VOICE_DUCK_DB (voice at
+ *       or above DUCK_KNEE_LEVEL). Between those it interpolates — a soft knee.
+ *
+ *  Because the duck now FOLLOWS the voice amplitude, a word that fades in eases
+ *  the tone down WITH it (no clippy pre-duck), and the tone breathes back as the
+ *  word trails off. Cost is trivial: one fabsf + one multiply-add per sample.     */
+#define DUCK_ATTACK_MS    6.0f        /* follower rise: how fast the duck opens    */
+#define DUCK_RELEASE_MS   90.0f       /* follower fall: gentle recovery, no pump   */
+#define DUCK_THRESHOLD    0.04f       /* |voice| below this == "silent", no duck   */
+#define DUCK_KNEE_LEVEL   0.50f       /* |voice| at/above this == full VOICE_DUCK_DB*/
 
 /* ---- Audio: baseline tone trim when callouts are enabled ----------------- */
 /*  Even with the voice ducking the tone during a callout, the steady presence

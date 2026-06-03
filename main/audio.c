@@ -74,6 +74,11 @@ static float s_tone_agl_smooth = TONE_START_FT;   /* drives pitch + level       
 static float s_gain_cur        = 0.0f;            /* current linear tone gain    */
 static float s_duck_cur        = 1.0f;            /* current duck multiplier     */
 
+/*  Sidechain duck follower: a one-pole peak detector tracking the rectified voice
+ *  |sample|. This IS the "how loud is the voice right now" signal the compressor
+ *  ducks against — rising with the attack coefficient, falling with the release.  */
+static float s_voice_env       = 0.0f;            /* tracked voice amplitude     */
+
 /*  Pilot's master volume offset as a LINEAR gain (1.0 == 0 dB == no cut). Set
  *  from NVS at boot (and live by the config-menu preview) via audio_set_master_db.
  *  Multiplied into BOTH channels every sample so it trims tone AND voice equally
@@ -107,12 +112,17 @@ static float s_gain_step = 0.0f;
 /*  Max smoothed-AGL change per sample for the pitch (slower => more stable).   */
 static float s_agl_step  = 0.0f;
 
-/*  Voice-duck envelope steps (per sample). The duck has an ASYMMETRIC shape: a
- *  very fast ATTACK so the tone is already out of the way as a word begins, and a
- *  gentle RELEASE so the tone eases back without a pump. A full duck swing takes
- *  DUCK_ATTACK_MS down and DUCK_RELEASE_MS back up (see config.h).               */
-static float s_duck_attack_step  = 0.0f;   /* toward the ducked level (fast) */
-static float s_duck_release_step = 0.0f;   /* back toward full      (slow) */
+/*  Sidechain-follower coefficients (one-pole). The follower rises toward a louder
+ *  voice with s_duck_atk_a and falls toward a quieter one with s_duck_rel_a, each
+ *  derived from DUCK_ATTACK_MS / DUCK_RELEASE_MS at init: a = 1 - exp(-1/(t*fs)).
+ *  ATTACK is short (the duck opens promptly WITH the syllable, not ahead of it);
+ *  RELEASE is long (the tone breathes back gently after the word).               */
+static float s_duck_atk_a = 1.0f;   /* follower attack coeff (voice getting louder)*/
+static float s_duck_rel_a = 1.0f;   /* follower release coeff (voice getting quieter)*/
+
+/*  Precomputed full-duck linear gain (db_to_gain(-VOICE_DUCK_DB)) so the per-sample
+ *  path scales between 1.0 (no duck) and this without a pow() each sample.        */
+static float s_duck_floor = 1.0f;
 
 /*  Flare-fade slew steps (per sample): a full 1->0 swing takes FLARE_FADE_OUT_MS
  *  on the way DOWN, and FLARE_FADE_IN_MS on the way UP. The asymmetry is what
@@ -193,14 +203,23 @@ void audio_init(const audio_config_t *cfg)
     float agl_ramp_samples = 0.25f * (float)SAMPLE_RATE;
     s_agl_step = TONE_START_FT / agl_ramp_samples;
 
-    /* Voice-duck envelope steps: a full duck swing covers DUCK_ATTACK_MS on the
-     * way down (fast) and DUCK_RELEASE_MS on the way up (slow). The asymmetry is
-     * what makes the tone clear instantly for the first syllable yet ease back in
-     * without an audible pump (see config.h).                                   */
-    float duck_atk_samples = (DUCK_ATTACK_MS  / 1000.0f) * (float)SAMPLE_RATE;
-    float duck_rel_samples = (DUCK_RELEASE_MS / 1000.0f) * (float)SAMPLE_RATE;
-    s_duck_attack_step  = (duck_atk_samples > 0) ? (1.0f / duck_atk_samples) : 1.0f;
-    s_duck_release_step = (duck_rel_samples > 0) ? (1.0f / duck_rel_samples) : 1.0f;
+    /* Sidechain-follower coefficients (one-pole, a = 1 - exp(-1/(tau*fs))). The
+     * follower tracks the voice's rectified amplitude, rising with the short
+     * ATTACK and falling with the long RELEASE so the tone ducks WITH the voice's
+     * own loudness rather than snapping ahead of it (see config.h). Clamped to
+     * (0,1] so a degenerate time constant just becomes instantaneous-but-stable.  */
+    float atk_tau_samp = (DUCK_ATTACK_MS  / 1000.0f) * (float)SAMPLE_RATE;
+    float rel_tau_samp = (DUCK_RELEASE_MS / 1000.0f) * (float)SAMPLE_RATE;
+    s_duck_atk_a = (atk_tau_samp > 0.0f) ? (1.0f - expf(-1.0f / atk_tau_samp)) : 1.0f;
+    s_duck_rel_a = (rel_tau_samp > 0.0f) ? (1.0f - expf(-1.0f / rel_tau_samp)) : 1.0f;
+    if (s_duck_atk_a <= 0.0f || s_duck_atk_a > 1.0f) s_duck_atk_a = 1.0f;
+    if (s_duck_rel_a <= 0.0f || s_duck_rel_a > 1.0f) s_duck_rel_a = 1.0f;
+    s_voice_env = 0.0f;
+
+    /* Full-duck gain floor: the tone is attenuated to this when the voice is at
+     * or above DUCK_KNEE_LEVEL; it scales smoothly up to 1.0 (no duck) as the
+     * voice envelope falls to DUCK_THRESHOLD. Precomputed so the loop has no pow().*/
+    s_duck_floor = db_to_gain(-VOICE_DUCK_DB);
 
     /* Resolve the steady tone trim once: a constant cut while callouts are on so
      * the voice always reads a touch clearer over the presence tone; no trim at
@@ -416,6 +435,8 @@ void audio_suspend(void)
         s_running = false;
         /* Reset the tone gain so it ramps cleanly back from silence on resume. */
         s_gain_cur = 0.0f;
+        s_duck_cur = 1.0f;     /* un-duck so the next descent starts at full tone   */
+        s_voice_env = 0.0f;    /* drain the sidechain follower (no stale duck)       */
         s_phase    = 0.0f;
         s_phase2   = 0.0f;     /* keep the 2nd harmonic in step with the fundamental */
         /* Drain the mix LPF so a resumed landing starts from silence, not from a
@@ -549,10 +570,9 @@ void audio_task(void *arg)
             target_gain = db_to_gain(agl_to_tone_db(tone_agl));
         }
 
-        /* Duck target: attenuate the tone while a clip is playing. */
-        float duck_target = (s_clip_pcm != NULL)
-                            ? db_to_gain(-VOICE_DUCK_DB)
-                            : 1.0f;
+        /* The voice-duck is no longer a per-frame target: it is derived PER SAMPLE
+         * from the live voice envelope (sidechain compressor) further down, so the
+         * tone ducks with the voice's actual loudness instead of a fixed level.   */
 
         /* Flare-fade target + the step to use this frame. Below FLARE_FADE_FT we
          * fade the tone OUT (target 0) using the SLOW out-step; at/above it we
@@ -572,51 +592,66 @@ void audio_task(void *arg)
              * adequate at these short ramp times).                             */
             s_gain_cur = slew_limit(s_gain_cur, target_gain, s_gain_step);
 
-            /* Slew the duck with the ASYMMETRIC envelope: a fast attack toward the
-             * ducked level (duck_target < current) so the tone clears instantly as
-             * a word begins, then a gentle release back to full (duck_target >
-             * current) so it eases in without pumping. Pick the step by direction. */
-            float duck_step = (duck_target < s_duck_cur) ? s_duck_attack_step
-                                                         : s_duck_release_step;
-            s_duck_cur = slew_limit(s_duck_cur, duck_target, duck_step);
-
             /* Slew the flare fade toward its target. Asymmetric step: slow out
              * under the flare, fast in on a climb-back-up. The fade-out step is
-             * far smaller than the gain/duck steps so the tone eases away over
-             * the full 3 s rather than snapping with the level schedule.        */
+             * far smaller than the gain step so the tone eases away over the full
+             * 3 s rather than snapping with the level schedule.                  */
             s_flare_fade = slew_limit(s_flare_fade, fade_target, fade_step);
 
-            float f = agl_to_pitch_hz(s_tone_agl_smooth);
-
-            /* Equal-loudness correction: fold the ISO-226 flattening for THIS
-             * frequency into the gain so the perceived loudness follows the
-             * scheduled dB instead of rising as the pitch ascends. The urgency
-             * cue stays in the PITCH; loudness holds steady through the flare.  */
-            float eql_gain = db_to_gain(equal_loudness_db(f));
-
-            /* s_flare_fade silences the tone under the flare (see config.h).
-             * tone_sample() = fundamental + small 2nd harmonic (warmth).
-             * s_tone_trim holds the tone a constant TONE_TRIM_WITH_VOICE_DB down
-             * while callouts are enabled so the voice reads clearer over it (it
-             * is 1.0 in tone-only modes).                                        */
-            float tone = tone_sample(f) * s_gain_cur * s_duck_cur * eql_gain
-                         * s_flare_fade * s_tone_trim;
-
-            /* Mix the voice clip (already at a comfortable level) if playing.
+            /* --- Read the voice sample FIRST so the duck can key off it -------
              * voice_active tracks PRESENCE (not amplitude): a clip mid-stream can
              * pass through a zero-crossing, so we must not infer "no voice" from
-             * voice == 0 — only the soft-clip decision below relies on this.      */
+             * voice == 0 — the soft-clip decision below relies on this.          */
             float voice = 0.0f;
             bool  voice_active = (s_clip_pcm != NULL);
             if (s_clip_pcm != NULL) {
                 voice = (float)s_clip_pcm[s_clip_pos] / 32768.0f;
                 if (++s_clip_pos >= s_clip_len) {
-                    /* Clip finished; ducking will ramp back up next frame. */
+                    /* Clip finished; the follower decays and the tone breathes
+                     * back up over DUCK_RELEASE_MS — no hard un-duck step.       */
                     s_clip_pcm = NULL;
                     s_clip_len = 0;
                     s_clip_pos = 0;
                 }
             }
+
+            /* --- Sidechain duck (a compressor keyed off the voice envelope) ---
+             * Feed the rectified voice into a one-pole peak follower: rise with the
+             * fast ATTACK coeff when the voice gets louder, fall with the slow
+             * RELEASE coeff when it quietens. s_voice_env is therefore the voice's
+             * real, smoothed loudness — not just "is a clip pointer set".          */
+            float rect = fabsf(voice);
+            float a = (rect > s_voice_env) ? s_duck_atk_a : s_duck_rel_a;
+            s_voice_env += a * (rect - s_voice_env);
+
+            /* Map that envelope to a duck multiplier with a soft knee: at/below
+             * DUCK_THRESHOLD the voice is "silent" and the tone is untouched (1.0);
+             * at/above DUCK_KNEE_LEVEL the tone is pulled all the way to s_duck_floor
+             * (full VOICE_DUCK_DB); between, it interpolates linearly. Because the
+             * amount tracks the voice's own contour, the leading edge of a word eases
+             * the tone down WITH the syllable instead of clipping it pre-emptively.  */
+            float duck = 1.0f;
+            if (s_voice_env > DUCK_THRESHOLD) {
+                float t = (s_voice_env - DUCK_THRESHOLD)
+                          / (DUCK_KNEE_LEVEL - DUCK_THRESHOLD);
+                if (t > 1.0f) t = 1.0f;
+                duck = 1.0f + t * (s_duck_floor - 1.0f);   /* 1.0 -> s_duck_floor */
+            }
+            s_duck_cur = duck;   /* exposed for clarity; the follower IS the smoothing */
+
+            /* Tone pitch for this sample + equal-loudness flattening at that
+             * frequency, so perceived loudness follows the scheduled dB instead of
+             * rising as the pitch ascends (urgency stays in PITCH, not loudness).  */
+            float f = agl_to_pitch_hz(s_tone_agl_smooth);
+            float eql_gain = db_to_gain(equal_loudness_db(f));
+
+            /* Build the tone: schedule gain · sidechain duck · equal-loudness ·
+             * flare fade · steady callout trim. tone_sample() = fundamental + a
+             * small 2nd harmonic (warmth); s_flare_fade silences it under the flare;
+             * s_tone_trim holds it a constant TONE_TRIM_WITH_VOICE_DB down while
+             * callouts are enabled (1.0 in tone-only modes).                       */
+            float tone = tone_sample(f) * s_gain_cur * duck * eql_gain
+                         * s_flare_fade * s_tone_trim;
 
             float left, right;
             if (s_cfg.stereo) {
