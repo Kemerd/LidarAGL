@@ -95,8 +95,10 @@ ground up past the dashed **ARM** line to cruise, then back down:
   (mode → start-alt → volume), playing the same spoken prompts and preview tones
   the firmware would. The level order and timing match `run_config_menu()`.
 - **Voice clarity** — when callouts are enabled the presence tone sits a steady
-  **−1 dB** lower so the numbers read clearer, and ducks with a fast-attack /
-  slow-release envelope under each callout — both mirrored from `audio.c`.
+  **−1 dB** lower so the numbers read clearer, and ducks with a **sidechain
+  compressor** that follows the voice's actual loudness (so the tone eases down
+  *with* each word instead of clipping its leading edge) — both mirrored from
+  `audio.c` (the emulator runs the same one-pole follower over each clip).
 - **Taxi-back disarm** — sit on the ground for **30 s** and the box disarms as if
   rebooted; the next takeoff is silent until you climb back through **ARM** (a
   quick touch-and-go inside the window keeps the callouts armed).
