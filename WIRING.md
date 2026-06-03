@@ -76,20 +76,31 @@ hear supply-correlated whine, add a small inline aux ground-loop isolator on L/R
 
 ### Analog output → GMA 245 (stereo aux)
 
+The PCM5102A's analog output is the 4-pin header silkscreened
+**`LOUT · AGND · ROUT · AGND`**. The two **AGND** pins are the **same net** (the
+DAC's analog ground) — they're doubled up only so each channel has a return pin
+next to it. This AGND is the **audio return**, and it is a *separate net* from the
+digital `GND` / `DGND` on the I2S side of the board.
+
 ```
-PCM5102A LOUT ─┐
-PCM5102A ROUT ─┼─► GMA 245 aux  (L, R, audio-LO ref)
-   panel LO  ◄──┘
+PCM5102A LOUT ───────────────────► GMA 245 aux L      (conductor 3)
+PCM5102A ROUT ───────────────────► GMA 245 aux R      (conductor 4)
+PCM5102A AGND ─┐  (both AGND pins,
+PCM5102A AGND ─┴── same net) ─────► GMA 245 audio LO  (conductor 5)
 ```
 
-- **Line level, no trim pot** — the DAC output goes straight to the GMA 245 aux,
-  which sets the volume. The firmware only shapes the perceptual dB ramp.
+- **Line level, no trim pot** — the DAC puts out ~2.1 Vrms (TI datasheet typ.),
+  which is line level, so it goes straight to the GMA 245 aux, which sets the
+  volume. The firmware only shapes the perceptual dB ramp.
 - **Stereo by default** — firmware emits L/R and gently pans the streams apart
   (voice right, tone left). Mono/stereo is a **runtime** choice from the config
   menu (hold the button at power-on); the I2S hardware always drives both
   channels, so mono just duplicates the signal to L and R (safe if wired mono).
 - Land L and R against the GMA's **audio LO** reference (not power ground) — that
-  isolation is what replaces the old transformer.
+  isolation is what replaces the old transformer. **Tie the audio LO to BOTH
+  AGND pins** on the `LOUT/ROUT` header; do **not** jump AGND to the board's
+  digital `GND`/`DGND` — bridging analog return to power ground reintroduces the
+  ground loop (the supply-whine path) this isolation exists to avoid.
 
 ### Cockpit harness (6-conductor, shielded)
 
