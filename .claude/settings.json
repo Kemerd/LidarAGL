@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.espressif.com)",
+      "Read(//c/Espressif/tools/**)",
+      "PowerShell(. 'C:\\\\Espressif\\\\tools\\\\Microsoft.v6.0.1.PowerShell_profile.ps1')",
+      "PowerShell(idf.py --version)",
+      "PowerShell(Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match 'COM\\\\d+' } | Select-Object Name | Format-Table -AutoSize)",
+      "PowerShell(. 'C:\\\\Espressif\\\\tools\\\\Microsoft.v6.0.1.PowerShell_profile.ps1' | Out-Null; $env:IDF_TOOLS_PATH = 'C:\\\\Espressif\\\\tools'; $env:IDF_PYTHON_ENV_PATH = 'C:\\\\Espressif\\\\tools\\\\python\\\\v6.0.1\\\\venv'; idf.py --version; \"EXIT=$LASTEXITCODE\")",
+      "PowerShell(Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match 'COM\\\\d+' } | Select-Object Name, DeviceID | Format-List)",
+      "PowerShell(. 'C:\\\\Espressif\\\\tools\\\\Microsoft.v6.0.1.PowerShell_profile.ps1' | Out-Null; $env:IDF_TOOLS_PATH = 'C:\\\\Espressif\\\\tools'; $env:IDF_PYTHON_ENV_PATH = 'C:\\\\Espressif\\\\tools\\\\python\\\\v6.0.1\\\\venv'; idf.py set-target esp32s3; if \\($LASTEXITCODE -ne 0\\) { Write-Host '!!! set-target FAILED'; exit 1 }; idf.py -p COM4 flash)"
+    ]
+  }
+}
