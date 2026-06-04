@@ -151,16 +151,11 @@ int sim_tone_active(void) { return g_out.tone_active ? 1 : 0; }
 EMSCRIPTEN_KEEPALIVE
 float sim_vert_fps(void) { return g_out.vert_fps; }
 
-/** @brief Smoothed vertical acceleration (ft/s^2, +up) for the blip's deriv term. */
-EMSCRIPTEN_KEEPALIVE
-float sim_vert_accel(void) { return g_out.vert_accel_fps2; }
-
 /* ---- Vario blip tunables (mirror config.h so the JS cadence matches firmware) -- */
 EMSCRIPTEN_KEEPALIVE float sim_vario_ref_fpm(void)       { return VARIO_REF_FPM; }
 EMSCRIPTEN_KEEPALIVE float sim_vario_sil_base_ms(void)   { return VARIO_SIL_BASE_MS; }
 EMSCRIPTEN_KEEPALIVE float sim_vario_sil_min_ms(void)    { return VARIO_SIL_MIN_MS; }
 EMSCRIPTEN_KEEPALIVE float sim_vario_beep_factor(void)   { return VARIO_BEEP_FACTOR; }
-EMSCRIPTEN_KEEPALIVE float sim_vario_accel_ms_gain(void) { return VARIO_ACCEL_MS_GAIN; }
 EMSCRIPTEN_KEEPALIVE float sim_vario_beep_min_ms(void)   { return VARIO_BEEP_MIN_MS; }
 EMSCRIPTEN_KEEPALIVE float sim_vario_beep_max_ms(void)   { return VARIO_BEEP_MAX_MS; }
 EMSCRIPTEN_KEEPALIVE float sim_vario_edge_ms(void)       { return VARIO_EDGE_MS; }

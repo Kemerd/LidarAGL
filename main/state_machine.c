@@ -20,24 +20,14 @@
  * ------------------------------------------------------------------------- */
 #define TREND_SMOOTH_ALPHA 0.25f
 
-/* ---------------------------------------------------------------------------
- *  Acceleration smoothing factor. The vario "blip" feature wants the FIRST
- *  DERIVATIVE of the sink rate (vertical acceleration) to nudge the beep length,
- *  so we low-pass the tick-to-tick change in trend_fps. Differentiation amplifies
- *  noise, so this alpha is lighter (heavier smoothing) than the rate's — we only
- *  want the broad "sink is building / easing" trend, not per-sample jitter.
- * ------------------------------------------------------------------------- */
-#define TREND_ACCEL_SMOOTH_ALPHA 0.15f
-
 void sm_init(sm_ctx_t *c, sm_state_t initial)
 {
-    c->state            = initial;
-    c->prev_agl         = 0.0f;
-    c->trend_fps        = 0.0f;
-    c->trend_accel_fps2 = 0.0f;
-    c->armed_mask       = 0u;
-    c->have_prev        = false;
-    c->ground_ms        = 0.0f;   /* fresh ground-dwell timer */
+    c->state      = initial;
+    c->prev_agl   = 0.0f;
+    c->trend_fps  = 0.0f;
+    c->armed_mask = 0u;
+    c->have_prev  = false;
+    c->ground_ms  = 0.0f;   /* fresh ground-dwell timer */
 
     /*  Positive-rate detector. We pre-arm only when seeded on the ground; a
      *  flying seed (in-flight reboot) starts DISARMED so a reboot mid-climb can
@@ -87,27 +77,16 @@ sm_state_t sm_initial_state(float boot_agl, bool ok, const sensor_profile_t *p)
 static float update_trend(sm_ctx_t *c, float agl_ft, float dt_s)
 {
     if (!c->have_prev || dt_s <= 0.0f) {
-        /* First sample (or a bogus dt): seed prev, report level (rate AND accel). */
-        c->prev_agl         = agl_ft;
-        c->have_prev        = true;
-        c->trend_fps        = 0.0f;
-        c->trend_accel_fps2 = 0.0f;
+        /* First sample (or a bogus dt): seed prev, report level. */
+        c->prev_agl  = agl_ft;
+        c->have_prev = true;
+        c->trend_fps = 0.0f;
         return 0.0f;
     }
 
-    /* Smooth the instantaneous vertical RATE first (sign-stable, lightly lagged). */
-    float prev_trend = c->trend_fps;                       /* rate before update */
-    float inst = (agl_ft - c->prev_agl) / dt_s;            /* instantaneous fps  */
+    float inst = (agl_ft - c->prev_agl) / dt_s;            /* instantaneous fps */
     c->trend_fps += TREND_SMOOTH_ALPHA * (inst - c->trend_fps);
     c->prev_agl = agl_ft;
-
-    /* The vario blip's derivative term: smooth the change in the SMOOTHED rate so
-     * we report vertical acceleration (ft/s^2, +up). Built off the post-smoothing
-     * trend so it can't chase the raw single-sample spikes the rate EMA already
-     * rejected.                                                                    */
-    float inst_accel = (c->trend_fps - prev_trend) / dt_s;
-    c->trend_accel_fps2 += TREND_ACCEL_SMOOTH_ALPHA * (inst_accel - c->trend_accel_fps2);
-
     return c->trend_fps;
 }
 
@@ -356,8 +335,7 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
     out->tone_agl            = agl_ft;
     out->tone_active         = tone_active;
     out->fired_positive_rate = posrate_fire;
-    /*  Hand the smoothed vertical rate + acceleration to the audio engine so the
-     *  vario blip can chop the tone by descent rate (see audio.c blip gate).      */
+    /*  Hand the smoothed vertical rate to the audio engine so the vario blip can
+     *  chop the tone by descent rate (see audio.c blip gate).                     */
     out->vert_fps            = c->trend_fps;
-    out->vert_accel_fps2     = c->trend_accel_fps2;
 }

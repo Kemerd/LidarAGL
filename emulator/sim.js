@@ -246,15 +246,13 @@ async function main() {
     flareFadeOutMs:  M.cwrap('sim_flare_fade_out_ms', num, []),
     flareFadeInMs:   M.cwrap('sim_flare_fade_in_ms',  num, []),
 
-    // Vario "blip": the live vertical rate/accel + the cadence tunables, so the
-    // JS blip scheduler chops the tone with exactly the firmware's mapping.
+    // Vario "blip": the live vertical rate + the cadence tunables, so the JS blip
+    // scheduler chops the tone with exactly the firmware's mapping.
     vertFps:         M.cwrap('sim_vert_fps',          num, []),
-    vertAccel:       M.cwrap('sim_vert_accel',        num, []),
     varioRefFpm:     M.cwrap('sim_vario_ref_fpm',     num, []),
     varioSilBaseMs:  M.cwrap('sim_vario_sil_base_ms', num, []),
     varioSilMinMs:   M.cwrap('sim_vario_sil_min_ms',  num, []),
     varioBeepFactor: M.cwrap('sim_vario_beep_factor', num, []),
-    varioAccelMsGain:M.cwrap('sim_vario_accel_ms_gain',num,[]),
     varioBeepMinMs:  M.cwrap('sim_vario_beep_min_ms', num, []),
     varioBeepMaxMs:  M.cwrap('sim_vario_beep_max_ms', num, []),
     varioEdgeMs:     M.cwrap('sim_vario_edge_ms',     num, []),
@@ -354,7 +352,6 @@ function readConfig() {
     varioSilBaseMs:  api.varioSilBaseMs(),
     varioSilMinMs:   api.varioSilMinMs(),
     varioBeepFactor: api.varioBeepFactor(),
-    varioAccelMsGain:api.varioAccelMsGain(),
     varioBeepMinMs:  api.varioBeepMinMs(),
     varioBeepMaxMs:  api.varioBeepMaxMs(),
     varioEdgeMs:     api.varioEdgeMs(),
@@ -1319,18 +1316,16 @@ async function unlockAudio() {
 }
 
 /**
- * Turn the live vertical rate + acceleration into the vario blip's beep / silence
- * half-period lengths (ms), mirroring audio.c's blip_durations(). The SILENCE is
- * the sink-rate knob (long when level, short when sinking fast => faster blips);
- * the BEEP is half that silence term plus a derivative term (vertical acceleration
- * stretches the beep when the descent is rapidly building). climbRateOn lets a
- * climb count toward the rate; otherwise a climb reads as 0 fpm (baseline beep).
+ * Turn the live vertical rate into the vario blip's beep / silence half-period
+ * lengths (ms), mirroring audio.c's blip_durations(). The SILENCE is the sink-rate
+ * knob (long when level, short when sinking fast => faster blips); the BEEP is a
+ * fixed fraction of it, so the whole cadence scales together (no derivative term).
+ * climbRateOn lets a climb count toward the rate; otherwise a climb reads as 0 fpm.
  *
  * @param {number} vfps  Vertical rate, ft/s (+up).
- * @param {number} vacc  Vertical acceleration, ft/s^2 (+up).
  * @returns {{beepMs:number, silenceMs:number}}
  */
-function blipDurations(vfps, vacc) {
+function blipDurations(vfps) {
   const vFpm     = vfps * 60;
   const sinkFpm  = vFpm < 0 ? -vFpm : 0;
   const climbFpm = vFpm > 0 ?  vFpm : 0;
@@ -1341,8 +1336,7 @@ function blipDurations(vfps, vacc) {
   if (t > 1) t = 1;
   const silenceMs = cfg.varioSilBaseMs + t * (cfg.varioSilMinMs - cfg.varioSilBaseMs);
 
-  const dsinkFpmS = -vacc * 60;     // +ve when the sink is worsening
-  let beepMs = cfg.varioBeepFactor * silenceMs + cfg.varioAccelMsGain * dsinkFpmS;
+  let beepMs = cfg.varioBeepFactor * silenceMs;
   if (beepMs < cfg.varioBeepMinMs) beepMs = cfg.varioBeepMinMs;
   if (beepMs > cfg.varioBeepMaxMs) beepMs = cfg.varioBeepMaxMs;
 
@@ -1469,7 +1463,7 @@ function frame(ts) {
     if (sinkRateOn && toneOn && modeTone) {
       if (now >= blipNextFlip) {
         blipInBeep = !blipInBeep;                            // flip into the next half
-        const d = blipDurations(api.vertFps(), api.vertAccel());
+        const d = blipDurations(api.vertFps());
         const halfMs = blipInBeep ? d.beepMs : d.silenceMs;
         blipNextFlip = now + halfMs / 1000;
         blipGainNode.gain.setTargetAtTime(blipInBeep ? 1 : 0, now, edge);
@@ -1519,7 +1513,7 @@ function updateTelemetry(st, toneAgl, toneOn, pollMs) {
   // Vario blip readout: show the feature state + the live blip rate while sounding.
   let varioTxt = 'off';
   if (sinkRateOn) {
-    const d = blipDurations(api.vertFps(), api.vertAccel());
+    const d = blipDurations(api.vertFps());
     const hz = 1000 / (d.beepMs + d.silenceMs);   // full beep+silence cycles / sec
     varioTxt = (toneOn ? `${hz.toFixed(1)} Hz` : 'armed')
              + (climbRateOn ? ' · ±' : ' · sink');

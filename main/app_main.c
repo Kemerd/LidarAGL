@@ -706,10 +706,9 @@ static void logic_task(void *arg)
             ESP_LOGI(TAG, "positive rate (climb confirmed, state=%d)", out.state);
         }
 
-        /* Publish tone params + poll cadence. The vertical rate/accel ride along so
-         * the audio engine's vario blip can chop the tone by descent rate.          */
-        audio_set_params(out.tone_agl, out.tone_active,
-                         out.vert_fps, out.vert_accel_fps2);
+        /* Publish tone params + poll cadence. The vertical rate rides along so the
+         * audio engine's vario blip can chop the tone by descent rate.              */
+        audio_set_params(out.tone_agl, out.tone_active, out.vert_fps);
         g_poll_period_ms = poll_profile_to_ms(out.poll);
 
         /* Light-sleep policy: allowed only in GROUND/CRUISE, where the tone is

@@ -56,8 +56,6 @@ typedef struct {
     sm_state_t state;        /**< Current behaviour state.                     */
     float      prev_agl;     /**< Previous AGL, for the trend estimate.        */
     float      trend_fps;    /**< Smoothed vertical rate (ft/s, +up / -down).  */
-    float      trend_accel_fps2; /**< Smoothed vertical accel (ft/s^2, +up):   */
-                                 /**< d/dt of trend_fps for the vario blip.    */
     uint32_t   armed_mask;   /**< Per-callout armed bits.                      */
     bool       armed;        /**< True once climbed through ARM_FT.            */
     bool       have_prev;    /**< False until the first step seeds prev_agl.   */
@@ -82,8 +80,6 @@ typedef struct {
                                         /**< climb fires the "positive rate" call.*/
     float          vert_fps;       /**< Smoothed vertical rate handed to the   */
                                    /**< audio engine for the vario blip (+up). */
-    float          vert_accel_fps2;/**< Smoothed vertical accel (d/dt of rate) */
-                                   /**< for the blip's derivative term (+up).  */
 } sm_out_t;
 
 /**
