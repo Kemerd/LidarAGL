@@ -246,6 +246,8 @@ until you change it again.
 | **Voice volume** | **0 dB** (no cut) | cut-only trim on the callouts, 0…−6 dB |
 | **Check-gear altitude** | **OFF** | descent "check gear" reminder; off until you set it |
 | **Positive rate** | **OFF** | takeoff climb callout; off until you enable it |
+| **Vario blip** | **OFF** | vario-style tone chopping by vertical rate (sink **or** climb); off until you pick a direction |
+| **Tone start altitude** | **100 ft** | where the presence tone begins its fade-in (100 or 200 ft) |
 | Ground reference | learned at every boot | not a menu item — see [Ground reference](#ground-reference-no-manual-calibration) |
 
 ### Entering config mode
@@ -299,7 +301,7 @@ and "10" callouts ducking it). It cuts **or** boosts in 2 dB steps and wraps aro
 voice at the chosen level. Cut-only, in 2 dB steps, wrapping back to no-cut:
 `0 → −2 → −4 → −6 → 0 …`. Double-tap (or wait) to confirm → **chirp**.
 
-The last two levels are **optional callouts**, both **off by default** and both
+Levels 5 and 6 are **optional callouts**, both **off by default** and both
 *skipped in Tone Only* (they are spoken callouts).
 
 **Level 5 — "Check Gear" altitude.** *Off by default.* You'll hear *"check gear"* then the
@@ -320,6 +322,31 @@ arms once the aircraft has settled in the flare region (held below 10 ft long en
 for the tone's fade-out to finish, so a bounce never arms it), then fires after the
 climb rate holds **≥ 100 fpm for a continuous 2 s** above 10 ft. That confirmation
 window is what rejects a bounce, a flare balloon, or sensor jitter.
+
+The last two levels are **tone** settings, so unlike Levels 5–6 they **run in every
+mode** (including Tone Only).
+
+**Level 7 — Vario "blip" rate.** *Off by default.* A variometer-style cue layered on
+the presence tone: it **chops the tone into blips whose rate tracks your vertical
+speed**, so you hear how fast you're sinking (or climbing) by ear. It's a single
+3-way choice — tap to cycle, each spoken as you reach it:
+
+| Taps to | Spoken | What you get |
+|---|---|---|
+| — (start) | "Off" | steady tone (no chopping) |
+| 1 | "Sink rate" | tone blips **faster the faster you descend**; a steady tone when level or climbing |
+| 2 | "Climb rate" | the inverse — blips on the way **up**, steady tone when level or sinking |
+
+Double-tap (or wait) to confirm → **chirp**. The cadence is modelled on the
+open-source **BlueFlyVario**: below **~40 fpm** the tone is steady, then the blip rate
+rises in proportion to vertical speed up to a **~600 bpm (10 Hz) cap at 1000 fpm**.
+The **pitch is unaffected** — it still tracks altitude only; the vario adds only the
+rhythm. Tune the curve via `VARIO_*` in [`config.h`](main/config.h).
+
+**Level 8 — Tone start altitude.** Sets where the presence tone begins its fade-in.
+You'll hear *"Tone Only"* then the current altitude; a tap toggles **100 ft ↔ 200 ft**
+(the higher option gives an earlier, gentler swell on a long final). Double-tap (or
+wait) to confirm → **chirp**.
 
 After confirming this last level the unit **reboots** into normal operation.
 
@@ -390,7 +417,9 @@ phrase, and the start-altitude reuses the existing number clips:
 | `volume_adjustment.pcm` | "Volume Adjustment" |
 | `check_gear.pcm` | "Check gear" (descent reminder + its menu title) |
 | `positive_rate.pcm` | "Positive rate" (climb callout + its menu title) |
-| `off.pcm` | "Off" (the OFF choice in the check-gear / positive-rate menus) |
+| `sink_rate.pcm` | "Sink rate" (vario-blip menu — sink direction) |
+| `climb_rate.pcm` | "Climb rate" (vario-blip menu — climb direction) |
+| `off.pcm` / `on.pcm` | "Off" / "On" (the choices in the toggle menus) |
 
 The converter sniffs the header, so a `.pcm` file that is secretly a renamed WAV
 still converts — you can pass `assets/original_audio/*.pcm` alongside the WAVs.
@@ -474,6 +503,17 @@ per boot**, so flash wear is negligible. `AGL = measured_range − ground_avg`.
   without either dominating. The pan never changes a stream's loudness, and it's purely a
   separation cue (no inter-channel time delay, so callout onset stays crisp). Mono is a
   runtime option in the [config menu](#configuring-the-unit).
+- **Vario "blip" (optional, off by default).** When armed in the
+  [config menu](#configuring-the-unit) (Level 7, **Sink** *or* **Climb**), the tone is
+  **chopped into blips whose rate tracks your vertical speed** — a variometer cue for
+  the ear. The cadence is modelled 1:1 on the open-source **BlueFlyVario** (blip rate
+  *proportional* to rate), flipped to descent and stretched for a landing aid: below
+  **~40 fpm** the tone stays steady, then the rate ramps up to a **~600 bpm (10 Hz) cap
+  at 1000 fpm**. Only the **rhythm** changes — pitch and level still track altitude
+  exactly as above. The live rate is lightly smoothed (so a sudden change eases in over
+  a few blips, not a lurch), and each beep always finishes before the cadence updates.
+  All of it tunes from the `VARIO_*` block in `config.h`, and it works in every audio
+  mode (it acts on the tone, so even *Tone Only* can use it).
 
 ### Power
 - WiFi/BT compiled out. In GROUND/CRUISE the tone is silent, the I2S channel is paused,
@@ -531,7 +571,7 @@ main/
   boot_buffer.*     NVS ground-reference + audio-config store, in-flight-reboot recovery, reset/config button
   state_machine.*   states, arming, edge-trigger callouts, hysteresis, poll profile (pure)
   audio_math.*      pitch map, dB schedule, gain, envelopes (pure)
-  audio.*           i2s_std engine: NCO tone, dB volume, ducking, clip mixing, runtime mono/stereo pan, suspend/resume
+  audio.*           i2s_std engine: NCO tone, dB volume, ducking, clip mixing, runtime mono/stereo pan, vario blip, suspend/resume
   callouts.*        callout enum + embedded-clip manifest (graceful on missing clips); config-menu clips
   app_main.c        boot sequence (incl. the hold-at-boot config menu), task spawning, the logic loop
 assets/
