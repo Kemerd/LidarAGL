@@ -49,6 +49,13 @@ static sm_ctx_t                g_ctx;                  /* carried SM context    
 static sm_out_t                g_out;                  /* last sm_step() output  */
 static const sensor_profile_t *g_profile = &SF30C_PROFILE;  /* active profile    */
 
+/*  Current pilot-chosen tone-start altitude (ft). Mirrors app_main's s_tone_start_ft:
+ *  the height at/below which the presence tone is allowed to sound and the anchor of
+ *  the pitch + dB fade-in. Seeded to the compile-time default; sim_set_tone_start()
+ *  updates BOTH this (so the getter/tape reflect it) and the two firmware paths it
+ *  drives — the SM tone gate (g_ctx.tone_start_ft) and the audio math schedule.      */
+static float s_tone_start_ft = TONE_START_FT;
+
 /* ===========================================================================
  *  Lifecycle / profile selection
  * ===========================================================================*/
@@ -151,6 +158,17 @@ int sim_tone_active(void) { return g_out.tone_active ? 1 : 0; }
 EMSCRIPTEN_KEEPALIVE
 float sim_vert_fps(void) { return g_out.vert_fps; }
 
+/**
+ * @brief 1 the ONE tick the state machine confirms a sustained post-liftoff climb.
+ *
+ * @details Surfaces sm_out_t.fired_positive_rate — the firmware speaks the spoken
+ *          "positive rate" reminder on this edge when the pilot has enabled the
+ *          feature (LEVEL 6). The emulator gates it on its own posRateOn flag in JS,
+ *          exactly like app_main's s_posrate_enabled, and plays the clip on the edge.
+ */
+EMSCRIPTEN_KEEPALIVE
+int sim_fired_positive_rate(void) { return g_out.fired_positive_rate ? 1 : 0; }
+
 /* ---- Vario blip tunables (mirror config.h so the JS cadence matches firmware) -- */
 EMSCRIPTEN_KEEPALIVE float sim_vario_onset_fpm(void)     { return VARIO_ONSET_FPM; }
 EMSCRIPTEN_KEEPALIVE float sim_vario_full_fpm(void)      { return VARIO_FULL_FPM; }
@@ -175,6 +193,27 @@ float sim_callout_ft(int i)
         return -1.0f;
     }
     return g_profile->callouts[i];
+}
+
+/** @brief Number of "check gear" altitude options the active profile offers. */
+EMSCRIPTEN_KEEPALIVE
+int sim_n_gear_check_opts(void) { return (int)g_profile->n_gear_check_opts; }
+
+/**
+ * @brief Height (ft) of gear-check option @p i in the active profile, or -1 if OOB.
+ *
+ * @details The config menu's LEVEL 5 cycles OFF -> these heights -> OFF (descending,
+ *          highest first), mirroring run_config_menu(). JS reads the list straight
+ *          from the profile so the sim offers the SAME altitudes the box does
+ *          (SF30/C: 200/100; SF30/D: 500/400/300/200/100).
+ */
+EMSCRIPTEN_KEEPALIVE
+float sim_gear_check_opt(int i)
+{
+    if (i < 0 || (size_t)i >= g_profile->n_gear_check_opts) {
+        return -1.0f;
+    }
+    return g_profile->gear_check_opts[i];
 }
 
 /** @brief At/above this AGL (ft) the active profile enters low-power CRUISE. */

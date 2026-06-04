@@ -31,6 +31,14 @@
  * exactly as before. See TONE_START_FT_HIGH / NVS_KEY_TONESTART in config.h.      */
 static float s_tone_start_ft = TONE_START_FT;
 
+/* The altitude (ft) at which the dB swell reaches FULL presence. It tracks the
+ * tone-start above so the fade-in always occupies the SAME proportion of the
+ * descent (its top half), instead of dragging down to a fixed floor:
+ *   - 100 ft start -> full at 50 ft (TONE_FULL_FT, exactly as before)
+ *   - 200 ft start -> full at 100 ft (the swell runs 200 -> 100, not 200 -> 50)
+ * Refreshed alongside s_tone_start_ft by audio_math_set_tone_start().           */
+static float s_tone_full_ft = TONE_FULL_FT;
+
 /* Clamp helper. */
 static float clampf(float v, float lo, float hi)
 {
@@ -45,6 +53,12 @@ void audio_math_set_tone_start(float ft)
      * tone-start at or below TONE_FULL_FT would leave no fade-in band at all, so
      * fall back to the default if asked for something below it.                  */
     s_tone_start_ft = (ft > TONE_FULL_FT) ? ft : TONE_START_FT;
+
+    /* Keep the fade-in band a constant FRACTION of the descent: the full-presence
+     * altitude scales with the chosen start, so a 200 ft start swells in over
+     * 200 -> 100 ft rather than the over-long 200 -> 50 ft. At the 100 ft default
+     * this is exactly TONE_FULL_FT (50 ft), leaving that mode byte-identical.     */
+    s_tone_full_ft = TONE_FULL_FT * (s_tone_start_ft / TONE_START_FT);
 }
 
 float agl_to_pitch_hz(float agl_ft)
@@ -78,14 +92,16 @@ float agl_to_tone_db(float agl_ft)
         return TONE_SILENT_DB;
     }
 
-    /* Full presence at and below TONE_FULL_FT (through flare to the ground). */
-    if (agl_ft <= TONE_FULL_FT) {
+    /* Full presence at and below the (scaled) full altitude — through flare to
+     * the ground. For the 200 ft start this is 100 ft, so the tone is already at
+     * full presence by 100 ft and simply holds the rest of the way down.        */
+    if (agl_ft <= s_tone_full_ft) {
         return TONE_FULL_DB;
     }
 
-    /* Between the tone-start altitude and TONE_FULL_FT: ramp the LEVEL IN dB
-     * linearly. frac = 0 at the start (floor) -> 1 at TONE_FULL_FT (full).      */
-    float span = s_tone_start_ft - TONE_FULL_FT;        /* e.g. 50 ft (or 150)  */
+    /* Between the tone-start altitude and the full altitude: ramp the LEVEL IN dB
+     * linearly. frac = 0 at the start (floor) -> 1 at s_tone_full_ft (full).     */
+    float span = s_tone_start_ft - s_tone_full_ft;      /* 50 ft @100 / 100 @200 */
     float frac = (s_tone_start_ft - agl_ft) / span;     /* 0..1 */
     frac = clampf(frac, 0.0f, 1.0f);
 

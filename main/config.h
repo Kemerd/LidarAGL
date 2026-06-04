@@ -158,7 +158,10 @@
 #define STEREO_PAN               0.90f   /* equal-power lean, ~90% common/~10% aside */
 
 #define TONE_START_FT     100.0f      /* tone becomes barely audible here        */
-#define TONE_FULL_FT      50.0f       /* tone reaches full presence by here      */
+#define TONE_FULL_FT      50.0f       /* full presence by here @100ft start; the
+                                       * full-presence point scales with the start,
+                                       * so the 200 ft option reaches full at 100 ft
+                                       * (swell runs 200->100, not 200->50)       */
 #define FLARE_BAND_HI     35.0f       /* top of flare full-attention band        */
 #define FLARE_BAND_LO     20.0f       /* bottom of flare band                    */
 
