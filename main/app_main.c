@@ -907,7 +907,7 @@ static bool bench_attach_detected(void)
  * ------------------------------------------------------------------------- */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "LidarAGL boot");
+    ESP_LOGI(TAG, "LidarAGL boot — firmware %s", FIRMWARE_VERSION);
 
     /* WiFi/BT are compiled out (sdkconfig) and never started here — net effect:
      * radios never powered, no draw, no EMI into the audio/avionics path.     */

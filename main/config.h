@@ -28,6 +28,15 @@
  *  REGION 1 — PURE-LOGIC-SAFE CONSTANTS  (no ESP headers; host-test friendly)
  * ===========================================================================*/
 
+/* ---- Firmware version ---------------------------------------------------- */
+/*  The single source of truth for the build's human-readable version string.
+ *  Bump this on every release that ships to a unit. It is logged in the boot
+ *  banner (app_main.c) so a `idf.py monitor` / bench capture immediately shows
+ *  which firmware a box is running, and it lives here in the pure-logic region
+ *  so the host tests + the WASM emulator can read the same constant without
+ *  pulling in any ESP-IDF headers.                                            */
+#define FIRMWARE_VERSION "v1.58"
+
 /* ---- Sensor model identifiers ------------------------------------------- */
 /*  Mirror of the enum in sensor_profile.h, expressed as plain ints so this
  *  header has zero dependencies. The autodetect falls back to whichever model
