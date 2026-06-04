@@ -54,6 +54,20 @@ GND, VIN — and **cap off the other three** (Alarm, Sync, Analog) unused.
 > **local LC/ferrite + bulk cap** at the sensor to keep its hash off the shared
 > rail.
 
+> ### ⚠️ Land the sensor on the pads numbered **`8`** and **`9`** — NOT the pins marked `TX`/`RX`
+>
+> This one cost real bench hours. The firmware reads the SF30 on **UART1 (GPIO 8 / 9)**.
+> The header pins silk-screened **`TX`/`RX`** on most ESP32-S3 boards are a *different*
+> UART — **UART0 / the USB-console (GPIO 43/44)** — which the firmware does **not** use
+> for the sensor. Wire the SF30 to `TX`/`RX` and GPIO 8 sits floating: you'll get
+> `raw UART1 drain: n=0` (zero bytes) plus occasional random "readings" from line noise.
+>
+> - 🟡 **Yellow (sensor TXD)** → the pad printed **`8`** / `IO8`  (the S3's RX)
+> - 🟠 **Orange (sensor RXD)** → the pad printed **`9`** / `IO9`  (the S3's TX)
+>
+> If you must use other pads, change `PIN_SF30C_RX` / `PIN_SF30C_TX` in `config.h` to
+> match — but never use the USB-Serial-JTAG pins (19/20) or the strapping pins.
+
 ### PCM5102A DAC → ESP32-S3 (I2S)
 
 | PCM5102A pin | → | ESP32-S3 | config.h |

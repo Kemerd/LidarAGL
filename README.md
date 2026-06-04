@@ -106,10 +106,49 @@ USB (flash/log). All sensor & DAC logic is 3.3 V.
 | **V+**   |  →      | the shared clean 5 V rail | — |
 
 > Note the crossover: sensor **TX** → S3 **RX**, sensor **RX** → S3 **TX**.
+>
+> ⚠️ **Use the pads numbered `8` and `9`, NOT the pins marked `TX`/`RX`.** Those
+> `TX`/`RX` labels are the S3's UART0 / USB-console (GPIO 43/44) — a *different* UART
+> the firmware doesn't read the sensor on. Wire the SF30 there and GPIO 8 floats →
+> `raw UART1 drain: n=0` and only noise. Yellow → pad **8**, Orange → pad **9**.
 > In an aircraft you'll run everything from one regulated 5 V rail (a separate
 > sensor rail isn't practical in the panel). The SF30 draws real current and is
 > noisy on its supply, so feed it through a small **local LC/ferrite + bulk cap**
 > right at the sensor to keep its switching hash off the shared rail.
+
+#### One-time sensor setup in LightWare Studio
+
+The SF30/C ships configured for **USB output at 921600 baud** — neither of which
+the firmware can read off the serial pins. You must point it at the serial port
+**once** with the free [LightWare Studio](https://lightwarelidar.com/) app (connect
+the sensor to a PC over micro-USB → **Parameters**). These settings persist in the
+sensor's own memory, so it's a per-sensor, one-time job.
+
+> **Why not LWNX binary?** This SF30/C only offers *"Distance over Serial"* (the
+> legacy 2-byte high/low stream) — its Output-type list has **no "Full
+> communication mode."** So the firmware reads the 2-byte protocol (`SF30C_MODE =
+> SF30C_ASCII`) and, on every boot, sends the ASCII `#` commands a host controller
+> is allowed to issue to start the laser and pin the rate. Output type + baud are
+> the only things that *can't* be set over serial, hence this one Studio step.
+
+| Studio parameter | Set to | Why |
+|------------------|--------|-----|
+| **Serial port baud rate** | **921600** | Must equal `SF30C_BAUD` (also 921600 — the factory default). A mismatch yields `n=0` (huge mismatch) or a `CE`-heavy garbage stream decoding to ~328 ft (~2× mismatch). Lower both sides together (e.g. 115200) for more cable margin if you like — just keep them equal. |
+| **Output type** | **Distance over Serial** | The only mode that streams on the UART pins. Factory default *"Distance over USB"* puts nothing on the serial port. |
+| **Exposure time** | **12793 µs (78 / sec)** | Long exposure = best precision; staying **under 500 / sec keeps the rated ±5 cm** (above it the spec drops to ±10 cm). |
+| **Serial port output rate** | **78 / sec** | Matches the sampling rate; ~156 B/s at 115200 — trivial load for the ESP32, plenty fresh for flare callouts. |
+| **Return mode** | **First** | First return = the nearest surface = true AGL. (Last return can read *through* to a lower surface.) |
+| **Lost signal confirmations** | **3** | A few confirms stop a single dropped reading flagging "lost"; the firmware also holds last-good across dropouts. |
+| **Zero offset** | **0** | Leave it — the firmware learns the mount/ground offset itself at boot, so any offset here would double-correct. |
+
+> **Rates are belt-and-suspenders.** The firmware re-asserts `#R8`/`#U8` (78 / sec)
+> on every boot, so even if Studio's rate fields drift, the device lands at 78 / sec.
+> The two rows that genuinely *require* Studio are **baud** and **Output type**.
+>
+> **Max accuracy vs. responsiveness:** 78 / sec is the sweet spot (the guide
+> explicitly advises slower rates for altimetry). Drop to **39 / sec** for the
+> longest exposure / best precision if you find that fast enough near the ground;
+> never exceed **312 / sec** or you cross the ±5 cm → ±10 cm accuracy line.
 
 ### 2) PCM5102A DAC → ESP32-S3 — I2S
 

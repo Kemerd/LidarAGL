@@ -37,10 +37,20 @@
 #define DEFAULT_SENSOR_MODEL SENSOR_MODEL_SF30C   /* SF30/C is the default unit */
 
 /* ---- SF30 serial / parse ------------------------------------------------- */
-#define SF30C_BAUD        115200      /* LightWare default; 8N1                 */
-#define SF30C_ASCII       0           /* legacy 2-byte stream — bring-up        */
-#define SF30C_BINARY      1           /* LWNX framed protocol — production      */
-#define SF30C_MODE        SF30C_BINARY
+/*  MUST equal the sensor's "Serial port baud rate" in LightWare Studio (currently
+ *  set to 460800 on our unit — confirm in Studio → Communication). A mismatch yields
+ *  n=0 (big error) or a CE-heavy garbage stream decoding to ~328 ft (~2x error).
+ *  The S3 UART handles any of these rates; just keep BOTH sides equal.             */
+#define SF30C_BAUD        460800      /* match Studio's Serial port baud; 8N1     */
+#define SF30C_ASCII       0           /* legacy 2-byte high/low stream          */
+#define SF30C_BINARY      1           /* LWNX framed protocol                   */
+/*  Our SF30/C (and its shipping firmware) ONLY offers "Distance over Serial" —
+ *  the legacy 2-byte high/low stream + the '#' ASCII command set. It has NO
+ *  "Full communication mode" (LWNX) option in LightWare Studio, so the REAL
+ *  sensor is parsed as ASCII. The bench SIM stream stays LWNX regardless — that
+ *  sim/real split lives in sf30c_read_latest_ft(). Set the sensor's serial baud
+ *  to SF30C_BAUD and Output type to "Distance over Serial" in Studio (see README).*/
+#define SF30C_MODE        SF30C_ASCII
 #define USE_FEET          1           /* all higher logic works in feet         */
 
 /*  Conversion factor applied in exactly ONE place (sf30c.c). The sensor reports
@@ -497,10 +507,13 @@
  *  raw range — so the boot ground-fill, the MAX_VALID_FT sanity check, and the
  *  stored NVS ground all keep working in honest small feet and nothing leaks
  *  between this mode and a normal boot. Each foot of real range above ground
- *  becomes BENCH_SCALE_GAIN feet of AGL, so ~5 ft of hand travel sweeps the
- *  whole 0..400 ft band (boot distance == 0 ft AGL, +5 ft == ~400 ft AGL).
+ *  becomes BENCH_SCALE_GAIN feet of AGL, so a few feet of hand travel sweeps the
+ *  whole 0..400 ft band (boot distance == 0 ft AGL, +4 ft == ~400 ft AGL at the
+ *  x100 default). This is only the COMPILE-TIME DEFAULT: the bench tool may send
+ *  its own gain in the OP_BENCH_REAL attach frame, which wins for that boot (see
+ *  bench_attach_detected / s_bench_scale_gain in app_main.c).
  *  Runtime-only and never persisted, exactly like sim mode.                     */
-#define BENCH_SCALE_GAIN     80.0f   /* AGL feet produced per real foot above ground */
+#define BENCH_SCALE_GAIN     100.0f  /* default AGL feet produced per real foot above ground */
 #define BENCH_TAPE_LOG_MS    100     /* fast, compact "bench: -> N ft" value cadence  */
                                      /* (the host altitude tape tracks THIS line)     */
 #define BENCH_DEBUG_LOG_MS   750     /* slower verbose raw/ground/agl breakdown line  */

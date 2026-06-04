@@ -19,6 +19,7 @@
 #include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
+#include "esp_timer.h"   /* bench raw-byte dump throttle */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -44,6 +45,15 @@ static lwnx_parser_t s_parser;
  *  stream from the USB-Serial-JTAG instead of UART1. Runtime-only (never NVS).  */
 static bool                  s_sim_mode = false;
 static sf30c_bench_ctrl_cb_t s_bench_cb = NULL;
+
+/*  Bench diagnostic: when set, dump the raw bytes drained from the REAL sensor
+ *  UART (throttled) so we can see exactly what the SF30 is putting on the wire.  */
+static bool                  s_raw_debug = false;
+
+void sf30c_enable_raw_debug(void)
+{
+    s_raw_debug = true;
+}
 
 /* ---- UART setup ---------------------------------------------------------- */
 
@@ -199,28 +209,74 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
             ? usb_serial_jtag_read_bytes(rx, sizeof rx, 0)
             : uart_read_bytes(SF30C_UART_NUM, rx, sizeof rx, 0);
 
+    /* Bench diagnostic: dump the raw wire bytes (up to 16, ~1 Hz) so we can see
+     * exactly what the real sensor is sending — distinguishes "sensor reports
+     * lost" from a baud/sync problem. Real-sensor path only.                      */
+    if (s_raw_debug && !s_sim_mode) {
+        static int64_t s_raw_log_us = 0;
+        int64_t t = esp_timer_get_time();
+        if (t - s_raw_log_us >= 1000 * 1000) {     /* ~1 s, logged even when n==0 */
+            s_raw_log_us = t;
+            static const char HEXD[] = "0123456789ABCDEF";
+            char hex[3 * 16 + 1];
+            int m = n; if (m < 0) m = 0; if (m > 16) m = 16;
+            int p = 0;
+            for (int i = 0; i < m; ++i) {
+                hex[p++] = HEXD[(rx[i] >> 4) & 0xF];
+                hex[p++] = HEXD[rx[i] & 0xF];
+                hex[p++] = ' ';
+            }
+            hex[p] = '\0';
+            /* n==0  -> sensor TX line is silent (wiring, or output type != Serial)
+             * n>0   -> bytes ARE arriving; the hex shows the real on-wire format. */
+            ESP_LOGW(TAG, "raw UART1 drain: n=%d [%s]", n, hex);
+        }
+    }
+
     bool got_sample = false;
     bool last_valid = true;
     float last_cm   = 0.0f;
 
     for (int i = 0; i < n; ++i) {
+        /* SIM mode always carries the LWNX framed stream from the bench tool —
+         * regardless of the real-sensor parse mode below — so decode it as LWNX
+         * and dispatch any bench-control frames that ride alongside.             */
+        if (s_sim_mode) {
+            lwnx_frame_t f;
+            if (lwnx_feed(&s_parser, rx[i], &f)) {
+                if (f.cmd == LWNX_CMD_DISTANCE_DATA) {
+                    int16_t cm = 0;
+                    /* firstReturnFiltered is the int16 at payload offset 6. */
+                    if (lwnx_read_i16(f.payload, f.plen, 6, &cm)) {
+                        last_cm    = (float)cm;
+                        last_valid = (cm != (int16_t)SF30_LOST_SIGNAL_CM) && (cm >= 0);
+                        got_sample = true;
+                    }
+                } else if (f.cmd == LWNX_CMD_BENCH_CTRL) {
+                    sim_dispatch_frame(&f);
+                }
+            }
+            continue;
+        }
+
+        /* REAL sensor: parse per the compile-time protocol. This SF30/C streams
+         * the legacy 2-byte high/low pairs ("Distance over Serial"), so SF30C_MODE
+         * is SF30C_ASCII; a unit configured for LWNX would use the binary path.   */
 #if SF30C_MODE == SF30C_BINARY
         lwnx_frame_t f;
         if (lwnx_feed(&s_parser, rx[i], &f)) {
             if (f.cmd == LWNX_CMD_DISTANCE_DATA) {
                 int16_t cm = 0;
-                /* firstReturnFiltered is the int16 at payload offset 6. */
                 if (lwnx_read_i16(f.payload, f.plen, 6, &cm)) {
                     last_cm    = (float)cm;
                     last_valid = (cm != (int16_t)SF30_LOST_SIGNAL_CM) && (cm >= 0);
                     got_sample = true;
                 }
             } else if (f.cmd == LWNX_CMD_BENCH_CTRL) {
-                /* Bench-control frames ride the same stream while in sim mode. */
                 sim_dispatch_frame(&f);
             }
         }
-#else /* SF30C_ASCII */
+#else /* SF30C_ASCII — legacy 2-byte high/low pairs */
         float cm; bool v;
         if (ascii_feed(rx[i], &cm, &v)) {
             last_cm    = cm;
@@ -341,8 +397,25 @@ void sf30c_configure_stream(uint32_t rate_code)
     lwnx_write_u32(LWNX_CMD_DISTANCE_CFG, 0xFFFFFFFFu);
     lwnx_write_u32(LWNX_CMD_STREAM, 5u);
     ESP_LOGI(TAG, "stream configured (rate_code=%u)", (unsigned)rate_code);
-#else
-    (void)rate_code;   /* ASCII firmware free-streams; nothing to configure. */
+#else /* SF30C_ASCII — legacy SF30/C "Distance over Serial" (product guide §10) */
+    /* Configure the sensor over serial exactly the way LightWare's own SF30 Linux
+     * sample (sf30_raspberrypi_c_serial) does — now that we talk at the sensor's
+     * real baud these actually land. We pin the sampling rate (#R) and serial
+     * output rate (#U), zero the offset (#Z0), and start the laser (#Y). Rate
+     * codes are a single digit 0..9 (8 == 78 readings/s — under the 500/s line the
+     * datasheet rates at +-5 cm, plenty for the flare).
+     *
+     * The ONLY thing that still needs LightWare Studio is the one-time Output type
+     * = "Distance over Serial" + the serial baud (no '#' command sets either).     */
+    char digit = (char)('0' + (int)(rate_code % 10));
+    char r_cmd[5] = { '#', 'R', digit, ':', '\0' };   /* sampling update rate      */
+    char u_cmd[5] = { '#', 'U', digit, ':', '\0' };   /* serial port output rate   */
+    uart_write_bytes(SF30C_UART_NUM, "#Y:", 3);       /* laser ON                  */
+    uart_write_bytes(SF30C_UART_NUM, r_cmd, 4);
+    uart_write_bytes(SF30C_UART_NUM, u_cmd, 4);
+    uart_write_bytes(SF30C_UART_NUM, "#Z0:", 4);      /* zero offset = 0 m         */
+    ESP_LOGI(TAG, "ASCII config: #Y + #R%c/#U%c + #Z0 (rate code %u, baud %d)",
+             digit, digit, (unsigned)rate_code, SF30C_BAUD);
 #endif
 }
 

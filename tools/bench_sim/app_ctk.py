@@ -13,6 +13,7 @@ wiring, so swapping to another GUI toolkit later only means rewriting this file.
 """
 
 import queue
+import struct
 
 import customtkinter as ctk
 
@@ -161,13 +162,21 @@ class BenchApp(ctk.CTk):
                       command=self.serial.pulse_reset).grid(row=0, column=2,
                                                             padx=4, sticky="ew")
 
+        # Bench real-sensor AGL scale gain: how many feet of AGL each real foot
+        # above the learned ground becomes. Sent in the OP_BENCH_REAL attach frame
+        # so the dev can dial the sweep without reflashing (firmware clamps to
+        # [1, 1000]). x100 => +4 real ft ≈ 0..400 ft AGL.
+        self.gain_entry = self._labelled_entry(
+            card, 3, "Bench scale gain (×)",
+            "%g" % P.BENCH_SCALE_GAIN_DEFAULT)
+
         # Bench REAL-sensor scaled debug: NOT a sim — the real LiDAR stays live on
         # UART, the firmware just scales the AGL up so a close bench target sweeps
         # the full callout band and logs each raw reading. Its own row so it reads
         # as the distinct mode it is.
         ctk.CTkButton(card, text="Bench real sensor (scaled debug)",
                       command=self._enter_bench_real).grid(
-                          row=3, column=0, columnspan=3, padx=16, pady=(0, 8),
+                          row=4, column=0, columnspan=3, padx=16, pady=(0, 8),
                           sticky="ew")
 
         ctk.CTkLabel(card, text="Enter Sim: the board reboots (RTS) and the bench "
@@ -176,10 +185,11 @@ class BenchApp(ctk.CTk):
                      "work on your board). Enter Config: must be in sim FIRST — it "
                      "software-reboots the box into the config menu (then drive it "
                      "with Next/Confirm below). Bench real sensor: keep the LiDAR "
-                     "connected — readings get scaled x80 (≈1 ft → 0, 6 ft → 400 ft) "
-                     "and logged so you can confirm the sensor is talking on the bench.",
+                     "connected — each real foot above ground is scaled by the gain "
+                     "above (x100 ⇒ ≈4 ft sweeps 0..400 ft) and logged so you can "
+                     "confirm the sensor is talking on the bench.",
                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=520,
-                     justify="left").grid(row=4, column=0, columnspan=3, padx=16,
+                     justify="left").grid(row=5, column=0, columnspan=3, padx=16,
                                           pady=(0, 14), sticky="w")
 
     def _build_ils_card(self, parent):
@@ -384,8 +394,20 @@ class BenchApp(ctk.CTk):
         self.engine.stop()
         self.ctrl.stop_attach()
         self.serial.pulse_reset()
-        self.ctrl.start_attach(P.OP_BENCH_REAL)
-        self._set_status("attaching (bench real sensor)…", WARN)
+        # Pack the requested AGL scale gain as a little-endian float right after the
+        # opcode. A blank/garbage field falls back to the default; clamp to the same
+        # [1, 1000] window the firmware enforces so the readout matches what lands.
+        gain = self._read_gain()
+        self.ctrl.start_attach(P.OP_BENCH_REAL, arg=struct.pack("<f", gain))
+        self._set_status("attaching (bench real sensor, x%g)…" % gain, WARN)
+
+    def _read_gain(self) -> float:
+        """Parse + clamp the bench-scale-gain field, falling back to the default."""
+        try:
+            gain = float(self.gain_entry.get())
+        except (ValueError, AttributeError):
+            gain = P.BENCH_SCALE_GAIN_DEFAULT
+        return max(P.BENCH_SCALE_GAIN_MIN, min(P.BENCH_SCALE_GAIN_MAX, gain))
 
     def _enter_config(self):
         # While in sim the chip's RTS reset is suppressed, so trigger a SOFTWARE

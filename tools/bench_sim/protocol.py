@@ -32,6 +32,9 @@ LWNX_CMD_BENCH_CTRL    = 200
 
 OP_HELLO        = 0x01              # attach: enter sim mode this boot
 OP_BENCH_REAL   = 0x02             # attach: REAL sensor + scaled-AGL debug boot
+                                   # may carry an optional '<f' float after the
+                                   # opcode: the AGL scale gain (overrides the
+                                   # firmware's compile-time BENCH_SCALE_GAIN)
 OP_ENTER_CONFIG = 0x10             # attach + run the boot config menu this boot
 OP_REBOOT       = 0x11             # esp_restart(); host re-attaches afterwards
 OP_MENU_NEXT    = 0x20             # config menu: single-tap (cycle a selection)
@@ -47,6 +50,13 @@ DISTANCE_OFFSET_FILT   = 6         # int16 LE cm offset the firmware decodes
 # --- Units / sentinels (main/config.h) ---------------------------------------
 CM_TO_FT               = 0.0328084 # the firmware's single cm->ft factor
 SF30_LOST_SIGNAL_CM    = 16000     # sentinel the SF30 emits on no-return
+
+# Bench real-sensor AGL scale gain (main/config.h BENCH_SCALE_GAIN). This is the
+# default the GUI seeds its field with; the firmware clamps incoming values to
+# [1, 1000] (see bench_attach_detected). x100 => +4 real ft sweeps ~0..400 ft AGL.
+BENCH_SCALE_GAIN_DEFAULT = 100.0
+BENCH_SCALE_GAIN_MIN     = 1.0
+BENCH_SCALE_GAIN_MAX     = 1000.0
 
 # Nominal serial baud. The USB-Serial-JTAG is a CDC device and ignores the baud
 # rate, but pyserial still requires a value when opening the port.

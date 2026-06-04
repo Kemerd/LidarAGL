@@ -24,3 +24,5 @@ __pycache__/
 #   - assets/clips/*.pcm        (generated callout clips the firmware embeds)
 #   - assets/original_audio/*   (source WAV masters, for re-conversion)
 # so a fresh clone builds and the voice masters are preserved.
+/SampleLibrary-master
+diag.txt

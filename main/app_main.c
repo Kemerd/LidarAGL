@@ -99,9 +99,15 @@ static volatile bool s_sim_want_config = false;
 static volatile bool s_sim_want_bench_real = false;
 
 /*  True once bench real-sensor scaled debug mode is armed for this boot. Read by
- *  the logic task to multiply the AGL by BENCH_SCALE_GAIN and emit the throttled
+ *  the logic task to multiply the AGL by s_bench_scale_gain and emit the throttled
  *  raw-reading line. Never set on a normal/flight boot.                           */
 static bool s_bench_scale = false;
+
+/*  The actual AGL scale used in bench real-sensor mode. Seeded with the compile-
+ *  time BENCH_SCALE_GAIN default, but the bench tool can override it per boot by
+ *  appending a little-endian float to the OP_BENCH_REAL attach frame (parsed in
+ *  bench_attach_detected). Lets the dev dial the sweep without a reflash.         */
+static float s_bench_scale_gain = BENCH_SCALE_GAIN;
 
 /*  Bench HIL: a "reboot into the config menu" request that survives the SOFTWARE
  *  reboot esp_restart() performs (RTC memory keeps its value across a restart,
@@ -696,12 +702,12 @@ static void logic_task(void *arg)
 
         /* Bench real-sensor debug: a close bench target only swings a few feet,
          * so multiply the (real-feet) AGL up to flight altitudes — one foot above
-         * the learned ground becomes BENCH_SCALE_GAIN feet, so ~5 ft of hand
+         * the learned ground becomes s_bench_scale_gain feet, so a few feet of hand
          * travel sweeps the whole 0..400 ft callout band. The raw sensor reading
          * is logged (throttled) so the dev can confirm the LiDAR is streaming.
          * Armed only for an OP_BENCH_REAL boot; a flight build never enters here. */
         if (s_bench_scale) {
-            float scaled = agl * BENCH_SCALE_GAIN;
+            float scaled = agl * s_bench_scale_gain;
             /* Fast, compact value line — the host altitude tape parses THIS, so it
              * tracks smoothly without drowning the human log in the full breakdown.*/
             static int64_t s_tape_log_us = 0;    /* logic task is single-threaded  */
@@ -866,6 +872,17 @@ static bool bench_attach_detected(void)
                     /* Real-sensor scaled debug boot: caught here so the driver is
                      * left installed for app_main to tidy up, just like HELLO.    */
                     s_sim_want_bench_real = true;
+                    /* The host may append a little-endian float (the desired AGL
+                     * scale) right after the opcode. The S3 is little-endian like
+                     * the host, so a straight copy decodes it. Sanity-clamp before
+                     * accepting so a garbled frame can't produce an absurd sweep.  */
+                    if (f.plen >= 1 + sizeof(float)) {
+                        float g;
+                        memcpy(&g, &f.payload[1], sizeof g);
+                        if (g >= 1.0f && g <= 1000.0f) {
+                            s_bench_scale_gain = g;
+                        }
+                    }
                     found = true;
                     break;
                 }
@@ -913,8 +930,9 @@ void app_main(void)
              * mode. ESP_LOG keeps using its direct-FIFO path either way, so the
              * console + this banner are unaffected by leaving the driver up.       */
             s_bench_scale = true;
+            sf30c_enable_raw_debug();   /* dump the raw sensor bytes for diagnosis */
             ESP_LOGW(TAG, "BENCH REAL-SENSOR MODE: real LiDAR on UART, AGL scaled "
-                          "x%.0f for bench callout testing", (double)BENCH_SCALE_GAIN);
+                          "x%.0f for bench callout testing", (double)s_bench_scale_gain);
         } else {
             sf30c_set_bench_ctrl_cb(bench_ctrl_handler);
             sf30c_sim_enable();

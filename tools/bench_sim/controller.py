@@ -55,16 +55,19 @@ class BenchController:
 
     # --- attach spammer ------------------------------------------------------
 
-    def start_attach(self, opcode: int = P.OP_HELLO, interval: float = 0.04):
+    def start_attach(self, opcode: int = P.OP_HELLO, arg: bytes = b"",
+                     interval: float = 0.04):
         """Repeatedly send `opcode` until stop_attach() (catches the boot window).
 
         opcode is OP_HELLO for a normal sim attach, or OP_ENTER_CONFIG to bring
-        the box up straight into the config menu.
+        the box up straight into the config menu. `arg` is opcode-specific extra
+        payload sent after the opcode byte every frame — e.g. the packed '<f' AGL
+        scale gain for OP_BENCH_REAL.
         """
         self.stop_attach()
         self._spam_stop.clear()
         self._spam_thread = threading.Thread(
-            target=self._spam, args=(opcode, interval), daemon=True)
+            target=self._spam, args=(opcode, arg, interval), daemon=True)
         self._spam_thread.start()
 
     def stop_attach(self):
@@ -76,8 +79,8 @@ class BenchController:
     def is_attaching(self) -> bool:
         return self._spam_thread is not None and self._spam_thread.is_alive()
 
-    def _spam(self, opcode: int, interval: float):
-        frame = codec.build_bench_ctrl(opcode)
+    def _spam(self, opcode: int, arg: bytes, interval: float):
+        frame = codec.build_bench_ctrl(opcode, arg)
         while not self._spam_stop.is_set():
             self.serial.send(frame)
             time.sleep(interval)

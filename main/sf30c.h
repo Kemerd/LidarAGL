@@ -86,6 +86,15 @@ void sf30c_sim_enable(void);
 bool sf30c_sim_active(void);
 
 /**
+ * @brief Enable a throttled hex dump of the raw bytes drained from the REAL
+ *        sensor UART (bench diagnostics only; the sim stream is unaffected).
+ *
+ * @details Lets a developer see exactly what the SF30 puts on the wire, to tell
+ *          "sensor reports lost / out-of-range" apart from a baud/sync problem.
+ */
+void sf30c_enable_raw_debug(void);
+
+/**
  * @brief Callback invoked when a BENCH_CTRL frame is decoded on the sim stream.
  *
  * @param opcode  OP_* control opcode (payload byte 0).
