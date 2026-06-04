@@ -195,7 +195,7 @@
  *  level with the analog trim pot; firmware only provides the ramp shape.
  *  Rule of thumb: +10 dB ~ perceived "twice as loud".                          */
 #define TONE_FLOOR_DB     -40.0f      /* barely audible at 100 ft                */
-#define TONE_FULL_DB      -6.0f       /* full presence at/below 50 ft            */
+#define TONE_FULL_DB      -10.0f       /* full presence at/below 50 ft            */
 #define VOICE_DUCK_DB     4.0f        /* duck the tone this much under a callout  */
 #define GAIN_RAMP_MS      40          /* raised-cosine envelope time (>=30–50ms)  */
 
