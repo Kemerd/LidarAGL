@@ -181,7 +181,7 @@
  *
  *    3) Conditional soft-clip — see TONE_SOFTCLIP_ONLY_WITH_VOICE below.       */
 #define TONE_HARMONIC2_LVL  0.18f     /* 2nd-harmonic mix (0 = pure sine)        */
-#define MIX_LPF_FC_HZ       3500.0f   /* 1-pole LPF corner on the L/R mix bus    */
+#define MIX_LPF_FC_HZ       4200.0f   /* 1-pole LPF corner on the L/R mix bus    */
 
 /*  The solo presence tone is scheduled to peak around -6 dBFS, so on its OWN it
  *  never needs limiting — running it through tanh() only ADDS odd-harmonic edge

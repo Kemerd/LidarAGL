@@ -59,6 +59,23 @@ TRIM_THRESH   = 0.02         # speech starts where |sample| exceeds this * peak
 TRIM_PAD_MS   = 30           # keep this much audio either side of the speech
 TRIM_FADE_MS  = 8            # raised-cosine fade in/out at the trimmed edges
 
+# --- Voice high-pass (low-end / plosive-pop cut) -----------------------------
+# These callout masters are heavily low-biased (60-85% of their energy sits below
+# 1 kHz, with rumble + plosive "pop" energy under ~150 Hz). A high-pass that cuts
+# everything at/below VOICE_HPF_HZ removes that boom/pop — the classic fix for the
+# harsh thump under a hard "T"/"P" — without touching intelligibility (the speech
+# formants live well above it). We bake it into the clip here so the firmware pays
+# zero CPU and the presence tone (600-1800 Hz) is untouched.
+#
+# Implemented as a proper 4th-order BUTTERWORTH high-pass = two cascaded RBJ-cookbook
+# biquads (24 dB/oct, matching a DAW's "24" high-pass). A 4th-order Butterworth does
+# NOT use Q=0.707 per section; the maximally-flat cascade needs these two Qs:
+#     https://www.w3.org/TR/audio-eq-cookbook/        (biquad HPF coefficients)
+#     https://www.earlevel.com/main/2016/09/29/cascading-filters/  (cascade Q split)
+VOICE_HPF_ENABLE = True       # master switch for the high-pass stage
+VOICE_HPF_HZ     = 150.0      # cut at/below this (Hz)
+VOICE_HPF_Q      = (0.54119610, 1.30656296)  # 4th-order Butterworth section Qs
+
 # --- Consonant softening (de-esser + plosive tamer) --------------------------
 # Recorded/synth voice tends to spit on the hard "T" in "two/twenty/thirty" (a
 # fast broadband plosive burst) and hiss on any "S" (sibilance — a narrow band
@@ -144,6 +161,61 @@ def trim_silence(mono):
         clip[-1 - i]       *= env
 
     return clip
+
+
+def _biquad_hpf_coeffs(fc, fs, q):
+    """RBJ-cookbook high-pass biquad coefficients, normalised so a0 == 1.
+
+    Returns (b0, b1, b2, a1, a2). See the Audio EQ Cookbook (w3.org/TR/audio-eq-
+    cookbook): a high-pass derived from the analog prototype via the bilinear
+    transform, with alpha = sin(w0)/(2Q) setting the resonance/Q at the corner.
+    """
+    w0 = 2.0 * math.pi * fc / fs
+    cw = math.cos(w0)
+    sw = math.sin(w0)
+    alpha = sw / (2.0 * q)
+
+    b0 = (1.0 + cw) / 2.0
+    b1 = -(1.0 + cw)
+    b2 = (1.0 + cw) / 2.0
+    a0 = 1.0 + alpha
+    a1 = -2.0 * cw
+    a2 = 1.0 - alpha
+
+    # Normalise out a0 so the difference equation can assume a0 == 1.
+    return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+
+
+def _biquad_apply(samples, coeffs):
+    """Run one biquad over a float signal (Transposed Direct Form II, stable)."""
+    b0, b1, b2, a1, a2 = coeffs
+    z1 = 0.0
+    z2 = 0.0
+    out = [0.0] * len(samples)
+    for i, x in enumerate(samples):
+        y = b0 * x + z1
+        z1 = b1 * x - a1 * y + z2
+        z2 = b2 * x - a2 * y
+        out[i] = y
+    return out
+
+
+def highpass_voice(mono):
+    """Cut low-end rumble + plosive pop with a 4th-order Butterworth high-pass.
+
+    `mono` is a float signal; returns a new float signal with everything at/below
+    VOICE_HPF_HZ rolled off at 24 dB/oct. Implemented as two cascaded RBJ biquads
+    whose Qs give the maximally-flat (Butterworth) shape — see VOICE_HPF_Q.
+    """
+    if not VOICE_HPF_ENABLE:
+        return mono
+    if len(mono) < 4:
+        return mono                       # too short to filter meaningfully
+
+    out = mono
+    for q in VOICE_HPF_Q:                 # cascade the Butterworth sections
+        out = _biquad_apply(out, _biquad_hpf_coeffs(VOICE_HPF_HZ, SAMPLE_RATE, q))
+    return out
 
 
 def soften_consonants(mono):
@@ -292,8 +364,10 @@ def wav_to_samples(wav_path):
             out.append(mono[i0] * (1 - frac) + mono[i1] * frac)
         mono = out
 
-    # Soften the harsh "T" plosives and "S" sibilance before trimming/normalising,
-    # while the signal is still float in ~[-1, 1] (the natural scale for the DSP).
+    # High-pass first to strip sub-150 Hz rumble + plosive pop, then soften the
+    # harsh "T"/"S" consonants — both on the float signal in ~[-1, 1] before we
+    # trim/normalise (so the normalise reflects the cleaned-up peak).
+    mono = highpass_voice(mono)
     mono = soften_consonants(mono)
 
     # Cut leading/trailing silence so every callout starts tight and on time.
