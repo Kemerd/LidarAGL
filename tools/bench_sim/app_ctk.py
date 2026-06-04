@@ -345,16 +345,21 @@ class BenchApp(ctk.CTk):
             return
         if self.serial.connect(port):
             self.connect_btn.configure(text="Disconnect")
-            # Stream immediately so the device's boot ground-fill is fed, and
-            # spam HELLO so the next boot window is caught.
-            self.engine.start()
-            self.ctrl.start_attach(P.OP_HELLO)
-            self._set_status("attaching…", WARN)
+            # Just open the port and read the device log — DON'T force a mode on
+            # connect. We used to auto-spam HELLO here, which slammed the box
+            # straight into sim and (because the heartbeat never stops) made it
+            # impossible to ever reach bench-real. Now the user explicitly picks a
+            # mode below; each handler owns starting the right stream + attach.
+            self._set_status("connected — pick Enter Sim or Bench real sensor",
+                             MUTED)
 
     def _enter_sim(self):
-        # Hardware-reset the chip (works whether or not it's already in sim),
-        # then spam HELLO so the post-reboot sim window is caught as the port
-        # re-enumerates and the worker auto-reconnects.
+        # Hardware-reset the chip (works whether or not it's already in sim), then
+        # spam HELLO so the post-reboot sim window is caught as the port
+        # re-enumerates and the worker auto-reconnects. Start the fabricated stream
+        # FIRST so the device's boot ground-fill is fed (and to re-arm it if a
+        # prior bench-real run stopped it).
+        self.engine.start()
         self.serial.pulse_reset()
         self.ctrl.start_attach(P.OP_HELLO)
         self._set_status("attaching…", WARN)
@@ -362,8 +367,15 @@ class BenchApp(ctk.CTk):
     def _enter_bench_real(self):
         # Real-sensor scaled debug: reboot the chip and spam OP_BENCH_REAL so the
         # post-reboot attach window catches it. The firmware keeps the LiDAR on
-        # UART (no sim frames needed), so we DON'T start the sim engine here — the
-        # board reports its own real, scaled readings on the log instead.
+        # UART and reports its own real, scaled readings on the log.
+        #
+        # CRITICAL: stop the fabricated stream AND the HELLO heartbeat BEFORE the
+        # reset. The real LiDAR feeds the device here, so sim frames are unwanted;
+        # and any in-flight HELLO would linger across the reboot and catch the box
+        # into sim before our OP_BENCH_REAL spam reconnects. (Enter Sim is immune
+        # to the HELLO race only because stale + new are both HELLO.)
+        self.engine.stop()
+        self.ctrl.stop_attach()
         self.serial.pulse_reset()
         self.ctrl.start_attach(P.OP_BENCH_REAL)
         self._set_status("attaching (bench real sensor)…", WARN)
@@ -373,6 +385,8 @@ class BenchApp(ctk.CTk):
         # reboot into the config menu (OP_ENTER_CONFIG → device sets a reboot-to-
         # config flag and restarts), then re-attach with HELLO so it comes back
         # into sim and the menu runs. Enter Sim FIRST if you're not attached yet.
+        # Ensure the stream is live (config needs the box drained + in sim).
+        self.engine.start()
         self.ctrl.enter_config()
         self.ctrl.start_attach(P.OP_HELLO)
         self._set_status("rebooting to config…", WARN)
@@ -458,11 +472,14 @@ class BenchApp(ctk.CTk):
                 self.sim_state_lbl.configure(text="sim mode active",
                                              text_color=GOOD)
             elif "BENCH REAL-SENSOR MODE" in line:
-                # Real-sensor scaled debug armed: the board is reading its own
-                # LiDAR, so there's no sim engine to track — just reflect the mode
-                # and stop the attach spam (the window has been caught).
+                # Real-sensor scaled debug armed: the board reads its own LiDAR and
+                # has dropped its USB-JTAG driver, so stop BOTH the attach spam and
+                # the sim stream (further writes would just time out) and reflect
+                # the mode. The device's own "bench: raw=… -> … ft" lines now show
+                # on the log so you can confirm the sensor is talking.
                 self.sim_active = False
                 self.ctrl.stop_attach()
+                self.engine.stop()
                 self._set_status("BENCH REAL SENSOR", GOOD)
                 self.sim_state_lbl.configure(text="real sensor — scaled debug",
                                              text_color=GOOD)

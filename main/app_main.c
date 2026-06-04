@@ -664,6 +664,18 @@ static void logic_task(void *arg)
         /* Peek the freshest range sample (non-destructive). */
         range_sample_t s;
         if (xQueuePeek(q_range_latest, &s, pdMS_TO_TICKS(100)) != pdTRUE) {
+            /* Bench debug: no sample means the sensor task has published nothing,
+             * i.e. the LiDAR is silent. Surface that (throttled to ~1 s) so a
+             * dead / miswired sensor is obvious rather than looking like "stuck
+             * at 0 ft". A flight build never sets s_bench_scale.                   */
+            if (s_bench_scale) {
+                static int64_t s_silent_log_us = 0;
+                int64_t t = esp_timer_get_time();
+                if (t - s_silent_log_us >= 1000 * 1000) {   /* ~1 s */
+                    s_silent_log_us = t;
+                    ESP_LOGW(TAG, "bench: no sensor data yet (LiDAR silent / miswired?)");
+                }
+            }
             continue;   /* no sample yet */
         }
 
@@ -873,11 +885,13 @@ void app_main(void)
         if (s_sim_want_bench_real) {
             /* Real-sensor scaled debug: the LiDAR stays on UART1 (sim mode is
              * left OFF), so we only arm the AGL scaling + raw-reading log the
-             * logic task applies. We never read the USB stream in this mode, so
-             * uninstall the driver the attach probe left installed to restore the
-             * pristine console for log monitoring.                               */
+             * logic task applies. We deliberately LEAVE the USB-Serial-JTAG driver
+             * installed (exactly as sim mode does): uninstalling it forces a USB
+             * re-enumeration, which the host sees as a disconnect and reopens —
+             * re-asserting RTS and resetting the chip straight back OUT of this
+             * mode. ESP_LOG keeps using its direct-FIFO path either way, so the
+             * console + this banner are unaffected by leaving the driver up.       */
             s_bench_scale = true;
-            usb_serial_jtag_driver_uninstall();
             ESP_LOGW(TAG, "BENCH REAL-SENSOR MODE: real LiDAR on UART, AGL scaled "
                           "x%.0f for bench callout testing", (double)BENCH_SCALE_GAIN);
         } else {
