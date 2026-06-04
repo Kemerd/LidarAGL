@@ -206,6 +206,15 @@
       border-radius: 22px;                 /* slightly rounder than panels — sheet feel */
       box-shadow: var(--shadow);
       padding: 22px 22px 18px;
+      /* The full firmware menu (8 levels) can be taller than a phone viewport, so cap
+         the sheet to the visible area and let it scroll inside — the backdrop padding
+         (20px) is reserved top + bottom. dvh tracks mobile browser chrome; vh is the
+         fallback. Momentum scrolling on iOS.                                          */
+      max-height: calc(100vh - 40px);
+      max-height: calc(100dvh - 40px);
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;        /* don't chain the scroll to the page       */
       /* Spring-in: start small + nudged down, settle with an overshoot curve.   */
       transform: scale(.92) translateY(12px);
       opacity: 0;
@@ -262,7 +271,17 @@
     .cap-row.disabled { opacity: .45; pointer-events: none; }
     .cap-hint { color: var(--text-dim); font-size: 11.5px; line-height: 1.45; }
 
-    .sheet-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .sheet-actions {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+      /* Pin the actions to the bottom of the scrolling sheet so Commit/Cancel stay
+         reachable no matter how far down the menu the pilot has scrolled. The surface
+         backdrop + a hairline let the options scroll cleanly underneath.             */
+      position: sticky; bottom: -18px;        /* offset the sheet's 18px bottom padding */
+      background: var(--surface);
+      margin: 4px -22px -18px;                 /* bleed to the sheet edges...           */
+      padding: 14px 22px 18px;                 /* ...then re-inset to align the buttons  */
+      border-top: 1px solid var(--hairline);
+    }
 
     /* ---- Segmented control (iOS-style pill selector) ---------------------- */
     /*  A single-row mutually-exclusive picker — the touch-friendly analogue of the
