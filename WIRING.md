@@ -67,8 +67,17 @@ GND, VIN — and **cap off the other three** (Alarm, Sync, Analog) unused.
 
 > **SCK → GND is important.** It forces the PCM5102A to run from its internal
 > PLL, so the S3 emits **no MCLK** (firmware sets `mclk = I2S_GPIO_UNUSED`).
-> Onboard jumpers FLT / DEMP / XSMT / FMT: leave at the board defaults
-> (I2S format, normal latency).
+>
+> **XSMT must be pulled HIGH or the DAC stays MUTED.** This bites hard: the
+> common purple **GY-PCM5102A** clone ships with XSMT **low (muted)**, so you get
+> perfect BCK/LRCK/DIN clocks + data and *dead silence* — every wire looks right.
+> XSMT is an active-low soft-mute with an internal pull-DOWN, so it needs an
+> external pull-up. On the back of the board the four solder jumpers are
+> `H1L..H4L` = **FLT / DEMP / XSMT / FMT** (High/Low select). Fix it by bridging
+> **jumper 3 (XSMT) to H**, *or* wiring the **XSMT pin ("3") → A3V3** (the analog
+> 3.3 V pin between pin 4 and G). Verify with a meter: **XSMT should read ~3.3 V**
+> (a stuck ~0.5 V reading = still muted). The other three jumpers (FLT / DEMP /
+> FMT) are correct at their **Low** defaults — that's I2S format, normal latency.
 
 ### Config button (audio modes + wipe learned ground reference)
 
