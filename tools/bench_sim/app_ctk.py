@@ -144,24 +144,24 @@ class BenchApp(ctk.CTk):
 
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.grid(row=2, column=0, columnspan=3, padx=12, pady=(8, 14), sticky="ew")
-        for i in range(4):
+        for i in range(3):
             row.grid_columnconfigure(i, weight=1)
         ctk.CTkButton(row, text="Enter Sim", command=self._enter_sim
                       ).grid(row=0, column=0, padx=4, sticky="ew")
         ctk.CTkButton(row, text="Enter Config", fg_color=WARN, text_color="#000",
                       command=self._enter_config).grid(row=0, column=1, padx=4,
                                                        sticky="ew")
-        ctk.CTkButton(row, text="Reboot", fg_color=DANGER, command=self.ctrl.reboot
-                      ).grid(row=0, column=2, padx=4, sticky="ew")
-        ctk.CTkButton(row, text="Reset Board", fg_color="transparent",
-                      border_width=1, command=self.serial.pulse_reset).grid(
-            row=0, column=3, padx=4, sticky="ew")
+        ctk.CTkButton(row, text="Reboot", fg_color=DANGER,
+                      command=self.serial.pulse_reset).grid(row=0, column=2,
+                                                            padx=4, sticky="ew")
 
-        ctk.CTkLabel(card, text="First entry: click Enter Sim, then tap the "
-                     "board's EN/reset (or Reset Board).", text_color=MUTED,
-                     font=ctk.CTkFont(size=11), wraplength=520, justify="left"
-                     ).grid(row=3, column=0, columnspan=3, padx=16, pady=(0, 14),
-                            sticky="w")
+        ctk.CTkLabel(card, text="Click Enter Sim: the board reboots (RTS) and the "
+                     "bench rides the reconnect to catch its sim window — watch "
+                     "for the green dot. If RTS reset doesn't work on your board, "
+                     "tap the physical EN/reset button after clicking.",
+                     text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=520,
+                     justify="left").grid(row=3, column=0, columnspan=3, padx=16,
+                                          pady=(0, 14), sticky="w")
 
     def _build_ils_card(self, parent):
         card = self._card(parent, "ILS approach")
@@ -252,11 +252,24 @@ class BenchApp(ctk.CTk):
 
     def _refresh_ports(self):
         ports = list_ports()
-        labels = ["%s  -  %s" % (d, desc) for d, desc in ports] or ["(none found)"]
-        self._port_devices = [d for d, _ in ports]
+        self._port_devices = []
+        labels = []
+        esp_idx = None
+        for i, p in enumerate(ports):
+            self._port_devices.append(p["device"])
+            vidpid = ("  [%04X:%04X]" % (p["vid"], p["pid"] or 0)
+                      if p["vid"] is not None else "")
+            tag = "   * ESP32" if p["is_esp"] else ""
+            labels.append("%s  -  %s%s%s" % (p["device"], p["desc"], vidpid, tag))
+            if p["is_esp"] and esp_idx is None:
+                esp_idx = i
+        if not labels:
+            labels = ["(none found)"]
+            self._port_devices = []
         self.port_menu.configure(values=labels)
-        if labels:
-            self.port_menu.set(labels[0])
+        # Pre-select the Espressif port so you can't accidentally talk to some
+        # other USB-serial gadget (a Steam controller also shows as "USB Serial").
+        self.port_menu.set(labels[esp_idx] if esp_idx is not None else labels[0])
 
     def _selected_port(self):
         idx = 0
@@ -269,7 +282,9 @@ class BenchApp(ctk.CTk):
         return None
 
     def _toggle_connect(self):
-        if self.serial.is_open():
+        # is_active() reflects user intent; the actual open happens asynchronously
+        # in the worker (which also auto-reopens across the chip's resets).
+        if self.serial.is_active():
             self.engine.stop()
             self.ctrl.stop_attach()
             self.serial.disconnect()
@@ -290,12 +305,15 @@ class BenchApp(ctk.CTk):
             self._set_status("attaching…", WARN)
 
     def _enter_sim(self):
-        self.ctrl.reboot()                  # harmless if not yet in sim
+        # Hardware-reset the chip (works whether or not it's already in sim),
+        # then spam HELLO so the post-reboot sim window is caught as the port
+        # re-enumerates and the worker auto-reconnects.
+        self.serial.pulse_reset()
         self.ctrl.start_attach(P.OP_HELLO)
         self._set_status("attaching…", WARN)
 
     def _enter_config(self):
-        self.ctrl.reboot()                  # restart if already in sim
+        self.serial.pulse_reset()
         self.ctrl.start_attach(P.OP_ENTER_CONFIG)
         self._set_status("attaching (config)…", WARN)
 

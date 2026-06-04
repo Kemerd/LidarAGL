@@ -331,8 +331,12 @@
  *  delayed and the console is left exactly as it was.                           */
 #define SIM_USJ_RX_BUF        1024   /* USJ driver RX ring (>= one frame @ ~78 Hz) */
 #define SIM_USJ_TX_BUF        256    /* unused by us, but the driver requires > 0  */
-#define SIM_ATTACH_GRACE_MS   400    /* fast-bail a normal boot when no USB host    */
-#define SIM_ATTACH_WINDOW_MS  2500   /* max wait for a hello while a host IS present*/
+#define SIM_ATTACH_GRACE_MS   800    /* fast-bail a normal boot when no USB host    */
+#define SIM_ATTACH_WINDOW_MS  4000   /* max wait for a hello while a host IS present*/
+/*  Why 800/4000: entering sim requires a reboot, and resetting a native-USB chip
+ *  drops the COM port for ~1 s while it re-enumerates. The host bench reconnects
+ *  and resumes its hello spam inside this window. The grace covers USB enumeration
+ *  so a genuinely unplugged (flight) boot still bails quickly.                   */
 
 /*  Custom LWNX command id for host->device bench control. Reuses the LWNX frame
  *  + CRC so the device validates it with the same parser; the value sits safely

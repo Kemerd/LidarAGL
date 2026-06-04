@@ -1,146 +1,196 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-serial_worker.py -- thread-safe pyserial wrapper for the bench.
+serial_worker.py -- resilient pyserial wrapper for the bench.
 
-The device's native USB-Serial-JTAG is FULL DUPLEX: the bench sends simulated
-LWNX frames (host->device) while the firmware's ESP_LOG output streams back
-(device->host). This worker owns the port:
+The ESP32-S3's native USB-Serial-JTAG drops off the USB bus whenever the chip
+RESETS -- and entering sim mode requires a reboot. So this worker is built to
+RIDE those resets: one manager thread keeps (re)opening the port and reading the
+device log, while send() simply no-ops during the brief gap the port is gone.
+That makes "click Enter Sim -> chip reboots -> port re-enumerates -> hello caught"
+work without the user babysitting the connection.
 
-    * send()         -- thread-safe writes (the sim engine calls this ~78x/sec,
-                        the GUI calls it for control frames). A lock serialises
-                        writers so frames never interleave on the wire.
-    * a reader thread -- continuously drains RX and hands decoded text lines to
-                        an on_rx callback, so the GUI can show the device log.
-
-pyserial is the only third-party dependency here.
+The device's USB RX is only drained while the firmware is in its boot sim-window
+or already in sim mode; the rest of the time host writes will time out (the chip
+just isn't listening). We treat that as normal and report it once, not per-frame.
 """
 
 import threading
+import time
 
 import serial                       # pyserial
 import serial.tools.list_ports
 
 import protocol as P
 
+# Espressif's USB vendor id. The ESP32-S3 native USB-Serial-JTAG enumerates under
+# this VID (PID 0x1001) -- the only reliable way to tell it apart from other COM
+# devices (a Steam controller, say, also shows up as a generic "USB Serial Device").
+ESP_VID = 0x303A
+
 
 def list_ports():
-    """Return [(device, description), ...] for every serial port on the system.
-
-    The ESP32-S3 native port shows up as "USB Serial Device" / "USB JTAG/serial
-    debug unit" with VID 303A -- we surface the description so the user can pick
-    the right COM port.
-    """
+    """Return [{device, desc, vid, pid, is_esp}, ...] for every serial port."""
     out = []
     for p in serial.tools.list_ports.comports():
-        out.append((p.device, p.description or ""))
+        out.append({
+            "device": p.device,
+            "desc": p.description or "",
+            "vid": p.vid,
+            "pid": p.pid,
+            "is_esp": (p.vid == ESP_VID),
+        })
     return out
 
 
 class SerialWorker:
-    """Owns one serial connection; safe to call send() from any thread."""
-
     def __init__(self, on_rx=None, on_status=None):
-        # on_rx(text)    -- called with each decoded text line from the device.
-        # on_status(msg) -- called on connect/disconnect/errors for the UI.
+        # on_rx(text)    -- one decoded device-log line.
+        # on_status(msg) -- connect / reconnect / error notices for the UI.
         self._on_rx = on_rx
         self._on_status = on_status
 
+        self._port = None
+        self._baud = P.NOMINAL_BAUD
+
         self._ser = None
-        self._tx_lock = threading.Lock()
-        self._reader = None
+        self._ser_lock = threading.Lock()   # guards the handle swap
+        self._tx_lock = threading.Lock()    # serialises concurrent writers
+
+        self._want = False                  # user intends to be connected
         self._stop = threading.Event()
+        self._thread = None
+        self._write_ok = True               # for throttling write-fail spam
+
+    # --- state ---------------------------------------------------------------
+
+    def is_active(self) -> bool:
+        """True between connect() and disconnect() (drives the UI button)."""
+        return self._want
+
+    def is_open(self) -> bool:
+        with self._ser_lock:
+            return self._ser is not None and self._ser.is_open
 
     # --- connection ----------------------------------------------------------
 
-    def is_open(self) -> bool:
-        return self._ser is not None and self._ser.is_open
-
     def connect(self, port: str, baud: int = P.NOMINAL_BAUD) -> bool:
-        """Open `port`. Returns True on success. Starts the RX reader thread."""
-        self.disconnect()                       # ensure a clean slate
-        try:
-            # Short read timeout so the reader loop stays responsive and can be
-            # stopped promptly; write_timeout guards against a stalled host pipe.
-            self._ser = serial.Serial(port, baudrate=baud, timeout=0.05,
-                                      write_timeout=0.5)
-        except Exception as e:                  # noqa: BLE001 -- surface to UI
-            self._status("open failed: %s" % e)
-            self._ser = None
-            return False
-
+        """Begin maintaining a connection to `port` (auto-reopens across resets)."""
+        self.disconnect()
+        self._port = port
+        self._baud = baud
+        self._want = True
+        self._write_ok = True
         self._stop.clear()
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader.start()
-        self._status("connected: %s @ %d" % (port, baud))
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
         return True
 
     def disconnect(self):
-        """Stop the reader and close the port. Safe to call repeatedly."""
+        self._want = False
         self._stop.set()
-        if self._reader is not None:
-            self._reader.join(timeout=1.0)
-            self._reader = None
-        if self._ser is not None:
-            try:
-                self._ser.close()
-            except Exception:
-                pass
-            self._ser = None
+        if self._thread is not None:
+            self._thread.join(timeout=1.5)
+            self._thread = None
+        self._close()
 
     # --- I/O -----------------------------------------------------------------
 
     def send(self, data: bytes):
-        """Write raw bytes to the device. Thread-safe; silent no-op if closed."""
-        if not self.is_open():
-            return
-        with self._tx_lock:
-            try:
-                self._ser.write(data)
-            except Exception as e:              # noqa: BLE001
-                self._status("write failed: %s" % e)
-
-    def pulse_reset(self):
-        """Best-effort hardware reset via the classic DTR/RTS toggle.
-
-        On many ESP32-S3 boards the native USB-Serial-JTAG honours the same
-        reset wiring esptool uses. This is a convenience for the FIRST attach
-        (so you needn't reach for the on-board EN button); if your board doesn't
-        wire it up, just tap EN instead -- the bench will still catch the boot.
-        """
-        if not self.is_open():
+        """Write bytes; thread-safe. No-ops (not an error) while the port is gone."""
+        with self._ser_lock:
+            ser = self._ser
+        if ser is None:
             return
         try:
-            # EN low (RTS), GPIO0 high (DTR not asserted) -> reset into run mode.
-            self._ser.setDTR(False)
-            self._ser.setRTS(True)
-            import time
-            time.sleep(0.05)
-            self._ser.setRTS(False)
-            self._status("sent reset pulse (DTR/RTS)")
-        except Exception as e:                  # noqa: BLE001
-            self._status("reset pulse failed: %s" % e)
+            with self._tx_lock:
+                ser.write(data)
+            self._write_ok = True
+        except Exception as e:              # noqa: BLE001
+            # Report only the FIRST failure in a run -- the device simply isn't
+            # draining yet (it's running normally, not in its sim window).
+            if self._write_ok:
+                self._status("device isn't accepting data yet (%s) -- click "
+                             "Enter Sim / tap EN so it opens its sim window" % e)
+                self._write_ok = False
+            self._close()                   # likely a reset -> let the manager reopen
+
+    def pulse_reset(self):
+        """Reboot the chip via the RTS line -- the same pin esptool resets with."""
+        with self._ser_lock:
+            ser = self._ser
+        if ser is None:
+            return
+        try:
+            ser.setRTS(True)                # EN low  -> chip held in reset
+            time.sleep(0.1)
+            ser.setRTS(False)               # EN high -> boot
+            self._status("reset pulse sent (RTS) -- catching the sim window…")
+        except Exception as e:              # noqa: BLE001
+            self._status("reset pulse failed (%s) -- tap the board's EN button" % e)
 
     # --- internals -----------------------------------------------------------
 
-    def _read_loop(self):
-        """Drain RX, split into text lines, and forward them to on_rx."""
-        buf = bytearray()
-        while not self._stop.is_set():
+    def _open(self) -> bool:
+        try:
+            s = serial.Serial(self._port, self._baud, timeout=0.05,
+                              write_timeout=0.3)
+        except Exception:
+            return False
+        with self._ser_lock:
+            self._ser = s
+        self._write_ok = True
+        self._status("connected: %s @ %d" % (self._port, self._baud))
+        return True
+
+    def _close(self):
+        with self._ser_lock:
+            s = self._ser
+            self._ser = None
+        if s is not None:
             try:
-                chunk = self._ser.read(256)
+                s.close()
             except Exception:
-                break                           # port went away
+                pass
+
+    def _run(self):
+        """Manager loop: keep the port open and stream RX lines; reopen on drop."""
+        buf = bytearray()
+        announced_wait = False
+        while self._want and not self._stop.is_set():
+            if not self.is_open():
+                if self._open():
+                    announced_wait = False
+                else:
+                    if not announced_wait:
+                        self._status("waiting for %s (rebooting / unplugged?)…"
+                                     % self._port)
+                        announced_wait = True
+                    time.sleep(0.3)         # device mid-reset; retry shortly
+                    continue
+
+            with self._ser_lock:
+                ser = self._ser
+            if ser is None:
+                continue
+            try:
+                chunk = ser.read(256)
+            except Exception:
+                self._status("connection lost — reconnecting…")
+                self._close()
+                continue
             if not chunk:
                 continue
+
             buf.extend(chunk)
-            # The device emits newline-terminated log lines; emit complete lines.
             while b"\n" in buf:
                 line, _, rest = buf.partition(b"\n")
                 buf = bytearray(rest)
                 text = line.decode("utf-8", errors="replace").rstrip("\r")
                 if text and self._on_rx:
                     self._on_rx(text)
+
+        self._close()
 
     def _status(self, msg: str):
         if self._on_status:
