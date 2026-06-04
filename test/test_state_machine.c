@@ -6,7 +6,8 @@
  *          safety-critical behaviours: silent climb-out, edge-triggered descent
  *          callouts, hysteresis / go-around re-arm, CRUISE gating, and trend
  *          dead-band. Every test runs against BOTH sensor profiles so we prove
- *          the SF30/D fires 500/400/300 and the SF30/C never does.
+ *          the SF30/D fires its high 600/500/400/300 numbers while the SF30/C tops
+ *          out at 300 and never fires the longer-range ones.
  */
 
 #include "test_util.h"
@@ -122,27 +123,31 @@ static void test_descent_sequence(const sensor_profile_t *p)
 
 static void test_high_callouts_profile_specific(void)
 {
-    /* SF30/D must fire 500/400/300; SF30/C must NOT have them at all. */
+    /* SF30/D tops out at 600 ft and must fire 600/500/400/300; SF30/C tops out at
+     * 300 ft (its new default top), firing 300 but never the longer-range numbers. */
     float scratch[16], hits[16];
 
+    /* SF30/D: climb above 600 + REARM_MARGIN so the top number arms, then descend. */
     sm_ctx_t cd;
     sm_init(&cd, ST_GROUND);
-    ramp(&cd, &SF30D_PROFILE, 0.0f, 560.0f, +4.0f, scratch, 16);
-    int nd = ramp(&cd, &SF30D_PROFILE, 560.0f, 0.0f, -2.0f, hits, 16);
+    ramp(&cd, &SF30D_PROFILE, 0.0f, 640.0f, +4.0f, scratch, 16);
+    int nd = ramp(&cd, &SF30D_PROFILE, 640.0f, 0.0f, -2.0f, hits, 16);
+    ASSERT_TRUE(has_hit(hits, nd, 600.0f), "[SF30/D] fires 600 ft (top)");
     ASSERT_TRUE(has_hit(hits, nd, 500.0f), "[SF30/D] fires 500 ft");
     ASSERT_TRUE(has_hit(hits, nd, 400.0f), "[SF30/D] fires 400 ft");
     ASSERT_TRUE(has_hit(hits, nd, 300.0f), "[SF30/D] fires 300 ft");
 
-    /* SF30/C: confirm 300 is simply not in its ladder and never fires even if
-     * we (impossibly) flew that high. */
+    /* SF30/C: climb above 300 + REARM_MARGIN so the new top number arms, then
+     * descend. It must fire 300 (top) and 200, but never 400/500/600 — those are
+     * SF30/D-only and not in the SF30/C ladder. */
     sm_ctx_t cc;
     sm_init(&cc, ST_GROUND);
-    ramp(&cc, &SF30C_PROFILE, 0.0f, 320.0f, +4.0f, scratch, 16);
-    int nc = ramp(&cc, &SF30C_PROFILE, 320.0f, 0.0f, -2.0f, hits, 16);
-    ASSERT_TRUE(!has_hit(hits, nc, 300.0f), "[SF30/C] never fires 300 ft");
-    ASSERT_TRUE(!has_hit(hits, nc, 500.0f), "[SF30/C] never fires 500 ft");
-    /* But it must still start its ladder at 200. */
-    ASSERT_TRUE(has_hit(hits, nc, 200.0f), "[SF30/C] top callout is 200 ft");
+    ramp(&cc, &SF30C_PROFILE, 0.0f, 340.0f, +4.0f, scratch, 16);
+    int nc = ramp(&cc, &SF30C_PROFILE, 340.0f, 0.0f, -2.0f, hits, 16);
+    ASSERT_TRUE(has_hit(hits, nc, 300.0f),  "[SF30/C] top callout is 300 ft");
+    ASSERT_TRUE(has_hit(hits, nc, 200.0f),  "[SF30/C] fires 200 ft");
+    ASSERT_TRUE(!has_hit(hits, nc, 400.0f), "[SF30/C] never fires 400 ft");
+    ASSERT_TRUE(!has_hit(hits, nc, 600.0f), "[SF30/C] never fires 600 ft");
 }
 
 static void test_hysteresis_no_machinegun(const sensor_profile_t *p)

@@ -96,12 +96,15 @@ static float s_duck_cur        = 1.0f;            /* current duck multiplier    
  *  ducks against — rising with the attack coefficient, falling with the release.  */
 static float s_voice_env       = 0.0f;            /* tracked voice amplitude     */
 
-/*  Pilot's master volume offset as a LINEAR gain (1.0 == 0 dB == no cut). Set
- *  from NVS at boot (and live by the config-menu preview) via audio_set_master_db.
- *  Multiplied into BOTH channels every sample so it trims tone AND voice equally
- *  — a true master volume on top of the analog pot. Atomic single-float write,
- *  so the render loop can read it lock-free.                                     */
-static volatile float s_master_gain = 1.0f;
+/*  Pilot's INDEPENDENT tone + voice volume offsets as LINEAR gains (1.0 == 0 dB
+ *  == no change). Set from NVS at boot (and live by the config-menu preview) via
+ *  audio_set_tone_db / audio_set_voice_db. The tone gain folds into the presence
+ *  tone before the mix; the voice gain folds into the voice clip before the mix —
+ *  so the pilot dials the tone-vs-voice balance, not one master. Atomic single-
+ *  float writes, so the render loop reads them lock-free. The tone gain may exceed
+ *  1.0 (a boost); the voice gain is cut-only (<= 1.0).                            */
+static volatile float s_tone_gain  = 1.0f;
+static volatile float s_voice_gain = 1.0f;
 
 /*  Fixed output headroom as a LINEAR gain (db_to_gain(OUTPUT_HEADROOM_DB)). Resolved
  *  once at init and multiplied into EVERY output sample — flight render and the
@@ -190,6 +193,12 @@ static inline float nco_advance(float *phase, float freq_hz);
  *  backstop, defined with the render helpers below) is also used by the blocking
  *  volume-preview tone above it.                                                  */
 static inline int16_t f32_to_s16(float x);
+
+/*  Forward declarations: the conditional soft-clip and the shared voice-sidechain
+ *  duck step (both defined with the render helpers below) are also used by the
+ *  blocking volume-preview "mini-flare" above them.                               */
+static inline float mix_limit(float x, bool voice_active);
+static inline float duck_step(float *env, float voice);
 
 /* ---------------------------------------------------------------------------
  *  Init
@@ -368,16 +377,32 @@ void audio_set_params(float tone_agl, bool tone_active)
     }
 }
 
-void audio_set_master_db(float db)
+void audio_set_tone_db(float db)
 {
-    /* Clamp to attenuation only (never boost past the schedule), convert once to
-     * a linear gain. A single volatile float write — no mutex needed; the render
+    /* Clamp to the tone menu's range (it may CUT or BOOST), convert once to a
+     * linear gain. A single volatile float write — no mutex needed; the render
      * loop reads whatever is current, and a half-updated float can't occur for a
      * 32-bit aligned store on the S3.                                            */
+    if (db < TONE_VOLUME_DB_MIN) {
+        db = TONE_VOLUME_DB_MIN;
+    }
+    if (db > TONE_VOLUME_DB_MAX) {
+        db = TONE_VOLUME_DB_MAX;
+    }
+    s_tone_gain = db_to_gain(db);
+}
+
+void audio_set_voice_db(float db)
+{
+    /* Clamp to attenuation only (the clips already sit near full scale), convert
+     * once to a linear gain. Same lock-free single-float store as the tone gain. */
     if (db > 0.0f) {
         db = 0.0f;
     }
-    s_master_gain = db_to_gain(db);
+    if (db < VOICE_VOLUME_DB_MIN) {
+        db = VOICE_VOLUME_DB_MIN;
+    }
+    s_voice_gain = db_to_gain(db);
 }
 
 void audio_request_callout(callout_id_t id)
@@ -417,10 +442,10 @@ void audio_play_clip_blocking(const clip_t *c)
     size_t n = c->len_bytes / 2;       /* mono s16 samples */
     size_t written_total = 0;
 
-    /* Apply the pilot's master volume offset so config-menu prompts (and the
-     * volume preview's spoken number) play at exactly the level the running box
-     * will use. 1.0 == 0 dB == unchanged.                                       */
-    float mg = s_master_gain;
+    /* These are VOICE clips (config-menu prompts + the volume preview's spoken
+     * number), so apply the pilot's VOICE volume offset — the prompts then play at
+     * exactly the callout level the running box will use. 1.0 == 0 dB == unchanged. */
+    float mg = s_voice_gain;
 
     /* Write in small interleaved blocks so we don't hold a huge stack buffer. */
     int16_t buf[AUDIO_FRAME_LEN * AUDIO_CH];
@@ -448,8 +473,8 @@ void audio_play_tone_blocking(float freq_hz, int ms, float level_db)
     /* A standalone NCO so the menu preview never disturbs the render loop's tone
      * phase. Mirrors the firmware tone chain at a FIXED pitch: dB level -> linear
      * gain, equal-loudness flattening at this frequency (so 1 kHz here sounds the
-     * same loudness it would in flight), then the pilot's master offset. Short
-     * raised-cosine fades top and tail the burst so there is no click.          */
+     * same loudness it would in flight), then the pilot's TONE offset (this burst
+     * IS the tone preview). Short raised-cosine fades top and tail it, no click.  */
     if (!s_running || ms <= 0 || freq_hz <= 0.0f) {
         return;
     }
@@ -457,7 +482,7 @@ void audio_play_tone_blocking(float freq_hz, int ms, float level_db)
         level_db = 0.0f;
     }
 
-    float gain = db_to_gain(level_db + equal_loudness_db(freq_hz)) * s_master_gain;
+    float gain = db_to_gain(level_db + equal_loudness_db(freq_hz)) * s_tone_gain;
 
     size_t total = (size_t)((float)ms / 1000.0f * (float)SAMPLE_RATE);
     /* Fade window: a few ms each end, never more than a third of the burst. */
@@ -488,6 +513,103 @@ void audio_play_tone_blocking(float freq_hz, int ms, float level_db)
             float s = nco_advance(&phase, freq_hz) * gain * env;
             /* Through the shared converter so the preview tone carries the same
              * output headroom (and limiter backstop) as the flight render path. */
+            int16_t v = f32_to_s16(s);
+            buf[2 * i]     = v;   /* L */
+            buf[2 * i + 1] = v;   /* R */
+        }
+        size_t wrote = 0;
+        i2s_channel_write(s_tx, buf, chunk * AUDIO_CH * sizeof(int16_t),
+                          &wrote, portMAX_DELAY);
+        done += chunk;
+    }
+}
+
+void audio_play_volume_preview_blocking(void)
+{
+    /* A short "mini-flare" balance preview: the presence tone sweeps down the
+     * 20->10 ft band (pitch rising on the real schedule) in the BACKGROUND while the
+     * "20" then "10" callouts speak over it and DUCK it — the exact sidechain that
+     * flies (shared duck_step()). Both tone and voice carry the pilot's live tone/
+     * voice offsets, so each menu step auditions the chosen balance. Blocking and
+     * mono-centered; runs before the render task exists.                           */
+    if (!s_running) {
+        return;
+    }
+
+    const float agl_from = VOLUME_PREVIEW_SWEEP_FROM_FT;
+    const float agl_to   = VOLUME_PREVIEW_SWEEP_TO_FT;
+    size_t total = (size_t)((float)VOLUME_PREVIEW_SWEEP_MS / 1000.0f * (float)SAMPLE_RATE);
+    if (total < 2) {
+        return;
+    }
+
+    /* The two spoken callouts, scheduled at their matching heights in the sweep:
+     * "20" near the top (~12 % in), "10" past the middle (~58 % in). A missing clip
+     * simply contributes silence (NULL pcm), so the preview still runs.            */
+    const clip_t  *c20   = callout_clip(CO_TWENTY);
+    const clip_t  *c10   = callout_clip(CO_TEN);
+    const int16_t *pcm20 = (c20 && c20->pcm) ? (const int16_t *)c20->pcm : NULL;
+    const int16_t *pcm10 = (c10 && c10->pcm) ? (const int16_t *)c10->pcm : NULL;
+    size_t len20   = pcm20 ? c20->len_bytes / 2 : 0;
+    size_t len10   = pcm10 ? c10->len_bytes / 2 : 0;
+    size_t start20 = (size_t)(0.12f * (float)total);
+    size_t start10 = (size_t)(0.58f * (float)total);
+
+    /* Click-free edges, plus a PRIVATE duck follower so we never touch the render
+     * loop's s_voice_env, and a standalone NCO phase for the swept fundamental.    */
+    size_t fade = (size_t)(0.010f * (float)SAMPLE_RATE);   /* 10 ms */
+    if (fade > total / 4) {
+        fade = total / 4;
+    }
+    float env   = 0.0f;
+    float phase = 0.0f;
+
+    size_t done = 0;
+    int16_t buf[AUDIO_FRAME_LEN * AUDIO_CH];
+    while (done < total) {
+        size_t chunk = total - done;
+        if (chunk > AUDIO_FRAME_LEN) chunk = AUDIO_FRAME_LEN;
+        for (size_t i = 0; i < chunk; ++i) {
+            size_t idx = done + i;
+
+            /* Scripted AGL -> pitch + scheduled level, exactly like flight. */
+            float prog = (float)idx / (float)(total - 1);
+            float agl  = agl_from + (agl_to - agl_from) * prog;
+            float f    = agl_to_pitch_hz(agl);
+
+            /* Pull the active callout sample (if any), then the voice volume offset. */
+            float voice        = 0.0f;
+            bool  voice_active = false;
+            if (pcm20 && idx >= start20 && (idx - start20) < len20) {
+                voice = (float)pcm20[idx - start20] / 32768.0f;
+                voice_active = true;
+            } else if (pcm10 && idx >= start10 && (idx - start10) < len10) {
+                voice = (float)pcm10[idx - start10] / 32768.0f;
+                voice_active = true;
+            }
+            voice *= s_voice_gain;
+
+            /* SHARED sidechain: the voice pulls the tone down with the same duck the
+             * flight render loop runs, so the preview balance is honest.            */
+            float duck = duck_step(&env, voice);
+
+            /* Tone on the real schedule, ducked, at the pilot's live tone gain. */
+            float tone = nco_advance(&phase, f)
+                         * db_to_gain(agl_to_tone_db(agl) + equal_loudness_db(f))
+                         * duck * s_tone_gain;
+
+            /* Whole-snippet raised-cosine fade in/out so there is no click. */
+            float edge = 1.0f;
+            if (fade > 0) {
+                if (idx < fade) {
+                    edge = raised_cosine((float)idx / (float)fade);
+                } else if (idx >= total - fade) {
+                    edge = raised_cosine((float)(total - 1 - idx) / (float)fade);
+                }
+            }
+
+            /* Mono mix + the same conditional soft-clip the render loop applies. */
+            float s = mix_limit(tone + voice, voice_active) * edge;
             int16_t v = f32_to_s16(s);
             buf[2 * i]     = v;   /* L */
             buf[2 * i + 1] = v;   /* R */
@@ -581,6 +703,29 @@ static inline float mix_limit(float x, bool voice_active)
     (void)voice_active;
     return soft_clip(x);
 #endif
+}
+
+/*  One sample of the voice-sidechain duck, SHARED by the flight render loop and the
+ *  config-menu volume preview so both pull the tone down off the voice identically.
+ *  Advances the caller's one-pole envelope follower with |voice| (fast ATTACK coeff
+ *  when louder, slow RELEASE when quieter), then maps that envelope through the soft
+ *  knee to a tone-gain multiplier: 1.0 (un-ducked) at/below DUCK_THRESHOLD, easing
+ *  to s_duck_floor (full VOICE_DUCK_DB) at/above DUCK_KNEE_LEVEL. The follower state
+ *  is caller-owned (a float*), so the render loop and the preview keep independent
+ *  envelopes and never cross-contaminate.                                          */
+static inline float duck_step(float *env, float voice)
+{
+    float rect = fabsf(voice);
+    float a = (rect > *env) ? s_duck_atk_a : s_duck_rel_a;
+    *env += a * (rect - *env);
+
+    float duck = 1.0f;
+    if (*env > DUCK_THRESHOLD) {
+        float t = (*env - DUCK_THRESHOLD) / (DUCK_KNEE_LEVEL - DUCK_THRESHOLD);
+        if (t > 1.0f) t = 1.0f;
+        duck = 1.0f + t * (s_duck_floor - 1.0f);
+    }
+    return duck;
 }
 
 /*  Final float -> s16 conversion. Two-stage by design:
@@ -753,28 +898,18 @@ void audio_task(void *arg)
                 }
             }
 
-            /* --- Sidechain duck (a compressor keyed off the voice envelope) ---
-             * Feed the rectified voice into a one-pole peak follower: rise with the
-             * fast ATTACK coeff when the voice gets louder, fall with the slow
-             * RELEASE coeff when it quietens. s_voice_env is therefore the voice's
-             * real, smoothed loudness — not just "is a clip pointer set".          */
-            float rect = fabsf(voice);
-            float a = (rect > s_voice_env) ? s_duck_atk_a : s_duck_rel_a;
-            s_voice_env += a * (rect - s_voice_env);
+            /* Fold in the pilot's VOICE volume offset (cut-only) right here, before
+             * the sidechain follower, so the duck keys off the post-trim voice level
+             * and a quieter voice ducks the tone proportionally less.                */
+            voice *= s_voice_gain;
 
-            /* Map that envelope to a duck multiplier with a soft knee: at/below
-             * DUCK_THRESHOLD the voice is "silent" and the tone is untouched (1.0);
-             * at/above DUCK_KNEE_LEVEL the tone is pulled all the way to s_duck_floor
-             * (full VOICE_DUCK_DB); between, it interpolates linearly. Because the
-             * amount tracks the voice's own contour, the leading edge of a word eases
-             * the tone down WITH the syllable instead of clipping it pre-emptively.  */
-            float duck = 1.0f;
-            if (s_voice_env > DUCK_THRESHOLD) {
-                float t = (s_voice_env - DUCK_THRESHOLD)
-                          / (DUCK_KNEE_LEVEL - DUCK_THRESHOLD);
-                if (t > 1.0f) t = 1.0f;
-                duck = 1.0f + t * (s_duck_floor - 1.0f);   /* 1.0 -> s_duck_floor */
-            }
+            /* --- Sidechain duck (a compressor keyed off the voice envelope) ---
+             * Advance the voice follower + map it to the tone-duck multiplier via the
+             * SHARED duck_step() — the very same sidechain the config-menu volume
+             * preview runs, so what the pilot auditions in the menu is what flies.
+             * s_voice_env is the render loop's own follower (the preview keeps its
+             * own), and duck_step bakes in the fast-attack/slow-release + soft knee.  */
+            float duck = duck_step(&s_voice_env, voice);
             s_duck_cur = duck;   /* exposed for clarity; the follower IS the smoothing */
 
             /* Tone pitch for this sample + equal-loudness flattening at that
@@ -784,12 +919,13 @@ void audio_task(void *arg)
             float eql_gain = db_to_gain(equal_loudness_db(f));
 
             /* Build the tone: schedule gain · sidechain duck · equal-loudness ·
-             * flare fade · steady callout trim. tone_sample() = fundamental + a
-             * small 2nd harmonic (warmth); s_flare_fade silences it under the flare;
-             * s_tone_trim holds it a constant TONE_TRIM_WITH_VOICE_DB down while
-             * callouts are enabled (1.0 in tone-only modes).                       */
+             * flare fade · steady callout trim · pilot tone volume. tone_sample() =
+             * fundamental + a small 2nd harmonic (warmth); s_flare_fade silences it
+             * under the flare; s_tone_trim holds it a constant TONE_TRIM_WITH_VOICE_DB
+             * down while callouts are enabled (1.0 in tone-only modes); s_tone_gain is
+             * the pilot's tone volume offset (may cut OR boost).                     */
             float tone = tone_sample(f) * s_gain_cur * duck * eql_gain
-                         * s_flare_fade * s_tone_trim;
+                         * s_flare_fade * s_tone_trim * s_tone_gain;
 
             float left, right;
             if (s_cfg.stereo) {
@@ -814,21 +950,20 @@ void audio_task(void *arg)
             left  = s_lpf_l;
             right = s_lpf_r;
 
-            /* Pilot's master volume offset (tone + voice together) applied LAST,
-             * after the limiter + LPF, so it is a true master trim on top of the
-             * analog pot and never changes the soft-clip threshold above.        */
-            float mg = s_master_gain;
+            /* The pilot's tone + voice volume offsets were already folded into the
+             * tone and voice individually (before the mix), so there is no master
+             * trim to apply here — just the fixed headroom + makeup lift.          */
 
             /* TEMP DEBUG: measure the post-headroom magnitude so we can see whether
              * the backstop limiter is firing (peak > 1.0) and how often. */
-            float dl = fabsf(left  * mg) * s_headroom * s_makeup;
-            float dr = fabsf(right * mg) * s_headroom * s_makeup;
+            float dl = fabsf(left)  * s_headroom * s_makeup;
+            float dr = fabsf(right) * s_headroom * s_makeup;
             if (dl > dbg_peak) dbg_peak = dl;
             if (dr > dbg_peak) dbg_peak = dr;
             if (dl > 1.0f || dr > 1.0f) dbg_clip++;
 
-            frame[2 * i]     = f32_to_s16(left  * mg);   /* L (headroom + backstop) */
-            frame[2 * i + 1] = f32_to_s16(right * mg);   /* R (headroom + backstop) */
+            frame[2 * i]     = f32_to_s16(left);    /* L (headroom + backstop) */
+            frame[2 * i + 1] = f32_to_s16(right);   /* R (headroom + backstop) */
         }
 
         /* Push the WHOLE frame into the DMA, ACCUMULATING across partial writes and

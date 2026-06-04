@@ -32,7 +32,7 @@ class AltitudeModel:
         # ILS parameters (sensible Glasair-ish approach defaults).
         self.glideslope_deg = 3.0       # standard ILS glideslope
         self.groundspeed_kt = 70.0      # approach groundspeed
-        self.start_alt_ft   = 200.0     # AGL the approach begins at
+        self.start_alt_ft   = 342.0     # AGL the approach begins at (default ILS start)
 
         # ILS run state.
         self.running = False            # is the approach currently advancing?

@@ -19,8 +19,9 @@
 /**
  * @brief Callout clip identifiers.
  *
- * @note Ordered low-to-high altitude. The SF30/C never requests the 300/400/500
- *       ids (they're not in its profile); the SF30/D requests all of them.
+ * @note Ordered low-to-high altitude. The SF30/C tops out at 300 ft, so it never
+ *       requests the 400/500/600 ids (they're not in its profile); the SF30/D,
+ *       with its longer range, requests all of them up to 600 ft.
  */
 typedef enum {
     CO_TEN = 0,
@@ -33,6 +34,7 @@ typedef enum {
     CO_THREE_HUNDRED,
     CO_FOUR_HUNDRED,
     CO_FIVE_HUNDRED,
+    CO_SIX_HUNDRED,
     CO_COUNT
 } callout_id_t;
 
@@ -103,7 +105,7 @@ const clip_t *config_clip_piece(config_piece_t piece);
 
 /**
  * @brief Map a callout HEIGHT in feet to its clip id.
- * @param ft  Callout height (10,20,30,40,50,100,200,300,400,500).
+ * @param ft  Callout height (10,20,30,40,50,100,200,300,400,500,600).
  * @return    The matching id, or CO_COUNT if no clip corresponds.
  */
 callout_id_t callout_id_for_ft(float ft);

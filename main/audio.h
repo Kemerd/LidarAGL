@@ -60,18 +60,30 @@ void audio_init(const audio_config_t *cfg);
 void audio_set_params(float tone_agl, bool tone_active);
 
 /**
- * @brief Set the pilot's master volume offset (dB), applied to the WHOLE mix.
+ * @brief Set the pilot's TONE volume offset (dB), applied to the presence tone.
  *
- * @param db  Offset in dB (<= 0). A master attenuation layered on top of the
- *            analog trim pot, so it lowers the presence tone AND the voice
- *            callouts equally. Converted once to a linear gain and multiplied
- *            into both channels every sample. Values > 0 are clamped to 0.
+ * @param db  Offset in dB, clamped to [TONE_VOLUME_DB_MIN, TONE_VOLUME_DB_MAX].
+ *            A trim layered on the analog pot that can CUT or BOOST the tone only
+ *            (the voice is untouched). Converted once to a linear gain and folded
+ *            into the tone every sample.
  *
- * @details Set once at boot from the value the config menu stored in NVS, and
- *          also driven live by the menu's per-step preview so the pilot can hear
- *          each setting before committing. Cheap and lock-free (a single float).
+ * @details Set at boot from NVS, and driven live by the volume menu's per-step
+ *          preview. Cheap and lock-free (a single float).
  */
-void audio_set_master_db(float db);
+void audio_set_tone_db(float db);
+
+/**
+ * @brief Set the pilot's VOICE volume offset (dB), applied to the voice callouts.
+ *
+ * @param db  Offset in dB (<= 0), clamped to [VOICE_VOLUME_DB_MIN, 0]. A cut-only
+ *            trim layered on the analog pot that lowers the callouts only (the
+ *            tone is untouched). Converted once to a linear gain and folded into
+ *            the voice every sample.
+ *
+ * @details Set at boot from NVS, and driven live by the volume menu's per-step
+ *          preview. Cheap and lock-free (a single float).
+ */
+void audio_set_voice_db(float db);
 
 /**
  * @brief Request a voice callout (called by the logic task).
@@ -92,7 +104,9 @@ void audio_play_chirp(void);
  * @details Used by the boot config menu to voice prompts before the render
  *          tasks exist. Blocks until the clip has been written to the DMA, so
  *          callers stay simple. Always mono-centered (duplicated to L+R in the
- *          stereo hardware frame); pan settings do not apply to prompts.
+ *          stereo hardware frame); pan settings do not apply to prompts. The
+ *          current VOICE volume offset (audio_set_voice_db) is applied, since
+ *          these are voice clips, so menu prompts track the chosen voice level.
  */
 void audio_play_clip_blocking(const clip_t *c);
 
@@ -106,12 +120,27 @@ void audio_play_clip_blocking(const clip_t *c);
  * @details Used by the boot volume menu to voice the example tone in
  *          "tone .. <number> .. tone" so the pilot hears the chosen level. Like
  *          audio_play_clip_blocking() it runs before the render tasks exist and
- *          is always mono-centered. The CURRENT master volume offset (set via
- *          audio_set_master_db) is applied, so the preview matches exactly what
- *          the box will sound like after the menu commits. Short raised-cosine
- *          fades top and tail the burst so there is no click.
+ *          is always mono-centered. The CURRENT tone volume offset (set via
+ *          audio_set_tone_db) is applied, so the preview matches exactly what the
+ *          tone will sound like after the menu commits. Short raised-cosine fades
+ *          top and tail the burst so there is no click.
  */
 void audio_play_tone_blocking(float freq_hz, int ms, float level_db);
+
+/**
+ * @brief Synchronously play the volume-menu "mini-flare" balance preview.
+ *
+ * @details A short scripted descent the pilot uses to judge the tone-vs-voice
+ *          BALANCE exactly as it flies: the REAL presence tone sweeps DOWN the
+ *          VOLUME_PREVIEW_SWEEP_FROM_FT -> _TO_FT band (pitch + level on the actual
+ *          agl_to_pitch_hz / agl_to_tone_db schedule) in the background, while the
+ *          "20" and "10" callouts speak over it and DUCK it through the very same
+ *          sidechain (duck_step) the flight render loop uses. The live TONE and
+ *          VOICE volume offsets (audio_set_tone_db / audio_set_voice_db) are both
+ *          applied, so each menu step auditions the chosen balance. Runs before the
+ *          render tasks exist, mono-centered, with click-free fades top and tail.
+ */
+void audio_play_volume_preview_blocking(void);
 
 /**
  * @brief Pause the I2S channel (before MCU light-sleep in GROUND/CRUISE).

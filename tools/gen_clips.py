@@ -52,6 +52,7 @@ CLIPS = {
     "three_hundred": "three hundred",
     "four_hundred":  "four hundred",
     "five_hundred":  "five hundred",
+    "six_hundred":   "six hundred",
 }
 
 # Repo paths (this file lives in tools/).
@@ -230,6 +231,7 @@ def gen_placeholders():
         "three_hundred": (3, 1100),
         "four_hundred":  (4, 1100),
         "five_hundred":  (5, 1100),
+        "six_hundred":   (6, 1100),
     }
     for stem, (count, freq) in pattern.items():
         samples = []

@@ -256,21 +256,41 @@
  *  trim is not applied and the tone runs at its full scheduled level.            */
 #define TONE_TRIM_WITH_VOICE_DB  -1.0f  /* steady tone cut while callouts are on   */
 
-/* ---- Audio: master volume offset (boot config menu, perceptual dB) -------- */
-/*  A pilot-set MASTER trim, layered ON TOP of the builder's analog pot, chosen
- *  in the boot config menu and stored in NVS. It attenuates the WHOLE mix —
- *  presence tone AND voice callouts equally — so it behaves like a true volume
- *  knob, not a tone/voice balance. The range is 0 dB (no cut, the default) down
- *  to VOLUME_OFFSET_DB_MIN in VOLUME_OFFSET_DB_STEP increments; the menu cycles
- *  through every step. Stored as a small NON-NEGATIVE magnitude in NVS (the cut
- *  in dB, e.g. 3 == -3 dB) so it packs into a u8 cleanly.                        */
-#define VOLUME_OFFSET_DB_MIN   -6.0f  /* deepest cut the menu offers              */
-#define VOLUME_OFFSET_DB_STEP   1.0f  /* 0,-1,-2,...,-6 dB (1 dB ~ just-noticeable)*/
-#define DEFAULT_VOLUME_OFFSET_DB 0.0f /* no cut until the pilot lowers it         */
+/* ---- Audio: independent tone + voice volume offsets (boot config menu) ----- */
+/*  Two pilot-set trims, layered ON TOP of the builder's analog pot, chosen in the
+ *  boot config menu and stored in NVS. Unlike the old single master, these adjust
+ *  the presence TONE and the voice CALLOUTS independently, so the pilot can dial
+ *  the tone-vs-voice balance to taste:
+ *
+ *    - TONE volume  : cut OR boost, TONE_VOLUME_DB_MIN .. TONE_VOLUME_DB_MAX.
+ *    - VOICE volume : cut ONLY,     VOICE_VOLUME_DB_MIN .. 0 dB (never boosted,
+ *                     since the clips already sit near full scale).
+ *
+ *  Both step in 2 dB increments (a comfortably-noticeable click) and default to
+ *  0 dB (no change) until the pilot moves them. The tone offset is stored SIGNED
+ *  in NVS (it can go negative or positive); the voice offset is stored as a small
+ *  NON-NEGATIVE cut magnitude (e.g. 4 == -4 dB) so it packs into a u8 cleanly.   */
+#define TONE_VOLUME_DB_MIN     -6.0f  /* deepest tone cut the menu offers          */
+#define TONE_VOLUME_DB_MAX      6.0f  /* loudest tone boost the menu offers        */
+#define TONE_VOLUME_DB_STEP     2.0f  /* +6,+4,+2,0,-2,-4,-6 dB                     */
+#define DEFAULT_TONE_VOLUME_DB  0.0f  /* no change until the pilot moves it        */
 
-/*  The 1 kHz example tone the volume menu plays at each step so the pilot can
- *  judge the chosen level by ear ("tone .. <number> .. tone"). 1 kHz is the
- *  equal-loudness reference and sits squarely in the speech band.                */
+#define VOICE_VOLUME_DB_MIN    -6.0f  /* deepest voice cut the menu offers         */
+#define VOICE_VOLUME_DB_STEP    2.0f  /* 0,-2,-4,-6 dB                             */
+#define DEFAULT_VOICE_VOLUME_DB 0.0f  /* no cut until the pilot lowers it          */
+
+/*  The volume menu previews each step as a short "mini-flare": the REAL presence
+ *  tone sweeps DOWN the 20->10 ft band (pitch rising on the actual schedule) in the
+ *  BACKGROUND while the "20" and "10" callouts speak over it and DUCK it — the exact
+ *  sidechain that flies. So the pilot judges the tone-vs-voice BALANCE the way the
+ *  box truly sounds, not as a static beep. Both tone and voice carry the live tone/
+ *  voice offsets, so each step auditions the chosen balance.                       */
+#define VOLUME_PREVIEW_SWEEP_FROM_FT 20.0f  /* sweep starts here ("20" speaks)      */
+#define VOLUME_PREVIEW_SWEEP_TO_FT   10.0f  /* ...descends to here ("10" speaks)    */
+#define VOLUME_PREVIEW_SWEEP_MS      2500   /* quick 2.5 s mini-flare               */
+
+/*  Legacy fixed-burst preview parameters, still used for the 1 kHz reference tone
+ *  in any non-sweep context. 1 kHz is the equal-loudness reference.               */
 #define VOLUME_PREVIEW_HZ      1000.0f
 #define VOLUME_PREVIEW_MS      350    /* length of each preview tone burst (ms)    */
 #define VOLUME_PREVIEW_DB      -6.0f  /* preview tone level (== TONE_FULL_DB)      */
@@ -339,7 +359,8 @@
 #define NVS_KEY_GROUNDBUF "groundbuf"  /* blob: BOOT_BUFFER_N x boot_entry_t     */
 #define NVS_KEY_AUDIOCFG  "audiocfg"   /* u8: selected AUDIO_MODE_* (config menu) */
 #define NVS_KEY_STARTALT  "startalt"   /* u16: callout start-altitude cap in ft   */
-#define NVS_KEY_VOLOFS    "volofs"     /* u8: master volume CUT magnitude in dB    */
+#define NVS_KEY_VOLOFS    "volofs"     /* u8: voice volume CUT magnitude in dB     */
+#define NVS_KEY_TONEVOL   "tonevol"    /* i8: tone volume offset in dB (signed)    */
 
 /* ---- Bench HIL simulation (USB-Serial-JTAG side-door) -------------------- */
 /*  A developer can bench-test THIS firmware with headphones and NO LiDAR fitted

@@ -40,7 +40,7 @@ const STATE_COLORS = {
 
 // The full union of callout heights across both profiles, so we can preload
 // every WAV once regardless of which profile is active.
-const ALL_CALLOUT_FT = [500, 400, 300, 200, 100, 50, 40, 30, 20, 10];
+const ALL_CALLOUT_FT = [600, 500, 400, 300, 200, 100, 50, 40, 30, 20, 10];
 
 // Spoken config-menu prompt pieces, mirroring the firmware's config_clip_piece
 // set (see callouts.c). Keyed by the same names the firmware uses; the value is
@@ -105,10 +105,11 @@ const FLARE_START_FT   = 20.0;   // height AGL where the flare begins
 const FLARE_TOUCHDOWN_SINK = 1.5; // residual sink at the wheels (ft/s, gentle)
 const FLARE_TAU        = 1.6;    // exponential time-constant of the flare (s)
 
-// Where the scripted approach begins, in feet above the highest callout-ceiling
-// the sensor can see. We start a touch above the profile's CRUISE band so the run
-// opens in CRUISE, breaks into DESCENT through the ladder, and ends on the ground.
-const APPROACH_START_MARGIN_FT = 15.0;
+// Where the scripted approach begins, in feet AGL. A fixed default start height so
+// the run opens high, breaks into DESCENT through the ladder, and ends on the
+// ground. 342 ft sits just above the SF30/C cruise band (305 ft), so that profile
+// still opens in CRUISE; on the longer-range SF30/D it opens armed-and-descending.
+const APPROACH_START_FT = 342.0;
 
 // A brief hold once the wheels are down before the run auto-clears, so the final
 // "10" callout and the flare-fade tail can finish playing.
@@ -151,10 +152,13 @@ let modeStereo  = true;     // resolved api.modeStereo(audioMode)
 let modeCallouts = true;    // resolved api.modeCallouts(audioMode)
 let modeTone    = true;     // resolved api.modeTone(audioMode)
 
-// Master volume offset (dB, <= 0). The pilot's trim layered on the analog pot,
-// attenuating the WHOLE mix (tone + voice) exactly like app_main.c's saved offset
-// driving audio_set_master_db(). 0 dB == no cut; default seeded from the firmware.
-let volumeDb    = 0;
+// Independent tone + voice volume offsets (dB). The pilot's two trims layered on
+// the analog pot: the TONE offset can cut OR boost (audio_set_tone_db), the VOICE
+// offset is cut-only (audio_set_voice_db). 0 dB == no change; defaults seeded from
+// the firmware. Each drives its own WebAudio gain node so the sim balances the two
+// streams exactly like the box.
+let toneVolDb   = 0;
+let voiceVolDb  = 0;
 
 // WebAudio graph.
 let audioCtx     = null; // AudioContext (created on first gesture)
@@ -164,7 +168,8 @@ let osc2Gain     = null; // fixed gain on osc2 == TONE_HARMONIC2_LVL / (1 + lvl)
 let toneGainNode = null; // GainNode — 0 == silent
 let tonePanNode  = null; // StereoPannerNode — leans the tone left in stereo mode
 let mixLpfNode   = null; // BiquadFilter (lowpass) — anti-harshness mix-bus LPF
-let masterGainNode = null; // GainNode — the pilot's master volume offset (tone+voice)
+let toneVolNode  = null; // GainNode — the pilot's TONE volume offset (cut or boost)
+let voiceVolNode = null; // GainNode — the pilot's VOICE volume offset (cut only)
 let audioUnlocked = false;
 const calloutBuffers = new Map(); // height(ft) -> decoded AudioBuffer
 const calloutEnv     = new Map(); // height(ft) -> Float32Array sidechain envelope
@@ -241,12 +246,19 @@ async function main() {
     modeCallouts:   M.cwrap('sim_mode_callouts',      num, [num]),
     modeTone:       M.cwrap('sim_mode_tone',          num, [num]),
 
-    // Master volume offset (boot config menu) — range/step/default + the SAME
-    // db_to_gain() the firmware uses, so the master node matches the DAC path.
-    volMinDb:       M.cwrap('sim_volume_offset_db_min',  num, []),
-    volStepDb:      M.cwrap('sim_volume_offset_db_step', num, []),
-    volDefaultDb:   M.cwrap('sim_default_volume_offset_db', num, []),
-    masterGain:     M.cwrap('sim_master_gain',        num, [num]),
+    // Independent tone + voice volume offsets (boot config menu) — ranges/steps/
+    // defaults + the SAME clamped db_to_gain() the firmware uses, so each WebAudio
+    // volume node matches the DAC path.
+    toneVolMinDb:    M.cwrap('sim_tone_volume_db_min',    num, []),
+    toneVolMaxDb:    M.cwrap('sim_tone_volume_db_max',    num, []),
+    toneVolStepDb:   M.cwrap('sim_tone_volume_db_step',   num, []),
+    toneVolDefaultDb:M.cwrap('sim_default_tone_volume_db',num, []),
+    toneVolGain:     M.cwrap('sim_tone_volume_gain',      num, [num]),
+    voiceVolMinDb:   M.cwrap('sim_voice_volume_db_min',   num, []),
+    voiceVolStepDb:  M.cwrap('sim_voice_volume_db_step',  num, []),
+    voiceVolDefaultDb:M.cwrap('sim_default_voice_volume_db',num, []),
+    voiceVolGain:    M.cwrap('sim_voice_volume_gain',     num, [num]),
+    dbToGain:        M.cwrap('sim_db_to_gain',            num, [num]),
 
     // Volume-preview tone parameters ("tone .. number .. tone").
     volPreviewHz:   M.cwrap('sim_volume_preview_hz',  num, []),
@@ -270,9 +282,11 @@ async function main() {
   //    Seed the boot config from the firmware's own defaults, then resolve the
   //    mode flags so the very first audio frame already honours them.
   audioMode = api.defaultMode();
-  volumeDb  = api.volDefaultDb();      // master offset default (0 dB == no cut)
+  toneVolDb  = api.toneVolDefaultDb();   // tone offset default (0 dB == no change)
+  voiceVolDb = api.voiceVolDefaultDb();  // voice offset default (0 dB == no cut)
   applyAudioMode(audioMode);
-  applyVolume(volumeDb);
+  applyToneVolume(toneVolDb);
+  applyVoiceVolume(voiceVolDb);
   api.setProfile(profileIdx);
   api.init(0 /* ST_GROUND */);
   readConfig();
@@ -356,20 +370,36 @@ function applyAudioMode(mode) {
 }
 
 /**
- * Apply the pilot's master volume offset (dB) to the whole mix — the sim analogue
- * of app_main.c calling audio_set_master_db(). The offset is converted to a linear
- * gain by the SAME firmware db_to_gain() (via api.masterGain) and driven into the
- * master node so it trims the presence tone AND the voice callouts equally, just
- * like the DAC path. Clamped to attenuation only (never boosts past the schedule).
+ * Apply the pilot's TONE volume offset (dB) — the sim analogue of app_main.c calling
+ * audio_set_tone_db(). Converted to a linear gain by the SAME firmware-side clamp +
+ * db_to_gain() (via api.toneVolGain) and driven into the tone-path node, so it trims
+ * (or boosts) ONLY the presence tone, just like the DAC path.
  *
- * @param {number} db  Offset in dB (<= 0).
+ * @param {number} db  Tone offset in dB (may be negative or positive).
  */
-function applyVolume(db) {
-  volumeDb = Math.min(0, db);
-  if (masterGainNode && audioCtx) {
+function applyToneVolume(db) {
+  // Clamp to the firmware's tone range so the readout/state never drift past it.
+  toneVolDb = Math.max(api.toneVolMinDb(), Math.min(api.toneVolMaxDb(), db));
+  if (toneVolNode && audioCtx) {
     // Short glide so a live change during the menu preview never clicks.
-    masterGainNode.gain.setTargetAtTime(
-      api.masterGain(volumeDb), audioCtx.currentTime, 0.02);
+    toneVolNode.gain.setTargetAtTime(
+      api.toneVolGain(toneVolDb), audioCtx.currentTime, 0.02);
+  }
+}
+
+/**
+ * Apply the pilot's VOICE volume offset (dB) — the sim analogue of app_main.c calling
+ * audio_set_voice_db(). Cut-only (clamped to <= 0), converted to a linear gain by the
+ * SAME firmware-side db_to_gain() (via api.voiceVolGain) and driven into the voice-path
+ * node, so it trims ONLY the spoken callouts.
+ *
+ * @param {number} db  Voice offset in dB (<= 0).
+ */
+function applyVoiceVolume(db) {
+  voiceVolDb = Math.max(api.voiceVolMinDb(), Math.min(0, db));
+  if (voiceVolNode && audioCtx) {
+    voiceVolNode.gain.setTargetAtTime(
+      api.voiceVolGain(voiceVolDb), audioCtx.currentTime, 0.02);
   }
 }
 
@@ -385,9 +415,10 @@ function applyVolume(db) {
  *  discard them without touching the live audio. Commit copies them across.
  * ===========================================================================*/
 
-let pendingMode   = 1;   // mode highlighted in the open sheet (not yet applied)
-let pendingCapFt  = 0;   // start-alt cap highlighted in the open sheet
-let pendingVolDb  = 0;   // master volume offset highlighted in the open sheet
+let pendingMode      = 1;   // mode highlighted in the open sheet (not yet applied)
+let pendingCapFt     = 0;   // start-alt cap highlighted in the open sheet
+let pendingToneVolDb = 0;   // tone volume offset highlighted in the open sheet
+let pendingVoiceVolDb= 0;   // voice volume offset highlighted in the open sheet
 
 /** Open the config sheet, seeding the controls from the current live config. */
 function openConfigMenu() {
@@ -395,11 +426,13 @@ function openConfigMenu() {
   // Seed the cap from the live value, but never above this profile's ceiling.
   const top = cfg.callouts[0];
   pendingCapFt = isFinite(startAltFt) ? Math.min(startAltFt, top) : top;
-  pendingVolDb = volumeDb;          // seed the master offset from the live value
+  pendingToneVolDb  = toneVolDb;    // seed both offsets from the live values
+  pendingVoiceVolDb = voiceVolDb;
 
   buildModeList();
   buildCapControl();
-  buildVolumeControl();
+  buildToneVolumeControl();
+  buildVoiceVolumeControl();
 
   document.getElementById('configBackdrop').classList.add('open');
 }
@@ -485,66 +518,156 @@ function refreshCapEnabled() {
 }
 
 /**
- * Build the master-volume range against the firmware's offset range/step, and
- * preview each setting by ear on change — the sim analogue of LEVEL 3 in
- * run_config_menu. The slider walks 0 dB down to VOLUME_OFFSET_DB_MIN in
- * VOLUME_OFFSET_DB_STEP increments; moving it applies the offset LIVE (so the
- * preview plays at that level) and plays "tone .. number .. tone".
+ * Build the TONE-volume range against the firmware's tone range/step (LEVEL 3 of
+ * run_config_menu, "Volume Adjustment, Tone Only"). The slider walks the full cut-
+ * or-boost span (TONE_VOLUME_DB_MIN..MAX) in TONE_VOLUME_DB_STEP increments; moving
+ * it applies the offset LIVE and auditions the mini-flare balance preview.
  */
-function buildVolumeControl() {
-  const range = document.getElementById('volRange');
-  const minDb  = api.volMinDb();      // e.g. -6
-  const stepDb = api.volStepDb();     // e.g. 1
-  const nSteps = Math.round(-minDb / stepDb);   // 6 steps below 0 -> 7 stops
+function buildToneVolumeControl() {
+  const range  = document.getElementById('toneVolRange');
+  const minDb  = api.toneVolMinDb();    // e.g. -6
+  const maxDb  = api.toneVolMaxDb();    // e.g. +6
+  const stepDb = api.toneVolStepDb();   // e.g. 2
+  const nSteps = Math.round((maxDb - minDb) / stepDb);   // e.g. 6 -> 7 stops
+
+  // The slider counts steps from the MIN up to the MAX; value maps linearly to dB.
+  range.min = 0;
+  range.max = nSteps;
+  range.step = 1;
+  range.value = Math.round((pendingToneVolDb - minDb) / stepDb);
+  updateToneVolLabel(pendingToneVolDb);
+
+  range.oninput = () => {
+    pendingToneVolDb = minDb + parseInt(range.value, 10) * stepDb;
+    updateToneVolLabel(pendingToneVolDb);
+    unlockAudio().then(() => {
+      applyToneVolume(pendingToneVolDb);
+      previewBalance();
+    });
+  };
+}
+
+/**
+ * Build the VOICE-volume range against the firmware's voice range/step (LEVEL 4,
+ * "Volume Adjustment, Callouts Only"). Cut-only: the slider walks 0 dB down to
+ * VOICE_VOLUME_DB_MIN in VOICE_VOLUME_DB_STEP increments.
+ */
+function buildVoiceVolumeControl() {
+  const range  = document.getElementById('voiceVolRange');
+  const minDb  = api.voiceVolMinDb();   // e.g. -6
+  const stepDb = api.voiceVolStepDb();  // e.g. 2
+  const nSteps = Math.round(-minDb / stepDb);   // e.g. 3 -> 4 stops
 
   // The slider counts CUT steps (0..nSteps); 0 == no cut (0 dB), nSteps == min.
   range.min = 0;
   range.max = nSteps;
   range.step = 1;
-  range.value = Math.round(-pendingVolDb / stepDb);
-  updateVolLabel(pendingVolDb);
+  range.value = Math.round(-pendingVoiceVolDb / stepDb);
+  updateVoiceVolLabel(pendingVoiceVolDb);
 
   range.oninput = () => {
-    pendingVolDb = -parseInt(range.value, 10) * stepDb;
-    updateVolLabel(pendingVolDb);
-    // Apply live + preview, exactly like the firmware menu applies each tap before
-    // committing, so the user hears the chosen level immediately.
+    pendingVoiceVolDb = -parseInt(range.value, 10) * stepDb;
+    updateVoiceVolLabel(pendingVoiceVolDb);
     unlockAudio().then(() => {
-      applyVolume(pendingVolDb);
-      previewVolume();
+      applyVoiceVolume(pendingVoiceVolDb);
+      previewBalance();
     });
   };
 }
 
-/** Show the chosen offset, flagging 0 dB as "full". */
-function updateVolLabel(db) {
-  const el = document.getElementById('volVal');
+/** Show the chosen TONE offset, flagging 0 dB as "flat" and signing the value. */
+function updateToneVolLabel(db) {
+  const el = document.getElementById('toneVolVal');
+  el.textContent = db === 0 ? '0 dB · flat' : `${db > 0 ? '+' : ''}${db} dB`;
+}
+
+/** Show the chosen VOICE offset, flagging 0 dB as "full". */
+function updateVoiceVolLabel(db) {
+  const el = document.getElementById('voiceVolVal');
   el.textContent = db >= 0 ? '0 dB · full' : `${db} dB`;
 }
 
+// Mini-flare preview parameters — mirror config.h VOLUME_PREVIEW_SWEEP_*. The tone
+// sweeps DOWN this band while the "20" and "10" callouts duck it.
+const PREVIEW_SWEEP_FROM_FT = 20;
+const PREVIEW_SWEEP_TO_FT   = 10;
+const PREVIEW_SWEEP_S       = 2.5;
+
 /**
- * Preview the current master volume by ear: "tone .. number .. tone", mirroring
- * app_main.c's preview_volume(). A short 1 kHz WebAudio burst (at the firmware's
- * preview level + equal-loudness), then the spoken "30" callout, then the burst
- * again — all downstream of masterGainNode, so the live offset trims them just
- * like the running box. No-op until audio is unlocked.
+ * Preview the current tone/voice BALANCE by ear: the "mini-flare", mirroring
+ * audio_play_volume_preview_blocking(). The REAL presence tone sweeps down the
+ * 20->10 ft band (pitch + level on the firmware schedule, through toneVolNode) in
+ * the background while the "20" then "10" callouts speak over it (through
+ * voiceVolNode) and DUCK it — so the pilot hears the actual balance. The SAME
+ * preview serves both volume steps; whichever offset is live shifts the balance.
+ * No-op until audio is unlocked.
  */
-function previewVolume() {
+function previewBalance() {
   if (!audioUnlocked || !audioCtx) return;
 
-  const hz   = api.volPreviewHz();
-  const ms   = api.volPreviewMs();
-  const db   = api.volPreviewDb();
-  const gap  = 0.09;                 // 90 ms between pieces, matching the firmware
-  let when   = audioCtx.currentTime + 0.02;
+  const t0  = audioCtx.currentTime + 0.03;
+  const dur = PREVIEW_SWEEP_S;
 
-  when = scheduleTone(hz, ms, db, when) + gap;   // tone
-  when = scheduleCalloutAt(30, when) + gap;      // "30"
-  scheduleTone(hz, ms, db, when);                // tone
+  // Swept tone: a dedicated oscillator gliding pitch on the real schedule, through a
+  // duck gain node, into the tone-volume node (so the live tone offset applies). The
+  // level node rides the scheduled tone dB across the band (unclamped db_to_gain).
+  const f0   = api.pitchHz(PREVIEW_SWEEP_FROM_FT);
+  const f1   = api.pitchHz(PREVIEW_SWEEP_TO_FT);
+  const lvl0 = api.dbToGain(api.toneDb(PREVIEW_SWEEP_FROM_FT) + api.eqlDb(PREVIEW_SWEEP_FROM_FT));
+  const lvl1 = api.dbToGain(api.toneDb(PREVIEW_SWEEP_TO_FT)   + api.eqlDb(PREVIEW_SWEEP_TO_FT));
+
+  const osc = audioCtx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(f0, t0);
+  osc.frequency.linearRampToValueAtTime(f1, t0 + dur);
+
+  const lvlGain = audioCtx.createGain();
+  lvlGain.gain.setValueAtTime(0.0001, t0);
+  lvlGain.gain.linearRampToValueAtTime(lvl0, t0 + 0.05);
+  lvlGain.gain.linearRampToValueAtTime(lvl1, t0 + dur - 0.08);
+  lvlGain.gain.linearRampToValueAtTime(0.0001, t0 + dur);
+
+  const duckGain = audioCtx.createGain();
+  duckGain.gain.value = 1;
+
+  osc.connect(lvlGain).connect(duckGain).connect(toneVolNode);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.05);
+
+  // The two callouts at their heights — each plays through the voice node AND ducks
+  // the swept tone above via duckGain, the audible equivalent of duck_step().
+  scheduleDuckedCallout(20, t0 + dur * 0.12, duckGain);
+  scheduleDuckedCallout(10, t0 + dur * 0.58, duckGain);
 }
 
 /**
- * Schedule a fixed-frequency sine burst through the master node, returning the
+ * Play one callout at a scheduled time (through the voice-volume node) and dip the
+ * background tone's duck gain while it sounds: down to the firmware's duck floor over
+ * the attack, recovering over the release. A coarse but faithful stand-in for the
+ * per-sample sidechain the flight loop (and the firmware preview) run.
+ *
+ * @param {number} ft        Callout height whose WAV to play.
+ * @param {number} when      audioCtx time to start.
+ * @param {GainNode} duckGain  The background tone's duck node to dip.
+ */
+function scheduleDuckedCallout(ft, when, duckGain) {
+  const buf = calloutBuffers.get(ft);
+  if (!buf) return;
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(voiceVolNode);
+  src.start(when);
+
+  const floor = api.duckFloor();
+  const atk   = Math.max(0.005, api.duckAttackMs()  / 1000);
+  const rel   = Math.max(0.02,  api.duckReleaseMs() / 1000);
+  duckGain.gain.setTargetAtTime(floor, when, atk);            // dip under the voice
+  duckGain.gain.setTargetAtTime(1.0, when + buf.duration, rel); // breathe back up
+}
+
+/**
+ * Schedule a fixed-frequency sine burst through the tone-volume node, returning the
  * audioCtx time it ENDS. Mirrors audio_play_tone_blocking(): the burst level is
  * db + equal-loudness at this frequency, with short raised-cosine-ish fades (a
  * linear ramp is a close, click-free analogue) top and tail.
@@ -562,16 +685,18 @@ function scheduleTone(hz, ms, db, when) {
   o.frequency.value = hz;
 
   // Level = scheduled dB + equal-loudness flattening at this pitch (the firmware
-  // folds equal_loudness_db into the preview gain), then -> linear gain.
+  // folds equal_loudness_db into the preview gain), then -> linear gain. This is
+  // the burst's INTRINSIC level (unclamped db_to_gain); the pilot's tone offset is
+  // applied separately by toneVolNode downstream.
   const g = audioCtx.createGain();
-  const peak = api.masterGain(db + api.eqlDbHz(hz));
+  const peak = api.dbToGain(db + api.eqlDbHz(hz));
   const fade = Math.min(0.004, dur / 3);   // few-ms click-free edges
   g.gain.setValueAtTime(0.0001, when);
   g.gain.linearRampToValueAtTime(peak, when + fade);
   g.gain.setValueAtTime(peak, when + dur - fade);
   g.gain.linearRampToValueAtTime(0.0001, when + dur);
 
-  o.connect(g).connect(masterGainNode);   // through master -> offset applies
+  o.connect(g).connect(toneVolNode);   // through the tone-volume node -> offset applies
   o.start(when);
   o.stop(when + dur + 0.01);
   return when + dur;
@@ -594,7 +719,8 @@ function scheduleCalloutAt(ft, when) {
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
   // Centre the preview number (pan is a balance cue, not relevant to a level audit).
-  src.connect(masterGainNode);
+  // Through the VOICE node so the live voice offset trims it like the running box.
+  src.connect(voiceVolNode);
   src.start(when);
   return when + buf.duration;
 }
@@ -608,7 +734,8 @@ function scheduleCalloutAt(ft, when) {
 function commitConfigMenu() {
   applyAudioMode(pendingMode);
   startAltFt = pendingCapFt;
-  applyVolume(pendingVolDb);     // master volume offset (tone + voice)
+  applyToneVolume(pendingToneVolDb);    // independent tone + voice offsets
+  applyVoiceVolume(pendingVoiceVolDb);
 
   calibrateToGround();          // zero the box (shared with the Calibrate path)
   closeConfigMenu();
@@ -652,7 +779,7 @@ function calibrateToGround() {
 const DTAP_MS = 350;     // two taps within this window == a double-tap (confirm)
 
 let manualOpen   = false;   // is the manual menu modal showing?
-let manualLevel  = 0;       // 0 = mode, 1 = start-alt, 2 = volume, 3 = committed
+let manualLevel  = 0;       // 0 = mode, 1 = start-alt, 2 = tone-vol, 3 = voice-vol
 let manualLastTap = 0;      // performance.now() of the last tap (double-tap detect)
 let manualTapTimer = null;  // pending single-tap resolution timer
 
@@ -661,7 +788,8 @@ let manualTapTimer = null;  // pending single-tap resolution timer
 // saved/default values.
 let manMode  = 1;
 let manCapIdx = 0;          // index into the ascending callout ladder
-let manVolDb = 0;
+let manToneVolDb  = 0;      // tone volume offset (cut or boost)
+let manVoiceVolDb = 0;      // voice volume offset (cut only)
 
 /** Open the manual menu: reset to LEVEL 1 and speak the entry + first option. */
 function openManualMenu() {
@@ -669,7 +797,8 @@ function openManualMenu() {
     manualOpen  = true;
     manualLevel = 0;
     manMode     = audioMode;
-    manVolDb    = volumeDb;
+    manToneVolDb  = toneVolDb;
+    manVoiceVolDb = voiceVolDb;
 
     // Cap index seeded from the live cap against the ascending ladder.
     const asc = [...cfg.callouts].sort((a, b) => a - b);
@@ -730,11 +859,17 @@ function manualTap() {
       announceCapManual();
       break;
     }
-    case 2:   // master volume
-      manVolDb -= api.volStepDb();
-      if (manVolDb < api.volMinDb() - 0.001) manVolDb = 0;   // wrap to no-cut
-      applyVolume(manVolDb);            // apply live so the preview is at-level
-      previewVolume();
+    case 2:   // tone volume (cut OR boost) — step DOWN, wrap from below MIN to MAX
+      manToneVolDb -= api.toneVolStepDb();
+      if (manToneVolDb < api.toneVolMinDb() - 0.001) manToneVolDb = api.toneVolMaxDb();
+      applyToneVolume(manToneVolDb);    // apply live so the preview is at-level
+      previewBalance();
+      break;
+    case 3:   // voice volume (cut only) — step DOWN, wrap from below MIN to 0
+      manVoiceVolDb -= api.voiceVolStepDb();
+      if (manVoiceVolDb < api.voiceVolMinDb() - 0.001) manVoiceVolDb = 0;
+      applyVoiceVolume(manVoiceVolDb);
+      previewBalance();
       break;
   }
   renderManual();
@@ -756,25 +891,46 @@ function manualConfirm() {
       const asc = [...cfg.callouts].sort((a, b) => a - b);
       scheduleCalloutAt(asc[manCapIdx], when);
     } else {
-      enterVolumeLevel();
+      enterToneVolumeLevel();
     }
   } else if (manualLevel === 1) {
-    enterVolumeLevel();
+    enterToneVolumeLevel();
   } else if (manualLevel === 2) {
+    // Tone volume committed. The voice-volume level is skipped for a tone-only mode
+    // (no callouts to trim), exactly like the firmware.
+    if (api.modeCallouts(manMode) === 1) {
+      enterVoiceVolumeLevel();
+    } else {
+      commitManualMenu();
+      return;
+    }
+  } else if (manualLevel === 3) {
     commitManualMenu();
     return;
   }
   renderManual();
 }
 
-/** Advance into LEVEL 3 (volume): announce "Volume Adjustment" + preview. */
-function enterVolumeLevel() {
+/** Advance into LEVEL 3 (tone volume): announce "Volume Adjustment, Tone Only". */
+function enterToneVolumeLevel() {
   manualLevel = 2;
-  manVolDb = 0;                         // firmware starts LEVEL 3 at 0 dB
-  applyVolume(manVolDb);
-  const when = schedulePieceAt('volume_adjustment', audioCtx.currentTime + 0.12) + 0.12;
-  // Preview after the announcement finishes.
-  setTimeout(() => { if (manualOpen) previewVolume(); },
+  manToneVolDb = 0;                     // firmware starts each volume level at 0 dB
+  applyToneVolume(manToneVolDb);
+  let when = schedulePieceAt('volume_adjustment', audioCtx.currentTime + 0.12) + 0.12;
+  when = schedulePieceAt('tone_only', when) + 0.12;
+  // Preview the mini-flare after the announcement finishes.
+  setTimeout(() => { if (manualOpen) previewBalance(); },
+             Math.max(0, (when - audioCtx.currentTime) * 1000));
+}
+
+/** Advance into LEVEL 4 (voice volume): announce "Volume Adjustment, Callouts Only". */
+function enterVoiceVolumeLevel() {
+  manualLevel = 3;
+  manVoiceVolDb = 0;                    // firmware starts each volume level at 0 dB
+  applyVoiceVolume(manVoiceVolDb);
+  let when = schedulePieceAt('volume_adjustment', audioCtx.currentTime + 0.12) + 0.12;
+  when = schedulePieceAt('callouts_only', when) + 0.12;
+  setTimeout(() => { if (manualOpen) previewBalance(); },
              Math.max(0, (when - audioCtx.currentTime) * 1000));
 }
 
@@ -783,7 +939,8 @@ function commitManualMenu() {
   applyAudioMode(manMode);
   const asc = [...cfg.callouts].sort((a, b) => a - b);
   startAltFt = api.modeCallouts(manMode) === 1 ? asc[manCapIdx] : cfg.callouts[0];
-  applyVolume(manVolDb);
+  applyToneVolume(manToneVolDb);
+  applyVoiceVolume(manVoiceVolDb);
   calibrateToGround();
   closeManualMenu();
 }
@@ -812,8 +969,8 @@ function manualButtonPress() {
 function renderManual() {
   const levelEl = document.getElementById('manualLevel');
   const valueEl = document.getElementById('manualValue');
-  const LEVELS = ['Audio mode', 'Start-altitude cap', 'Volume adjustment'];
-  levelEl.textContent = `Step ${manualLevel + 1} of 3 · ${LEVELS[manualLevel] ?? '—'}`;
+  const LEVELS = ['Audio mode', 'Start-altitude cap', 'Tone volume', 'Voice volume'];
+  levelEl.textContent = `Step ${manualLevel + 1} of ${LEVELS.length} · ${LEVELS[manualLevel] ?? '—'}`;
 
   let v = '—';
   if (manualLevel === 0) {
@@ -823,7 +980,10 @@ function renderManual() {
     const ft = asc[manCapIdx];
     v = ft >= cfg.callouts[0] ? `${ft} ft · all` : `${ft} ft`;
   } else if (manualLevel === 2) {
-    v = manVolDb >= 0 ? '0 dB · full' : `${manVolDb} dB`;
+    v = manToneVolDb === 0 ? '0 dB · flat'
+                           : `${manToneVolDb > 0 ? '+' : ''}${manToneVolDb} dB`;
+  } else if (manualLevel === 3) {
+    v = manVoiceVolDb >= 0 ? '0 dB · full' : `${manVoiceVolDb} dB`;
   }
   valueEl.textContent = v;
 }
@@ -845,9 +1005,8 @@ function renderManual() {
 function startApproach() {
   unlockAudio();                          // first-class user gesture: enable sound
 
-  // Start a hair above CRUISE so the firmware boots into CRUISE and then breaks
-  // into DESCENT as we sink through the ladder — the full state arc on one run.
-  const startFt = cfg.cruiseFt + APPROACH_START_MARGIN_FT;
+  // Begin at the fixed default ILS start height and sink down the ladder from there.
+  const startFt = APPROACH_START_FT;
 
   targetAgl  = startFt;
   displayAgl = startFt;                   // snap the glyph; the run glides from here
@@ -962,23 +1121,27 @@ function setupAudioGraph() {
   mixLpfNode.type = 'lowpass';
   mixLpfNode.frequency.value = api.mixLpfFc();   // MIX_LPF_FC_HZ
 
-  // Master volume offset node — the pilot's trim layered on the analog pot. The
-  // firmware applies it LAST, to the whole mix (tone AND voice), so in the graph
-  // BOTH the tone chain and every callout source feed THIS node, and only this
-  // node reaches the destination. Mirrors audio_set_master_db()/s_master_gain.
-  masterGainNode = audioCtx.createGain();
-  masterGainNode.gain.value = api.masterGain(volumeDb);
-  masterGainNode.connect(audioCtx.destination);
+  // Two independent volume nodes, mirroring the firmware's split trims: the TONE
+  // node sits at the END of the tone chain (audio_set_tone_db, may cut OR boost);
+  // the VOICE node is fed by every callout source (audio_set_voice_db, cut only).
+  // Each reaches the destination directly — there is no single master node anymore.
+  toneVolNode = audioCtx.createGain();
+  toneVolNode.gain.value = api.toneVolGain(toneVolDb);
+  toneVolNode.connect(audioCtx.destination);
+
+  voiceVolNode = audioCtx.createGain();
+  voiceVolNode.gain.value = api.voiceVolGain(voiceVolDb);
+  voiceVolNode.connect(audioCtx.destination);
 
   // Fundamental feeds the gain node at the normalised weight; the harmonic feeds
-  // it through osc2Gain. Then: gain -> pan -> LPF -> master -> out (LPF is
-  // post-pan so it shapes the final mix exactly like audio.c filters the L/R
-  // after panning; master is post-LPF, the true master trim).
+  // it through osc2Gain. Then: gain -> pan -> LPF -> tone-volume -> out (LPF is
+  // post-pan so it shapes the final mix exactly like audio.c filters the L/R after
+  // panning; the tone-volume node is post-LPF, the pilot's tone trim).
   const fundGain = audioCtx.createGain();
   fundGain.gain.value = norm;        // fundamental weight (1/(1+lvl))
   osc.connect(fundGain).connect(toneGainNode);
   osc2.connect(osc2Gain).connect(toneGainNode);
-  toneGainNode.connect(tonePanNode).connect(mixLpfNode).connect(masterGainNode);
+  toneGainNode.connect(tonePanNode).connect(mixLpfNode).connect(toneVolNode);
   osc.start();
   osc2.start();
 }
@@ -1031,7 +1194,8 @@ function schedulePieceAt(name, when) {
   if (!buf || !audioCtx) return when;
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
-  src.connect(masterGainNode);
+  // Menu prompts are voice clips -> through the voice-volume node.
+  src.connect(voiceVolNode);
   src.start(when);
   return when + buf.duration;
 }
@@ -1079,9 +1243,9 @@ function playCallout(ft) {
   const pan = audioCtx.createStereoPanner();
   pan.pan.value = modeStereo ? +api.stereoPan() : 0;
 
-  // Through the master node (post-pan) so the pilot's volume offset trims the
-  // voice exactly as it does the tone — the firmware applies master to both.
-  src.connect(pan).connect(masterGainNode);
+  // Through the voice-volume node (post-pan) so the pilot's voice offset trims the
+  // callouts, exactly like audio_set_voice_db() on the box.
+  src.connect(pan).connect(voiceVolNode);
   src.start();
 
   // Register this clip as the active sidechain source: the frame loop reads its
@@ -1207,11 +1371,11 @@ function frame(ts) {
       // Steady baseline tone trim while callouts are enabled (TONE_TRIM_WITH_VOICE
       // _DB): holds the tone a touch down for the whole descent so the voice reads
       // clearer over it — exactly audio.c's s_tone_trim (1.0 / no trim otherwise).
-      const toneTrim = modeCallouts ? api.masterGain(api.toneTrimDb()) : 1;
+      const toneTrim = modeCallouts ? api.dbToGain(api.toneTrimDb()) : 1;
 
       // Final tone gain = scheduled gain · flare fade · voice duck · baseline trim,
-      // the same stack of multipliers the firmware applies per sample (the master
-      // volume offset lives on masterGainNode, downstream of this node).
+      // the same stack of multipliers the firmware applies per sample (the pilot's
+      // tone volume offset lives on toneVolNode, downstream of this node).
       toneGainNode.gain.setTargetAtTime(
         api.toneGain(toneAgl) * flareFade * duckCur * toneTrim, now, 0.01);
     } else {
@@ -1289,9 +1453,11 @@ function updateTelemetry(st, toneAgl, toneOn, pollMs) {
   document.getElementById('capValTelem').textContent =
     (!isFinite(startAltFt) || startAltFt >= capTop) ? 'all' : `${Math.round(startAltFt)} ft`;
 
-  // Master volume offset (0 dB == full).
-  document.getElementById('volValTelem').textContent =
-    volumeDb >= 0 ? 'full' : `${volumeDb} dB`;
+  // Independent tone + voice offsets (0 dB == flat/full). Shown compactly as
+  // "T <tone> · V <voice>".
+  const tStr = toneVolDb  === 0 ? '0' : `${toneVolDb > 0 ? '+' : ''}${toneVolDb}`;
+  const vStr = voiceVolDb === 0 ? '0' : `${voiceVolDb}`;
+  document.getElementById('volValTelem').textContent = `T ${tStr} · V ${vStr} dB`;
 }
 
 /* =============================================================================

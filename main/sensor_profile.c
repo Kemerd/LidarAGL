@@ -14,23 +14,23 @@
 /* ---------------------------------------------------------------------------
  *  SF30/C callout ladder (descending).
  *
- *  Highest callout is 200 ft on purpose: the SF30/C ceiling is ~328 ft, so a
- *  300 ft callout would sit inside the sensor's noisy upper margin. Starting at
- *  200 gives the sensor headroom and keeps every spoken number trustworthy.
+ *  Highest callout is 305 ft on purpose: the SF30/C ceiling is ~328 ft, so a
+ *  328 ft callout would sit inside the sensor's noisy upper margin. Starting at
+ *  305 gives the sensor headroom and keeps every spoken number trustworthy.
  * ------------------------------------------------------------------------- */
 static const float SF30C_CALLOUTS[] = {
-    200.0f, 100.0f, 50.0f, 40.0f, 30.0f, 20.0f, 10.0f
+    300.0f, 200.0f, 100.0f, 50.0f, 40.0f, 30.0f, 20.0f, 10.0f
 };
 
 /* ---------------------------------------------------------------------------
  *  SF30/D callout ladder (descending).
  *
- *  The SF30/D reaches ~656 ft, so it adds the 500/400/300 ft high-altitude
+ *  The SF30/D reaches ~656 ft, so it adds the 600/500/400/300 ft high-altitude
  *  callouts requested for the long-range unit, then shares the same flare-band
  *  numbers as the SF30/C below 200 ft.
  * ------------------------------------------------------------------------- */
 static const float SF30D_CALLOUTS[] = {
-    500.0f, 400.0f, 300.0f, 200.0f, 100.0f, 50.0f, 40.0f, 30.0f, 20.0f, 10.0f
+    600.0f, 500.0f, 400.0f, 300.0f, 200.0f, 100.0f, 50.0f, 40.0f, 30.0f, 20.0f, 10.0f
 };
 
 /* ---- The immutable profiles --------------------------------------------- */
@@ -41,7 +41,7 @@ const sensor_profile_t SF30C_PROFILE = {
     .max_range_ft = 328.0f,                 /* 100 m                          */
     .callouts     = SF30C_CALLOUTS,
     .n_callouts   = sizeof(SF30C_CALLOUTS) / sizeof(SF30C_CALLOUTS[0]),
-    .cruise_ft    = 250.0f,                 /* margin below the 328 ft ceiling */
+    .cruise_ft    = 305.0f,                 /* margin below the 328 ft ceiling */
 };
 
 const sensor_profile_t SF30D_PROFILE = {
@@ -50,7 +50,7 @@ const sensor_profile_t SF30D_PROFILE = {
     .max_range_ft = 656.0f,                 /* 200 m                          */
     .callouts     = SF30D_CALLOUTS,
     .n_callouts   = sizeof(SF30D_CALLOUTS) / sizeof(SF30D_CALLOUTS[0]),
-    .cruise_ft    = 500.0f,                 /* sleep above the top callout     */
+    .cruise_ft    = 605.0f,                 /* sleep above the top callout     */
 };
 
 /* ---- Selectors ----------------------------------------------------------- */

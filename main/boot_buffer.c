@@ -194,27 +194,27 @@ void config_wipe_start_alt(void)
     ESP_LOGW(TAG, "start-altitude wiped (will use profile default)");
 }
 
-/* ---- Master volume offset (dB, layered on the analog pot) ---------------- */
+/* ---- Voice volume offset (dB cut, layered on the analog pot) ------------- */
 
-float config_load_volume_offset(void)
+float config_load_voice_volume(void)
 {
     /* Stored as a u8 CUT magnitude (|dB|): 0 == no cut, 6 == -6 dB. Absent /
      * unreadable / out-of-range -> the default (0 dB), so a bad value can never
-     * silence the box or push it louder than the schedule intends.            */
+     * silence the callouts.                                                     */
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
-        return DEFAULT_VOLUME_OFFSET_DB;
+        return DEFAULT_VOICE_VOLUME_DB;
     }
     uint8_t cut = 0;
     esp_err_t err = nvs_get_u8(h, NVS_KEY_VOLOFS, &cut);
     nvs_close(h);
     if (err != ESP_OK) {
-        return DEFAULT_VOLUME_OFFSET_DB;
+        return DEFAULT_VOICE_VOLUME_DB;
     }
     /* Convert the magnitude back to a (negative) offset and clamp to the floor. */
     float db = -(float)cut;
-    if (db < VOLUME_OFFSET_DB_MIN) {
-        db = VOLUME_OFFSET_DB_MIN;
+    if (db < VOICE_VOLUME_DB_MIN) {
+        db = VOICE_VOLUME_DB_MIN;
     }
     if (db > 0.0f) {
         db = 0.0f;
@@ -222,32 +222,32 @@ float config_load_volume_offset(void)
     return db;
 }
 
-void config_save_volume_offset(float db)
+void config_save_voice_volume(float db)
 {
-    /* Clamp to [VOLUME_OFFSET_DB_MIN, 0], then store the rounded CUT magnitude. */
+    /* Clamp to [VOICE_VOLUME_DB_MIN, 0], then store the rounded CUT magnitude. */
     if (db > 0.0f) {
         db = 0.0f;
     }
-    if (db < VOLUME_OFFSET_DB_MIN) {
-        db = VOLUME_OFFSET_DB_MIN;
+    if (db < VOICE_VOLUME_DB_MIN) {
+        db = VOICE_VOLUME_DB_MIN;
     }
-    uint8_t cut = (uint8_t)(-db + 0.5f);    /* -3 dB -> 3 */
+    uint8_t cut = (uint8_t)(-db + 0.5f);    /* -4 dB -> 4 */
 
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_open failed; volume offset not persisted");
+        ESP_LOGE(TAG, "nvs_open failed; voice volume not persisted");
         return;
     }
     if (nvs_set_u8(h, NVS_KEY_VOLOFS, cut) == ESP_OK) {
         nvs_commit(h);
-        ESP_LOGI(TAG, "volume offset saved: -%u dB", cut);
+        ESP_LOGI(TAG, "voice volume saved: -%u dB", cut);
     } else {
-        ESP_LOGE(TAG, "nvs_set_u8 failed; volume offset not persisted");
+        ESP_LOGE(TAG, "nvs_set_u8 failed; voice volume not persisted");
     }
     nvs_close(h);
 }
 
-void config_wipe_volume_offset(void)
+void config_wipe_voice_volume(void)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
@@ -255,7 +255,71 @@ void config_wipe_volume_offset(void)
         nvs_commit(h);
         nvs_close(h);
     }
-    ESP_LOGW(TAG, "volume offset wiped (will use 0 dB)");
+    ESP_LOGW(TAG, "voice volume wiped (will use 0 dB)");
+}
+
+/* ---- Tone volume offset (dB, SIGNED — can cut OR boost) ------------------ */
+
+float config_load_tone_volume(void)
+{
+    /* Stored SIGNED as an i8 of dB (e.g. -4 or +4). Absent / unreadable -> the
+     * default (0 dB). The value is clamped to the legal range so a corrupt entry
+     * can never push the tone past its menu limits.                            */
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return DEFAULT_TONE_VOLUME_DB;
+    }
+    int8_t raw = 0;
+    esp_err_t err = nvs_get_i8(h, NVS_KEY_TONEVOL, &raw);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return DEFAULT_TONE_VOLUME_DB;
+    }
+    float db = (float)raw;
+    if (db < TONE_VOLUME_DB_MIN) {
+        db = TONE_VOLUME_DB_MIN;
+    }
+    if (db > TONE_VOLUME_DB_MAX) {
+        db = TONE_VOLUME_DB_MAX;
+    }
+    return db;
+}
+
+void config_save_tone_volume(float db)
+{
+    /* Clamp to [TONE_VOLUME_DB_MIN, TONE_VOLUME_DB_MAX], then store as signed i8.
+     * Round toward nearest, handling the negative side symmetrically.           */
+    if (db < TONE_VOLUME_DB_MIN) {
+        db = TONE_VOLUME_DB_MIN;
+    }
+    if (db > TONE_VOLUME_DB_MAX) {
+        db = TONE_VOLUME_DB_MAX;
+    }
+    int8_t val = (int8_t)(db >= 0.0f ? db + 0.5f : db - 0.5f);
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed; tone volume not persisted");
+        return;
+    }
+    if (nvs_set_i8(h, NVS_KEY_TONEVOL, val) == ESP_OK) {
+        nvs_commit(h);
+        ESP_LOGI(TAG, "tone volume saved: %+d dB", val);
+    } else {
+        ESP_LOGE(TAG, "nvs_set_i8 failed; tone volume not persisted");
+    }
+    nvs_close(h);
+}
+
+void config_wipe_tone_volume(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, NVS_KEY_TONEVOL);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "tone volume wiped (will use 0 dB)");
 }
 
 /* ---- Load / commit ------------------------------------------------------- */

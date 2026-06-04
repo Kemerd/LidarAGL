@@ -425,18 +425,32 @@
         </p>
       </div>
 
-      <!-- Master volume offset (LEVEL 3 of the firmware menu). A trim on top of
-           the analog pot that lowers tone + voice together. Dragging it auditions
-           the level by ear as "tone .. number .. tone", just like the box. -->
-      <div class="cap-row" id="volRow">
+      <!-- TONE volume (LEVEL 3 of the firmware menu): "Volume Adjustment, Tone
+           Only". A trim on top of the analog pot that can CUT or BOOST the presence
+           tone only. Dragging it auditions the tone by ear, just like the box. -->
+      <div class="cap-row" id="toneVolRow">
         <div class="cap-head">
-          <span class="config-group-label" style="margin:0;">Volume adjustment</span>
-          <span class="cap-val" id="volVal">—</span>
+          <span class="config-group-label" style="margin:0;">Tone volume</span>
+          <span class="cap-val" id="toneVolVal">—</span>
         </div>
-        <input type="range" id="volRange" min="0" max="0" step="1" value="0" />
+        <input type="range" id="toneVolRange" min="0" max="0" step="1" value="0" />
         <p class="cap-hint">
-          Master trim layered on the analog volume pot — lowers the tone and the
-          voice together (0&nbsp;dB to −6&nbsp;dB). Drag to audition each level.
+          Trim on the presence tone only — cut or boost (−6&nbsp;dB to +6&nbsp;dB).
+          Drag to audition each level.
+        </p>
+      </div>
+
+      <!-- VOICE volume (LEVEL 4 of the firmware menu): "Volume Adjustment, Callouts
+           Only". A cut-only trim on the spoken callouts. Auditions one number. -->
+      <div class="cap-row" id="voiceVolRow">
+        <div class="cap-head">
+          <span class="config-group-label" style="margin:0;">Voice volume</span>
+          <span class="cap-val" id="voiceVolVal">—</span>
+        </div>
+        <input type="range" id="voiceVolRange" min="0" max="0" step="1" value="0" />
+        <p class="cap-hint">
+          Trim on the spoken callouts only — cut only (0&nbsp;dB to −6&nbsp;dB).
+          Drag to audition each level.
         </p>
       </div>
 

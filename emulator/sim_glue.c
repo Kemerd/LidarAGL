@@ -308,29 +308,67 @@ float sim_tone_harmonic2(void) { return TONE_HARMONIC2_LVL; }
 EMSCRIPTEN_KEEPALIVE
 float sim_mix_lpf_fc(void) { return MIX_LPF_FC_HZ; }
 
-/* ---- Master volume offset (boot config menu) ------------------------------ */
-/*  The pilot's master trim, layered on the analog pot, that attenuates the WHOLE
- *  mix (tone + voice). These getters hand the SAME range/step/default the firmware
- *  config menu cycles so the emulator's volume control and audio graph match the
- *  hardware exactly. db_to_gain() converts a chosen offset to the linear master
- *  gain the WebAudio master node should use.                                     */
+/* ---- Independent tone + voice volume offsets (boot config menu) ------------ */
+/*  The pilot's two trims, layered on the analog pot: the TONE offset (cut OR boost)
+ *  and the VOICE offset (cut only). These getters hand the SAME ranges/steps/
+ *  defaults the firmware config menu cycles so the emulator's two volume controls
+ *  and audio graph match the hardware exactly. The *_gain helpers convert a chosen
+ *  offset to the linear gain the matching WebAudio node should use, clamping to the
+ *  same limits audio_set_tone_db / audio_set_voice_db enforce on the box.         */
 
-/** @brief Deepest cut the volume menu offers, in dB (VOLUME_OFFSET_DB_MIN). */
+/** @brief Deepest TONE cut the menu offers, in dB (TONE_VOLUME_DB_MIN). */
 EMSCRIPTEN_KEEPALIVE
-float sim_volume_offset_db_min(void) { return VOLUME_OFFSET_DB_MIN; }
+float sim_tone_volume_db_min(void) { return TONE_VOLUME_DB_MIN; }
 
-/** @brief Step between volume settings, in dB (VOLUME_OFFSET_DB_STEP). */
+/** @brief Loudest TONE boost the menu offers, in dB (TONE_VOLUME_DB_MAX). */
 EMSCRIPTEN_KEEPALIVE
-float sim_volume_offset_db_step(void) { return VOLUME_OFFSET_DB_STEP; }
+float sim_tone_volume_db_max(void) { return TONE_VOLUME_DB_MAX; }
 
-/** @brief Default volume offset applied until the pilot lowers it (0 dB). */
+/** @brief Step between TONE volume settings, in dB (TONE_VOLUME_DB_STEP). */
 EMSCRIPTEN_KEEPALIVE
-float sim_default_volume_offset_db(void) { return DEFAULT_VOLUME_OFFSET_DB; }
+float sim_tone_volume_db_step(void) { return TONE_VOLUME_DB_STEP; }
 
-/** @brief Linear master gain for a given offset dB — the SAME db_to_gain() the
- *         firmware applies, so the sim's master node tracks the hardware 1:1. */
+/** @brief Default TONE offset until the pilot moves it (0 dB). */
 EMSCRIPTEN_KEEPALIVE
-float sim_master_gain(float db) { return db_to_gain(db > 0.0f ? 0.0f : db); }
+float sim_default_tone_volume_db(void) { return DEFAULT_TONE_VOLUME_DB; }
+
+/** @brief Deepest VOICE cut the menu offers, in dB (VOICE_VOLUME_DB_MIN). */
+EMSCRIPTEN_KEEPALIVE
+float sim_voice_volume_db_min(void) { return VOICE_VOLUME_DB_MIN; }
+
+/** @brief Step between VOICE volume settings, in dB (VOICE_VOLUME_DB_STEP). */
+EMSCRIPTEN_KEEPALIVE
+float sim_voice_volume_db_step(void) { return VOICE_VOLUME_DB_STEP; }
+
+/** @brief Default VOICE offset until the pilot lowers it (0 dB). */
+EMSCRIPTEN_KEEPALIVE
+float sim_default_voice_volume_db(void) { return DEFAULT_VOICE_VOLUME_DB; }
+
+/** @brief Linear TONE gain for an offset dB — clamped + db_to_gain()'d exactly like
+ *         audio_set_tone_db(), so the sim's tone node tracks the hardware 1:1. */
+EMSCRIPTEN_KEEPALIVE
+float sim_tone_volume_gain(float db)
+{
+    if (db < TONE_VOLUME_DB_MIN) db = TONE_VOLUME_DB_MIN;
+    if (db > TONE_VOLUME_DB_MAX) db = TONE_VOLUME_DB_MAX;
+    return db_to_gain(db);
+}
+
+/** @brief Linear VOICE gain for an offset dB — clamped (cut-only) + db_to_gain()'d
+ *         exactly like audio_set_voice_db(), so the voice node matches the box. */
+EMSCRIPTEN_KEEPALIVE
+float sim_voice_volume_gain(float db)
+{
+    if (db > 0.0f) db = 0.0f;
+    if (db < VOICE_VOLUME_DB_MIN) db = VOICE_VOLUME_DB_MIN;
+    return db_to_gain(db);
+}
+
+/** @brief Generic dB -> linear gain (the firmware's db_to_gain, UNCLAMPED). Used by
+ *         the sim for the preview-burst level and the steady tone trim, where the
+ *         value is an intrinsic level rather than a clamped pilot offset. */
+EMSCRIPTEN_KEEPALIVE
+float sim_db_to_gain(float db) { return db_to_gain(db); }
 
 /* ---- Volume-preview tone (config menu) ------------------------------------ */
 /*  The "tone .. number .. tone" preview the volume menu plays at each step. The

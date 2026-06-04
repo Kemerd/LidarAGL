@@ -39,6 +39,7 @@ DECLARE_CLIP(_binary_two_hundred_pcm);
 DECLARE_CLIP(_binary_three_hundred_pcm);
 DECLARE_CLIP(_binary_four_hundred_pcm);
 DECLARE_CLIP(_binary_five_hundred_pcm);
+DECLARE_CLIP(_binary_six_hundred_pcm);
 DECLARE_CLIP(_binary_calibration_error_pcm);
 /*  Spoken instruction played right after the calibration-error chirp: the chirp
  *  grabs attention, this voice line tells the pilot what to do.                 */
@@ -104,6 +105,7 @@ static void build_manifest(void)
     s_clips[CO_THREE_HUNDRED] = make_clip(_binary_three_hundred_pcm_start, _binary_three_hundred_pcm_end, "three hundred");
     s_clips[CO_FOUR_HUNDRED]  = make_clip(_binary_four_hundred_pcm_start,  _binary_four_hundred_pcm_end,  "four hundred");
     s_clips[CO_FIVE_HUNDRED]  = make_clip(_binary_five_hundred_pcm_start,  _binary_five_hundred_pcm_end,  "five hundred");
+    s_clips[CO_SIX_HUNDRED]   = make_clip(_binary_six_hundred_pcm_start,   _binary_six_hundred_pcm_end,   "six hundred");
 
     s_chirp       = make_clip(_binary_calibration_error_pcm_start, _binary_calibration_error_pcm_end, "calib error");
     s_calib_voice = make_clip(_binary_please_reset_unit_on_the_ground_pcm_start,
@@ -194,6 +196,7 @@ callout_id_t callout_id_for_ft(float ft)
         case 300: return CO_THREE_HUNDRED;
         case 400: return CO_FOUR_HUNDRED;
         case 500: return CO_FIVE_HUNDRED;
+        case 600: return CO_SIX_HUNDRED;
         default:  return CO_COUNT;     /* no clip for this height */
     }
 }
