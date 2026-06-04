@@ -47,10 +47,16 @@ idf_component_register(
     INCLUDE_DIRS
         "."
     REQUIRES
-        driver          # i2s_std, uart, gpio
-        nvs_flash       # boot-buffer persistence
-        esp_pm          # automatic light-sleep
-        esp_timer       # microsecond timing for dt / poll cadence
+        #  ESP-IDF v6 split the monolithic 'driver' component into one component
+        #  per peripheral and now strictly enforces that each <driver/xxx.h> we
+        #  include lists its OWNING component here (a bare "driver" no longer
+        #  pulls them in transitively). The three peripherals main actually uses:
+        esp_driver_i2s   # driver/i2s_std.h — PCM5102A I2S audio output
+        esp_driver_gpio  # driver/gpio.h    — DAC mute / status / config pins
+        esp_driver_uart  # driver/uart.h    — SF30 LiDAR serial link
+        nvs_flash        # boot-buffer persistence
+        esp_pm           # automatic light-sleep
+        esp_timer        # microsecond timing for dt / poll cadence
     EMBED_FILES
         ${CLIP_FILES}
 )
