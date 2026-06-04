@@ -344,6 +344,7 @@ class BenchApp(ctk.CTk):
             self.connect_btn.configure(text="Connect")
             self._set_status("disconnected", DANGER)
             self.sim_active = False
+            self._set_bench_real(False)     # restore the manual tape
             return
         port = self._selected_port()
         if not port:
@@ -398,7 +399,8 @@ class BenchApp(ctk.CTk):
         self._set_status("rebooting to config…", WARN)
 
     def _on_slider(self, value):
-        if self._slider_guard:
+        # Locked out in bench-real mode: the tape mirrors the real sensor there.
+        if self._slider_guard or self.bench_real_active:
             return
         # Hand flying: take over from any running ILS.
         self.model.mode = "manual"
@@ -474,6 +476,7 @@ class BenchApp(ctk.CTk):
                 # running so any later reboot (e.g. after a config commit) is
                 # caught straight back into sim with no user action.
                 self.sim_active = True
+                self._set_bench_real(False)     # back to the fabricated stream
                 self._set_status("SIM ACTIVE", GOOD)
                 self.sim_state_lbl.configure(text="sim mode active",
                                              text_color=GOOD)
@@ -481,14 +484,28 @@ class BenchApp(ctk.CTk):
                 # Real-sensor scaled debug armed: the board reads its own LiDAR and
                 # has dropped its USB-JTAG driver, so stop BOTH the attach spam and
                 # the sim stream (further writes would just time out) and reflect
-                # the mode. The device's own "bench: raw=… -> … ft" lines now show
-                # on the log so you can confirm the sensor is talking.
+                # the mode. The device's own "bench: -> N ft" lines now drive the
+                # altitude tape (see the parse below + the AGL read-out in _tick).
                 self.sim_active = False
                 self.ctrl.stop_attach()
                 self.engine.stop()
+                self._set_bench_real(True)      # tape mirrors the real sensor
                 self._set_status("BENCH REAL SENSOR", GOOD)
                 self.sim_state_lbl.configure(text="real sensor — scaled debug",
                                              text_color=GOOD)
+            elif "bench: " in line:
+                # Device's own bench-debug lines. The compact "... -> N ft" form
+                # (and the verbose breakdown, which also ends "-> N ft") carry the
+                # scaled AGL that drives the tape; a "no sensor data" line means the
+                # LiDAR is silent, so drop the tape to 0 to make that obvious.
+                if "-> " in line:
+                    try:
+                        self.bench_agl_ft = float(
+                            line.split("-> ", 1)[1].split(" ft", 1)[0])
+                    except (IndexError, ValueError):
+                        pass
+                elif "no sensor data" in line:
+                    self.bench_agl_ft = 0.0
             elif "config committed" in line:
                 self.sim_active = False
                 self._set_status("config saved — re-entering sim…", WARN)
@@ -498,11 +515,18 @@ class BenchApp(ctk.CTk):
                     self._set_status("re-attaching…", WARN)
             drained += 1
 
-        # Update the AGL read-out; reflect a running ILS on the tape.
-        agl = self.engine.last_agl_ft
-        self.agl_value.configure(text="%d" % int(round(agl)))
-        if self.model.is_ils_running():
+        # Update the AGL read-out. In bench-real mode the device IS the source of
+        # truth, so the tape mirrors its scaled reading; otherwise it follows the
+        # sim engine (and a running ILS drives the tape).
+        if self.bench_real_active:
+            agl = self.bench_agl_ft
+            self.agl_value.configure(text="%d" % int(round(agl)))
             self._set_slider(agl)
+        else:
+            agl = self.engine.last_agl_ft
+            self.agl_value.configure(text="%d" % int(round(agl)))
+            if self.model.is_ils_running():
+                self._set_slider(agl)
 
         self.after(100, self._tick)
 
@@ -523,6 +547,15 @@ class BenchApp(ctk.CTk):
             self.alt_slider.set(max(0.0, min(ALT_MAX_FT, ft)))
         finally:
             self._slider_guard = False
+
+    def _set_bench_real(self, active):
+        # Toggle bench-real mode: the tape becomes a read-only mirror of the
+        # device's scaled reading, so lock (or restore) the manual slider.
+        self.bench_real_active = active
+        try:
+            self.alt_slider.configure(state="disabled" if active else "normal")
+        except Exception:                       # pragma: no cover (widget quirk)
+            pass
 
     def _set_status(self, text, color):
         self.status_lbl.configure(text=text)

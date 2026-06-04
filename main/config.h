@@ -501,7 +501,9 @@
  *  whole 0..400 ft band (boot distance == 0 ft AGL, +5 ft == ~400 ft AGL).
  *  Runtime-only and never persisted, exactly like sim mode.                     */
 #define BENCH_SCALE_GAIN     80.0f   /* AGL feet produced per real foot above ground */
-#define BENCH_DEBUG_LOG_MS   250     /* min gap between bench raw-reading log lines   */
+#define BENCH_TAPE_LOG_MS    100     /* fast, compact "bench: -> N ft" value cadence  */
+                                     /* (the host altitude tape tracks THIS line)     */
+#define BENCH_DEBUG_LOG_MS   750     /* slower verbose raw/ground/agl breakdown line  */
 
 /* ---- FreeRTOS task stacks (BYTES in ESP-IDF) & priorities ---------------- */
 #define SENSOR_TASK_STACK 3072

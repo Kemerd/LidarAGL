@@ -701,15 +701,23 @@ static void logic_task(void *arg)
          * is logged (throttled) so the dev can confirm the LiDAR is streaming.
          * Armed only for an OP_BENCH_REAL boot; a flight build never enters here. */
         if (s_bench_scale) {
-            static int64_t s_bench_log_us = 0;   /* logic task is single-threaded */
-            if (now_us - s_bench_log_us >= (int64_t)BENCH_DEBUG_LOG_MS * 1000) {
-                s_bench_log_us = now_us;
+            float scaled = agl * BENCH_SCALE_GAIN;
+            /* Fast, compact value line — the host altitude tape parses THIS, so it
+             * tracks smoothly without drowning the human log in the full breakdown.*/
+            static int64_t s_tape_log_us = 0;    /* logic task is single-threaded  */
+            if (now_us - s_tape_log_us >= (int64_t)BENCH_TAPE_LOG_MS * 1000) {
+                s_tape_log_us = now_us;
+                ESP_LOGI(TAG, "bench: -> %.0f ft", (double)scaled);
+            }
+            /* Slower, verbose breakdown for eyeballing raw/ground/agl + liveness. */
+            static int64_t s_dbg_log_us = 0;
+            if (now_us - s_dbg_log_us >= (int64_t)BENCH_DEBUG_LOG_MS * 1000) {
+                s_dbg_log_us = now_us;
                 ESP_LOGI(TAG, "bench: raw=%.2f ft  ground=%.2f ft  agl=%.2f ft -> %.0f ft%s  seq=%u",
                          (double)s.range_ft, (double)s_ground_ref_ft, (double)agl,
-                         (double)(agl * BENCH_SCALE_GAIN), s.valid ? "" : " (HOLD)",
-                         (unsigned)s.seq);
+                         (double)scaled, s.valid ? "" : " (HOLD)", (unsigned)s.seq);
             }
-            agl *= BENCH_SCALE_GAIN;
+            agl = scaled;
         }
 
         sm_out_t out;
@@ -758,9 +766,22 @@ static void logic_task(void *arg)
         audio_set_params(out.tone_agl, out.tone_active, out.vert_fps);
         g_poll_period_ms = poll_profile_to_ms(out.poll);
 
+        /* Bench real-sensor debug: keep the sensor draining briskly. GROUND/CRUISE
+         * normally relax the poll to ~750 ms, which makes the live readout look
+         * frozen between updates — cap it so the tape tracks the LiDAR in real time.*/
+        if (s_bench_scale && g_poll_period_ms > SIM_POLL_MS) {
+            g_poll_period_ms = SIM_POLL_MS;
+        }
+
         /* Light-sleep policy: allowed only in GROUND/CRUISE, where the tone is
          * silent. Suspend the I2S channel before sleeping, resume on exit.    */
         bool sleep_allowed = (out.state == ST_GROUND || out.state == ST_CRUISE);
+
+        /* Never light-sleep on the bench: sleeping gates the UART/poll cadence and
+         * makes the live altitude stutter. Stay awake + fast for responsive testing.*/
+        if (s_bench_scale) {
+            sleep_allowed = false;
+        }
         if (sleep_allowed && !sleep_allowed_prev) {
             audio_suspend();
         } else if (!sleep_allowed && sleep_allowed_prev) {
