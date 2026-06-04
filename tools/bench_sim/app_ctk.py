@@ -46,6 +46,12 @@ class BenchApp(ctk.CTk):
         self.sim_active = False
         self._slider_guard = False     # suppress slider callback during sync
 
+        # Bench REAL-sensor mode: when active the altitude tape MIRRORS the device's
+        # own (scaled) reading parsed off the log, and the manual slider is locked —
+        # there's nothing to hand-fly, the real LiDAR is the source of truth.
+        self.bench_real_active = False
+        self.bench_agl_ft = 0.0
+
         # --- window ----------------------------------------------------------
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
