@@ -17,6 +17,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include "sensor_profile.h"
 
 /**
@@ -64,5 +65,48 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid);
  *          by the state/voice path.
  */
 void sensor_task(void *arg);
+
+/* ===========================================================================
+ *  Bench HIL simulation (USB-Serial-JTAG side-door)
+ * ---------------------------------------------------------------------------
+ *  In sim mode the read path drains a SIMULATED LWNX stream from the native
+ *  USB-Serial-JTAG instead of UART1, feeding the SAME parser/CRC/distance decode
+ *  so the host's frames exercise the real production path. Runtime-only: nothing
+ *  is persisted, so a power cycle returns to the real sensor. See config.h and
+ *  the tools/bench_sim Python app.
+ * ===========================================================================*/
+
+/**
+ * @brief Enter bench simulation mode (install the USB-Serial-JTAG driver and
+ *        flip the read source to it). Idempotent.
+ */
+void sf30c_sim_enable(void);
+
+/** @brief True while bench simulation mode is active. */
+bool sf30c_sim_active(void);
+
+/**
+ * @brief Callback invoked when a BENCH_CTRL frame is decoded on the sim stream.
+ *
+ * @param opcode  OP_* control opcode (payload byte 0).
+ * @param arg     Remaining payload bytes (little-endian args), or NULL.
+ * @param arglen  Number of arg bytes.
+ *
+ * @note Runs in whichever task drains the stream (the boot/menu pump, or the
+ *       sensor task once running). Keep it short.
+ */
+typedef void (*sf30c_bench_ctrl_cb_t)(uint8_t opcode, const uint8_t *arg, size_t arglen);
+
+/** @brief Register the bench-control callback (see sf30c_bench_ctrl_cb_t). */
+void sf30c_set_bench_ctrl_cb(sf30c_bench_ctrl_cb_t cb);
+
+/**
+ * @brief Drain the sim stream once (non-blocking): feed the parser and dispatch
+ *        any BENCH_CTRL frames via the registered callback.
+ *
+ * @details Lets boot-time code and the config menu pump control frames before
+ *          the sensor task exists. Distance frames are parsed but ignored here.
+ */
+void sf30c_sim_read_drain(void);
 
 #endif /* LIDARAGL_SF30C_H */

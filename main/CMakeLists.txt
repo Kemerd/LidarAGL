@@ -54,6 +54,7 @@ idf_component_register(
         esp_driver_i2s   # driver/i2s_std.h — PCM5102A I2S audio output
         esp_driver_gpio  # driver/gpio.h    — DAC mute / status / config pins
         esp_driver_uart  # driver/uart.h    — SF30 LiDAR serial link
+        esp_driver_usb_serial_jtag  # driver/usb_serial_jtag.h — bench HIL side-door
         nvs_flash        # boot-buffer persistence
         esp_pm           # automatic light-sleep
         esp_timer        # microsecond timing for dt / poll cadence

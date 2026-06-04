@@ -318,6 +318,34 @@
 #define NVS_KEY_STARTALT  "startalt"   /* u16: callout start-altitude cap in ft   */
 #define NVS_KEY_VOLOFS    "volofs"     /* u8: master volume CUT magnitude in dB    */
 
+/* ---- Bench HIL simulation (USB-Serial-JTAG side-door) -------------------- */
+/*  A developer can bench-test THIS firmware with headphones and NO LiDAR fitted
+ *  by streaming byte-accurate SF30/C LWNX frames into the native USB-Serial-JTAG
+ *  from the tools/bench_sim Python app. A runtime flag (NEVER persisted — so a
+ *  unit can't accidentally ship in sim mode) swaps the sensor read path from
+ *  UART1 to the USB-Serial-JTAG; everything downstream is the real decode chain.
+ *
+ *  At boot we briefly listen for a bench "hello": if a USB host is on the bus we
+ *  wait up to SIM_ATTACH_WINDOW_MS for it, but if nothing is plugged in (no USB
+ *  SOF) we bail after SIM_ATTACH_GRACE_MS so a normal/flight boot is barely
+ *  delayed and the console is left exactly as it was.                           */
+#define SIM_USJ_RX_BUF        1024   /* USJ driver RX ring (>= one frame @ ~78 Hz) */
+#define SIM_USJ_TX_BUF        256    /* unused by us, but the driver requires > 0  */
+#define SIM_ATTACH_GRACE_MS   400    /* fast-bail a normal boot when no USB host    */
+#define SIM_ATTACH_WINDOW_MS  2500   /* max wait for a hello while a host IS present*/
+
+/*  Custom LWNX command id for host->device bench control. Reuses the LWNX frame
+ *  + CRC so the device validates it with the same parser; the value sits safely
+ *  outside LightWare's well-known set (0/29/30/44/76, see lwnx.h).              */
+#define LWNX_CMD_BENCH_CTRL   200u
+/*  Bench-control opcodes (carried in payload[0]). Mirrored byte-for-byte in
+ *  tools/bench_sim/protocol.py.                                                  */
+#define OP_HELLO          0x01u   /* attach: enter sim mode this boot             */
+#define OP_ENTER_CONFIG   0x10u   /* attach + run the boot config menu this boot  */
+#define OP_REBOOT         0x11u   /* esp_restart(); the host re-attaches after    */
+#define OP_MENU_NEXT      0x20u   /* config menu: single-tap (cycle a selection)  */
+#define OP_MENU_CONFIRM   0x21u   /* config menu: double-tap (confirm a selection)*/
+
 /* ---- FreeRTOS task stacks (BYTES in ESP-IDF) & priorities ---------------- */
 #define SENSOR_TASK_STACK 3072
 #define LOGIC_TASK_STACK  4096

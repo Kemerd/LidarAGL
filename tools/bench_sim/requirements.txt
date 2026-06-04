@@ -1,0 +1,4 @@
+# LidarAGL bench-sim tool dependencies.
+#   pip install -r tools/bench_sim/requirements.txt
+pyserial>=3.5
+customtkinter>=5.2

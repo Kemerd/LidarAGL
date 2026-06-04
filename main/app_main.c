@@ -42,6 +42,8 @@
 #include "esp_timer.h"
 #include "esp_pm.h"
 #include "esp_system.h"   /* esp_restart() — config menu reboot */
+#include "driver/usb_serial_jtag.h"  /* bench HIL: read the sim stream from USB  */
+#include "lwnx.h"                     /* bench HIL: parse bench-control frames    */
 
 static const char *TAG = "app";
 
@@ -62,6 +64,10 @@ static float s_ground_ref_ft = MOUNT_OFFSET_FALLBACK_FT;
  *  during boot from the saved config; defaults to the profile's top callout, so
  *  the behaviour is unchanged unless the pilot lowers it in the config menu.    */
 static float s_start_alt_ft = 0.0f;   /* 0 == uncapped until boot sets it       */
+
+/*  Bench HIL: set during the boot attach probe when the connected bench tool
+ *  asked to open the config menu this boot. Runtime-only (never persisted).      */
+static volatile bool s_sim_want_config = false;
 
 /* ---- LWNX update-rate code per poll profile ------------------------------ */
 /*  The binary update-rate code (cmd 76). We keep the sensor at a brisk rate in
@@ -142,12 +148,66 @@ typedef enum {
     TAP_TIMEOUT,    /* CONFIG_COMMIT_MS elapsed with no tap (confirm)            */
 } tap_event_t;
 
+/* ---------------------------------------------------------------------------
+ *  Bench HIL: control-frame handling + serial-driven config-menu navigation.
+ *
+ *  Control frames (LWNX_CMD_BENCH_CTRL) decoded on the sim stream are dispatched
+ *  here. OP_REBOOT restarts immediately; the menu opcodes are latched into
+ *  s_sim_tap for sim_wait_tap_event() to consume, so the boot config menu can be
+ *  driven entirely over serial with the same tap / double-tap / timeout
+ *  semantics as the physical button.
+ * ------------------------------------------------------------------------- */
+static volatile tap_event_t s_sim_tap = TAP_NONE;
+
+static void bench_ctrl_handler(uint8_t op, const uint8_t *arg, size_t n)
+{
+    (void)arg;
+    (void)n;
+    switch (op) {
+        case OP_REBOOT:
+            ESP_LOGW(TAG, "sim: reboot requested by bench");
+            vTaskDelay(pdMS_TO_TICKS(50));   /* let the log + DMA flush */
+            esp_restart();                   /* does not return */
+            break;
+        case OP_MENU_NEXT:    s_sim_tap = TAP_SINGLE; break;
+        case OP_MENU_CONFIRM: s_sim_tap = TAP_DOUBLE; break;
+        default: break;
+    }
+}
+
+/*  Bench HIL replacement for wait_tap_event(): pump the sim stream and translate
+ *  the menu opcodes into tap events. CONFIG_COMMIT_MS of silence confirms, just
+ *  like the physical-button path.                                               */
+static tap_event_t sim_wait_tap_event(int *idle_ms)
+{
+    for (;;) {
+        sf30c_sim_read_drain();              /* may latch s_sim_tap via the cb */
+        if (s_sim_tap != TAP_NONE) {
+            tap_event_t ev = s_sim_tap;
+            s_sim_tap = TAP_NONE;
+            *idle_ms  = 0;
+            return ev;
+        }
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_POLL_MS));
+        *idle_ms += CONFIG_POLL_MS;
+        if (*idle_ms >= CONFIG_COMMIT_MS) {
+            return TAP_TIMEOUT;
+        }
+    }
+}
+
 /*  Wait for the next tap event. Tracks a rolling idle timer for the timeout and,
  *  on a press, opens a short window to see whether a second press makes it a
  *  double-tap. *idle_ms accumulates across calls so the timeout spans the whole
  *  level, not just one call.                                                    */
 static tap_event_t wait_tap_event(int *idle_ms)
 {
+    /* Bench HIL: when running in sim mode the config menu is driven over serial,
+     * not the physical button. */
+    if (sf30c_sim_active()) {
+        return sim_wait_tap_event(idle_ms);
+    }
+
     /* Wait for a rising edge (press), accumulating idle time toward timeout. */
     while (!boot_buffer_button_down()) {
         vTaskDelay(pdMS_TO_TICKS(CONFIG_POLL_MS));
@@ -425,6 +485,68 @@ static void enable_power_management(void)
 }
 
 /* ---------------------------------------------------------------------------
+ *  Bench HIL attach probe (runs once, early in boot).
+ *
+ *  Installs the USB-Serial-JTAG driver and listens for a bench "hello" frame.
+ *  If a USB host is on the bus we wait up to SIM_ATTACH_WINDOW_MS for it; if
+ *  nothing is plugged in (no USB SOF) we bail after SIM_ATTACH_GRACE_MS so a
+ *  normal/flight boot is barely delayed. On no-attach we uninstall the driver so
+ *  the console is left exactly as it was. Returns true if sim mode should be
+ *  entered; sets s_sim_want_config when the host asked to open the config menu.
+ * ------------------------------------------------------------------------- */
+static bool bench_attach_detected(void)
+{
+    if (!usb_serial_jtag_is_driver_installed()) {
+        usb_serial_jtag_driver_config_t cfg = {
+            .tx_buffer_size = SIM_USJ_TX_BUF,
+            .rx_buffer_size = SIM_USJ_RX_BUF,
+        };
+        if (usb_serial_jtag_driver_install(&cfg) != ESP_OK) {
+            return false;
+        }
+    }
+
+    lwnx_parser_t p;
+    lwnx_parser_reset(&p);
+
+    TickType_t start         = xTaskGetTickCount();
+    TickType_t hard_deadline = start + pdMS_TO_TICKS(SIM_ATTACH_WINDOW_MS);
+    bool found = false;
+
+    while (!found && xTaskGetTickCount() < hard_deadline) {
+        uint8_t rx[64];
+        int n = usb_serial_jtag_read_bytes(rx, sizeof rx, pdMS_TO_TICKS(20));
+        for (int i = 0; i < n; ++i) {
+            lwnx_frame_t f;
+            if (lwnx_feed(&p, rx[i], &f) &&
+                f.cmd == LWNX_CMD_BENCH_CTRL && f.plen >= 1) {
+                uint8_t op = f.payload[0];
+                if (op == OP_ENTER_CONFIG) {
+                    s_sim_want_config = true;
+                    found = true;
+                    break;
+                }
+                if (op == OP_HELLO) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        /* Fast-bail a normal boot: if no USB host is on the bus by the grace
+         * point, no bench is attached — don't keep a flight boot waiting.       */
+        if (!found && !usb_serial_jtag_is_connected() &&
+            (xTaskGetTickCount() - start) > pdMS_TO_TICKS(SIM_ATTACH_GRACE_MS)) {
+            break;
+        }
+    }
+
+    if (!found) {
+        usb_serial_jtag_driver_uninstall();   /* restore the pristine console */
+    }
+    return found;
+}
+
+/* ---------------------------------------------------------------------------
  *  app_main
  * ------------------------------------------------------------------------- */
 void app_main(void)
@@ -436,6 +558,15 @@ void app_main(void)
 
     /* 1. NVS + reset-button GPIO. */
     boot_buffer_init();
+
+    /* 1b. Bench HIL: if the tools/bench_sim app is attached over USB, enter the
+     * runtime-only simulation mode — the sensor read path then draws simulated
+     * LWNX frames from USB instead of the (absent) LiDAR. Never persisted, so a
+     * plain power cycle returns the box to the real sensor.                      */
+    if (bench_attach_detected()) {
+        sf30c_set_bench_ctrl_cb(bench_ctrl_handler);
+        sf30c_sim_enable();
+    }
 
     /* Resolve the stored audio configuration (mono/stereo + which streams play).
      * NVS wins at runtime; a missing/corrupt value yields DEFAULT_AUDIO_MODE.   */
@@ -457,7 +588,8 @@ void app_main(void)
      * both up, so the menu can speak prompts and cycle the right callout ladder.
      * run_config_menu() wipes ground + config and never returns (it reboots once
      * the selection commits).                                                    */
-    if (boot_buffer_reset_pressed()) {
+    if (boot_buffer_reset_pressed() ||
+        (sf30c_sim_active() && s_sim_want_config)) {
         run_config_menu();               /* does not return                      */
     }
 

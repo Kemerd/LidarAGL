@@ -17,6 +17,7 @@
 
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -39,10 +40,23 @@ static uint32_t s_seq = 0;
 /*  Persistent LWNX parser (binary mode). */
 static lwnx_parser_t s_parser;
 
+/*  Bench HIL simulation: when set, the read path drains the SIMULATED LWNX
+ *  stream from the USB-Serial-JTAG instead of UART1. Runtime-only (never NVS).  */
+static bool                  s_sim_mode = false;
+static sf30c_bench_ctrl_cb_t s_bench_cb = NULL;
+
 /* ---- UART setup ---------------------------------------------------------- */
 
 void sf30c_init(void)
 {
+    /* Bench sim mode: there is no real sensor on UART1 — the read path pulls
+     * simulated frames from the USB-Serial-JTAG instead. Skip the UART bring-up
+     * entirely (sf30c_sim_enable() already reset the parser).                   */
+    if (s_sim_mode) {
+        ESP_LOGI(TAG, "sim mode: skipping UART1 init (LiDAR not used)");
+        return;
+    }
+
     const uart_config_t cfg = {
         .baud_rate  = SF30C_BAUD,
         .data_bits  = UART_DATA_8_BITS,
@@ -65,6 +79,67 @@ void sf30c_init(void)
     ESP_LOGI(TAG, "UART%d up @ %d 8N1 (RX=%d TX=%d), mode=%s",
              SF30C_UART_NUM, SF30C_BAUD, PIN_SF30C_RX, PIN_SF30C_TX,
              (SF30C_MODE == SF30C_BINARY) ? "BINARY" : "ASCII");
+}
+
+/* ===========================================================================
+ *  Bench HIL simulation (USB-Serial-JTAG side-door)
+ * ---------------------------------------------------------------------------
+ *  sf30c_sim_enable() installs the USB-Serial-JTAG driver purely to READ the
+ *  host's simulated stream; we deliberately do NOT route the console VFS through
+ *  the driver, so ESP_LOG keeps using its default (direct-FIFO) path and logging
+ *  is unchanged. The driver itself takes no power-management lock (the system
+ *  connection-monitor owns the NO_LIGHT_SLEEP lock and follows USB connect /
+ *  disconnect), so installing it never blocks in-flight light-sleep.
+ * ===========================================================================*/
+
+void sf30c_set_bench_ctrl_cb(sf30c_bench_ctrl_cb_t cb)
+{
+    s_bench_cb = cb;
+}
+
+bool sf30c_sim_active(void)
+{
+    return s_sim_mode;
+}
+
+/*  Hand a decoded BENCH_CTRL frame to the registered callback (opcode + args). */
+static void sim_dispatch_frame(const lwnx_frame_t *f)
+{
+    if (f->cmd != LWNX_CMD_BENCH_CTRL || s_bench_cb == NULL) {
+        return;
+    }
+    uint8_t        op   = (f->plen > 0) ? f->payload[0] : 0;
+    const uint8_t *arg  = (f->plen > 1) ? &f->payload[1] : NULL;
+    size_t         alen = (f->plen > 1) ? (f->plen - 1) : 0;
+    s_bench_cb(op, arg, alen);
+}
+
+void sf30c_sim_enable(void)
+{
+    /* Install the RX driver once (idempotent — the boot probe may already have
+     * installed it). We only read with it; console TX stays on its default path.*/
+    if (!usb_serial_jtag_is_driver_installed()) {
+        usb_serial_jtag_driver_config_t cfg = {
+            .tx_buffer_size = SIM_USJ_TX_BUF,
+            .rx_buffer_size = SIM_USJ_RX_BUF,
+        };
+        ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
+    }
+    lwnx_parser_reset(&s_parser);
+    s_sim_mode = true;
+    ESP_LOGW(TAG, "BENCH SIM MODE: reading the LWNX distance stream from USB-Serial-JTAG");
+}
+
+void sf30c_sim_read_drain(void)
+{
+    uint8_t rx[128];
+    int n = usb_serial_jtag_read_bytes(rx, sizeof rx, 0);
+    for (int i = 0; i < n; ++i) {
+        lwnx_frame_t f;
+        if (lwnx_feed(&s_parser, rx[i], &f)) {
+            sim_dispatch_frame(&f);   /* distance frames are simply ignored here */
+        }
+    }
 }
 
 /* ---- Helpers ------------------------------------------------------------- */
@@ -118,8 +193,11 @@ static bool ascii_feed(uint8_t b, float *out_cm, bool *out_valid)
 bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
 {
     uint8_t rx[256];
-    /* Non-blocking drain of whatever is buffered. */
-    int n = uart_read_bytes(SF30C_UART_NUM, rx, sizeof rx, 0);
+    /* Non-blocking drain of whatever is buffered. In bench sim mode the bytes
+     * come from the USB-Serial-JTAG (the simulated sensor) instead of UART1.    */
+    int n = s_sim_mode
+            ? usb_serial_jtag_read_bytes(rx, sizeof rx, 0)
+            : uart_read_bytes(SF30C_UART_NUM, rx, sizeof rx, 0);
 
     bool got_sample = false;
     bool last_valid = true;
@@ -137,6 +215,9 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
                     last_valid = (cm != (int16_t)SF30_LOST_SIGNAL_CM) && (cm >= 0);
                     got_sample = true;
                 }
+            } else if (f.cmd == LWNX_CMD_BENCH_CTRL) {
+                /* Bench-control frames ride the same stream while in sim mode. */
+                sim_dispatch_frame(&f);
             }
         }
 #else /* SF30C_ASCII */
@@ -220,6 +301,13 @@ static bool lwnx_await_reply(uint8_t want_cmd, char *out, size_t cap,
 
 const sensor_profile_t *sf30c_detect_profile(void)
 {
+    if (s_sim_mode) {
+        /* No sensor to interrogate on the bench — use the default profile so the
+         * config menu still cycles a real callout ladder.                       */
+        const sensor_profile_t *p = sensor_profile_for_model(DEFAULT_SENSOR_MODEL);
+        ESP_LOGI(TAG, "sim mode: using default profile %s (no autodetect)", p->name);
+        return p;
+    }
 #if SF30C_MODE == SF30C_BINARY
     /* Ask the sensor who it is (cmd 0, read). Retry a couple of times since the
      * unit may still be booting when we first ask.                            */
@@ -241,6 +329,11 @@ const sensor_profile_t *sf30c_detect_profile(void)
 
 void sf30c_configure_stream(uint32_t rate_code)
 {
+    if (s_sim_mode) {
+        /* No sensor to configure — the bench free-streams cmd-44 frames. */
+        ESP_LOGI(TAG, "sim mode: skipping sensor stream configuration");
+        return;
+    }
 #if SF30C_MODE == SF30C_BINARY
     /* Order matches the LightWare sample: rate, then enable all distance
      * fields, then start streaming distance data.                            */
