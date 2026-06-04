@@ -298,6 +298,13 @@ float sim_tone_start_ft(void) { return s_tone_start_ft; }
 EMSCRIPTEN_KEEPALIVE
 float sim_tone_start_high_ft(void) { return TONE_START_FT_HIGH; }
 
+/** @brief The default (lower) tone-start option the menu offers (DEFAULT_TONE_START_FT,
+ *         100 ft). Exposed separately from sim_tone_start_ft() — which tracks the LIVE
+ *         pilot choice and can already be 200 — so the menu's toggle always has a stable
+ *         "100 ft" endpoint to flip back to. */
+EMSCRIPTEN_KEEPALIVE
+float sim_tone_start_default_ft(void) { return DEFAULT_TONE_START_FT; }
+
 /**
  * @brief Set the pilot's tone-start altitude — the sim analogue of app_main applying
  *        config_load_tone_start() at boot (LEVEL 8 of run_config_menu).

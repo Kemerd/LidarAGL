@@ -57,6 +57,14 @@ const CONFIG_PIECE_WAV = {
   tone_only:          'tone_only.wav',
   start_alt:          'callout_start_altitude.wav',
   volume_adjustment:  'volume_adjustment.wav',
+  // Optional-feature prompts + in-flight clips (LEVELs 5-7): the gear-check reminder,
+  // the positive-rate climb call, the vario direction names, and the on/off pieces.
+  check_gear:         'check_gear.wav',
+  positive_rate:      'positive_rate.wav',
+  sink_rate:          'sink_rate.wav',
+  climb_rate:         'climb_rate.wav',
+  on:                 'on.wav',
+  off:                'off.wav',
 };
 
 // Human-facing labels for the AUDIO_MODE_* indices (config.h). The INDEX is the
@@ -160,6 +168,36 @@ let modeTone    = true;     // resolved api.modeTone(audioMode)
 let toneVolDb   = 0;
 let voiceVolDb  = 0;
 
+// Optional callouts + tone-start (firmware config-menu LEVELs 5, 6, 8). All default
+// to the firmware defaults (gear-check OFF, positive-rate OFF, tone-start 100 ft) so
+// an un-configured sim behaves exactly as the box does fresh out of the menu.
+//   gearCheckFt : 0 == OFF, else the descent altitude that appends "check gear".
+//   posRateOn   : speak "positive rate" on a confirmed post-liftoff climb.
+//   toneStartFt : where the presence tone begins its fade-in (100 or 200 ft); fed
+//                 into the SM tone gate + the audio schedule via api.setToneStart().
+let gearCheckFt = 0;
+let posRateOn   = false;
+let toneStartFt = 100;     // overwritten with api.toneStartFt() once the module is up
+
+// --- ILS hand-fly error (mirrors tools/bench_sim/altitude_model.py) ----------
+// A real pilot never tracks the glideslope perfectly: they wander, OVER-correct, and
+// occasionally flatten out before re-intercepting. We model the vertical DEVIATION
+// from the ideal glideslope as an UNDER-damped spring (the pilot chasing the needle,
+// so a correction overshoots and must be caught again) driven by control jitter with
+// random partial level-offs on top. ilsErrorRate (0..0.25) scales the whole mess;
+// 0 == a perfect on-rails approach. Deviations taper to zero near the ground so the
+// flare + touchdown stay clean. Default 7 %, matching the bench tool's feel.
+const ERR_NAT_FREQ      = 0.55;          // rad/s — needle-chase rate (~11 s period)
+const ERR_DAMPING       = 0.40;          // < 1 -> overshoot / over-correction
+const ERR_GUST_SIGMA    = 18.0;          // ft/s^2 of control jitter per unit rate
+const ERR_LEVELOFF_HZ   = 0.9;           // expected level-offs/sec per unit rate
+const ERR_LEVELOFF_FRAC = [0.4, 1.1];    // impulse as a fraction of nominal descent
+const ERR_DEV_CAP_FT    = 50.0;          // hard bound on the vertical deviation (ft)
+const ERR_TAPER_FT      = 50.0;          // below this AGL the deviation fades to 0
+let   ilsErrorRate = 0.07;               // 0..0.25 sloppiness (default 7 %)
+let   ilsDev   = 0;                       // current vertical deviation (ft)
+let   ilsDevV  = 0;                       // its rate of change (ft/s)
+
 // WebAudio graph.
 let audioCtx     = null; // AudioContext (created on first gesture)
 let osc          = null; // continuous OscillatorNode for the presence tone
@@ -175,6 +213,7 @@ let audioUnlocked = false;
 const calloutBuffers = new Map(); // height(ft) -> decoded AudioBuffer
 const calloutEnv     = new Map(); // height(ft) -> Float32Array sidechain envelope
 const configBuffers  = new Map(); // piece name -> decoded AudioBuffer (menu prompts)
+const voiceEnv       = new Map(); // piece name -> sidechain envelope (in-flight clips)
 
 // Voice-SIDECHAIN duck, mirroring audio.c's compressor. The firmware ducks the
 // tone in proportion to the voice's ACTUAL loudness (a one-pole follower over the
@@ -228,6 +267,9 @@ async function main() {
 
     nCallouts:     M.cwrap('sim_n_callouts',     num,   []),
     calloutFt:     M.cwrap('sim_callout_ft',     num,   [num]),
+    // "Check gear" altitude options for the active profile (LEVEL 5 of the menu).
+    nGearCheckOpts: M.cwrap('sim_n_gear_check_opts', num, []),
+    gearCheckOpt:   M.cwrap('sim_gear_check_opt',    num, [num]),
     cruiseFt:      M.cwrap('sim_cruise_ft',      num,   []),
     maxRangeFt:    M.cwrap('sim_max_range_ft',   num,   []),
 
@@ -239,6 +281,12 @@ async function main() {
 
     armFt:         M.cwrap('sim_arm_ft',         num,   []),
     toneStartFt:   M.cwrap('sim_tone_start_ft',  num,   []),
+    // Tone-start altitude (LEVEL 8): the higher option + a live setter that threads
+    // the pilot's choice into BOTH the audio schedule and the SM tone gate, mirroring
+    // app_main's config_load_tone_start() + audio_set_tone_start() at boot.
+    toneStartHighFt: M.cwrap('sim_tone_start_high_ft', num, []),
+    toneStartDefaultFt: M.cwrap('sim_tone_start_default_ft', num, []),
+    setToneStart:    M.cwrap('sim_set_tone_start',     null, [num]),
     toneFullFt:    M.cwrap('sim_tone_full_ft',   num,   []),
     flareHiFt:     M.cwrap('sim_flare_hi_ft',    num,   []),
     flareLoFt:     M.cwrap('sim_flare_lo_ft',    num,   []),
@@ -251,6 +299,9 @@ async function main() {
     // scheduler chops the tone with exactly the firmware's mapping (bpm linear in
     // vertical rate, anchored to two measured points).
     vertFps:         M.cwrap('sim_vert_fps',          num, []),
+    // "Positive rate" climb edge (sm_out_t.fired_positive_rate) — 1 the one tick a
+    // sustained post-liftoff climb is confirmed. JS gates it on posRateOn (LEVEL 6).
+    firedPositiveRate: M.cwrap('sim_fired_positive_rate', num, []),
     varioOnsetFpm:   M.cwrap('sim_vario_onset_fpm',   num, []),
     varioFullFpm:    M.cwrap('sim_vario_full_fpm',    num, []),
     varioBpmMax:     M.cwrap('sim_vario_bpm_max',     num, []),
@@ -307,11 +358,12 @@ async function main() {
   audioMode = api.defaultMode();
   toneVolDb  = api.toneVolDefaultDb();   // tone offset default (0 dB == no change)
   voiceVolDb = api.voiceVolDefaultDb();  // voice offset default (0 dB == no cut)
+  toneStartFt = api.toneStartFt();       // tone-start default (100 ft) from the firmware
   applyAudioMode(audioMode);
   applyToneVolume(toneVolDb);
   applyVoiceVolume(voiceVolDb);
   api.setProfile(profileIdx);
-  api.init(0 /* ST_GROUND */);
+  initMachine(0 /* ST_GROUND */);        // seats the machine + applies the tone start
   readConfig();
 
   // 4. Wire up the DOM and canvas, then start the loop.
@@ -435,6 +487,58 @@ function applyVoiceVolume(db) {
   }
 }
 
+/**
+ * Restart the state machine into @p state, then re-apply the pilot's tone-start
+ * altitude. sm_init() re-seeds the tone gate to the compile-time default every time
+ * (see sm_init), so — exactly like app_main overriding it from NVS after init — we
+ * push the chosen value back in after each restart so the gate + audio schedule stay
+ * on the pilot's pick across resets, profile switches and approach starts.
+ *
+ * @param {number} state  sm_state_t to seed (ST_GROUND=0 .. ST_DESCENT=4).
+ */
+function initMachine(state) {
+  api.init(state);
+  api.setToneStart(toneStartFt);
+}
+
+/**
+ * Apply the pilot's tone-start altitude (LEVEL 8) — the sim analogue of app_main
+ * calling audio_set_tone_start(). sim_set_tone_start threads it into the audio math
+ * schedule AND the SM tone gate; we then refresh the cached cfg.toneStart so the tape
+ * band that visualises the swell redraws at the new height.
+ *
+ * @param {number} ft  Tone-start altitude in feet (100 or 200).
+ */
+function applyToneStart(ft) {
+  toneStartFt = ft;
+  api.setToneStart(ft);
+  if (cfg) cfg.toneStart = api.toneStartFt();   // refresh the visualised swell band
+}
+
+/**
+ * Set the variometer blip direction (LEVEL 7), keeping the firmware's two mutually-
+ * exclusive flags and the UI in sync. Pure JS state the audio frame reads each tick;
+ * resetting the blip phase makes a switch start a fresh blip on a beep at once. Also
+ * reflects the choice on the standalone vario radios so both controls always agree.
+ *
+ * @param {string} mode  'off' | 'sink' | 'climb'.
+ */
+function setVario(mode) {
+  sinkRateOn   = (mode === 'sink');
+  climbRateOn  = (mode === 'climb');
+  blipInBeep   = false;
+  blipNextFlip = 0;
+  // Keep the standalone radio buttons in lockstep with the chosen direction.
+  const id = { off: 'varioOff', sink: 'varioSink', climb: 'varioClimb' }[mode];
+  const el = id && document.getElementById(id);
+  if (el) el.checked = true;
+}
+
+/** The current vario direction as a string, derived from the two live flags. */
+function varioMode() {
+  return sinkRateOn ? 'sink' : climbRateOn ? 'climb' : 'off';
+}
+
 /* =============================================================================
  *  Boot config menu (Calibrate button)
  *
@@ -451,6 +555,10 @@ let pendingMode      = 1;   // mode highlighted in the open sheet (not yet appli
 let pendingCapFt     = 0;   // start-alt cap highlighted in the open sheet
 let pendingToneVolDb = 0;   // tone volume offset highlighted in the open sheet
 let pendingVoiceVolDb= 0;   // voice volume offset highlighted in the open sheet
+let pendingGearFt    = 0;   // check-gear altitude highlighted (0 == OFF)
+let pendingPosRate   = false; // positive-rate toggle highlighted
+let pendingVario     = 'off'; // vario direction highlighted ('off'|'sink'|'climb')
+let pendingToneStart = 100; // tone-start altitude highlighted (100 | 200)
 
 /** Open the config sheet, seeding the controls from the current live config. */
 function openConfigMenu() {
@@ -460,11 +568,19 @@ function openConfigMenu() {
   pendingCapFt = isFinite(startAltFt) ? Math.min(startAltFt, top) : top;
   pendingToneVolDb  = toneVolDb;    // seed both offsets from the live values
   pendingVoiceVolDb = voiceVolDb;
+  pendingGearFt     = gearCheckFt;  // seed the optional features from live state
+  pendingPosRate    = posRateOn;
+  pendingVario      = varioMode();
+  pendingToneStart  = toneStartFt;
 
   buildModeList();
   buildCapControl();
   buildToneVolumeControl();
   buildVoiceVolumeControl();
+  buildGearControl();
+  buildPosRateControl();
+  buildVarioControl();
+  buildToneStartControl();
 
   document.getElementById('configBackdrop').classList.add('open');
 }
@@ -547,6 +663,9 @@ function refreshCapEnabled() {
   const capRow = document.getElementById('capRow');
   const calloutsOn = api.modeCallouts(pendingMode) === 1;
   capRow.classList.toggle('disabled', !calloutsOn);
+  // The optional voice features share the same "needs callouts" gate, so keep them
+  // in step with the cap whenever the mode changes.
+  refreshOptionalEnabled();
 }
 
 /**
@@ -617,6 +736,92 @@ function updateToneVolLabel(db) {
 function updateVoiceVolLabel(db) {
   const el = document.getElementById('voiceVolVal');
   el.textContent = db >= 0 ? '0 dB · full' : `${db} dB`;
+}
+
+/**
+ * Build the "check gear" altitude range against the active profile's gear-check
+ * options (LEVEL 5). The stops are OFF (index 0) then the profile heights ascending,
+ * so the slider reads off -> low -> high. We store the chosen FT (0 == OFF) to stay
+ * ladder-agnostic across a profile switch.
+ */
+function buildGearControl() {
+  const range = document.getElementById('gearRange');
+  const opts = [];
+  const n = api.nGearCheckOpts();
+  for (let i = 0; i < n; i++) opts.push(api.gearCheckOpt(i));
+  const stops = [0, ...opts.sort((a, b) => a - b)];   // 0 == OFF, then ascending
+
+  range.min = 0;
+  range.max = stops.length - 1;
+  range.step = 1;
+  range._stops = stops;
+
+  let idx = stops.indexOf(pendingGearFt);
+  if (idx < 0) idx = 0;                                // fall back to OFF
+  range.value = idx;
+  updateGearLabel(stops[idx]);
+
+  range.oninput = () => {
+    const ft = range._stops[parseInt(range.value, 10)];
+    pendingGearFt = ft;
+    updateGearLabel(ft);
+  };
+
+  refreshOptionalEnabled();
+}
+
+/** Show the chosen gear-check altitude, or "Off" at index 0. */
+function updateGearLabel(ft) {
+  document.getElementById('gearVal').textContent = ft > 0 ? `${ft} ft` : 'Off';
+}
+
+/**
+ * Wire a segmented control: mark the segment whose data-val matches @p value, and
+ * route a click to re-skin the row + report the picked value. A tiny shared helper
+ * for the positive-rate, vario and tone-start pickers.
+ *
+ * @param {string}   segId    Element id of the .seg container.
+ * @param {string}   value    The currently-selected data-val (as a string).
+ * @param {Function} onPick   Called with the picked data-val string.
+ */
+function buildSeg(segId, value, onPick) {
+  const seg = document.getElementById(segId);
+  const opts = seg.querySelectorAll('.seg-opt');
+  for (const opt of opts) {
+    opt.classList.toggle('sel', opt.dataset.val === String(value));
+    opt.onclick = () => {
+      for (const o of opts) o.classList.toggle('sel', o === opt);
+      onPick(opt.dataset.val);
+    };
+  }
+}
+
+/** Build the positive-rate ON/OFF segmented control (LEVEL 6). */
+function buildPosRateControl() {
+  buildSeg('posRateSeg', pendingPosRate ? '1' : '0', (v) => { pendingPosRate = (v === '1'); });
+  refreshOptionalEnabled();
+}
+
+/** Build the vario OFF/Sink/Climb segmented control (LEVEL 7). */
+function buildVarioControl() {
+  buildSeg('varioSeg', pendingVario, (v) => { pendingVario = v; });
+}
+
+/** Build the tone-start 100/200 ft segmented control (LEVEL 8). */
+function buildToneStartControl() {
+  buildSeg('toneStartSeg', String(pendingToneStart),
+           (v) => { pendingToneStart = parseInt(v, 10); });
+}
+
+/**
+ * Grey out the features that depend on the voice when the pending mode mutes callouts
+ * (tone-only): gear-check and positive-rate are voice callouts, so the firmware skips
+ * them in that mode. Vario + tone-start act on the TONE, so they stay enabled.
+ */
+function refreshOptionalEnabled() {
+  const calloutsOn = api.modeCallouts(pendingMode) === 1;
+  document.getElementById('gearRow').classList.toggle('disabled', !calloutsOn);
+  document.getElementById('posRateRow').classList.toggle('disabled', !calloutsOn);
 }
 
 // Mini-flare preview parameters — mirror config.h VOLUME_PREVIEW_SWEEP_*. The tone
@@ -769,6 +974,15 @@ function commitConfigMenu() {
   applyToneVolume(pendingToneVolDb);    // independent tone + voice offsets
   applyVoiceVolume(pendingVoiceVolDb);
 
+  // Optional features (LEVELs 5-8). Gear-check + positive-rate are voice callouts, so
+  // in a tone-only mode the firmware skips them entirely — force them OFF to match.
+  // Vario + tone-start act on the tone and always apply.
+  const calloutsOn = api.modeCallouts(pendingMode) === 1;
+  gearCheckFt = calloutsOn ? pendingGearFt  : 0;
+  posRateOn   = calloutsOn ? pendingPosRate : false;
+  setVario(pendingVario);
+  applyToneStart(pendingToneStart);
+
   calibrateToGround();          // zero the box (shared with the Calibrate path)
   closeConfigMenu();
 }
@@ -782,7 +996,7 @@ function calibrateToGround() {
   cancelApproach();            // a zeroing always supersedes a running approach
   targetAgl  = 0;
   displayAgl = 0;              // snap the glyph instantly — this is a zeroing
-  api.init(0 /* ST_GROUND */);
+  initMachine(0 /* ST_GROUND */);
   lastFiredFt = null;
   flareFade = 1;
   duckCur = 1;                 // un-duck (no callout in flight after a zeroing)
@@ -811,9 +1025,14 @@ function calibrateToGround() {
 const DTAP_MS = 350;     // two taps within this window == a double-tap (confirm)
 
 let manualOpen   = false;   // is the manual menu modal showing?
-let manualLevel  = 0;       // 0 = mode, 1 = start-alt, 2 = tone-vol, 3 = voice-vol
+let manualLevel  = 0;       // see the LVL_* constants below
 let manualLastTap = 0;      // performance.now() of the last tap (double-tap detect)
 let manualTapTimer = null;  // pending single-tap resolution timer
+
+// The firmware's config-menu level order (run_config_menu LEVELs 1-8). Some are
+// skipped in a tone-only mode (they are voice callouts); the walk steps over those.
+const LVL_MODE = 0, LVL_STARTALT = 1, LVL_TONEVOL = 2, LVL_VOICEVOL = 3,
+      LVL_GEAR = 4, LVL_POSRATE = 5, LVL_VARIO = 6, LVL_TONESTART = 7, LVL_DONE = 8;
 
 // Working picks for the in-progress walk (committed only at the end), seeded from
 // the live config when the menu opens — same as the firmware starting from its
@@ -822,15 +1041,22 @@ let manMode  = 1;
 let manCapIdx = 0;          // index into the ascending callout ladder
 let manToneVolDb  = 0;      // tone volume offset (cut or boost)
 let manVoiceVolDb = 0;      // voice volume offset (cut only)
+let manGearSel   = 0;       // 0 == OFF, else 1..n index into the ascending gear opts
+let manPosRate   = false;   // positive-rate enable
+let manVario     = 0;       // 0 == off, 1 == sink, 2 == climb
+let manToneStartSel = 0;    // 0 == default (100 ft), 1 == high (200 ft)
 
 /** Open the manual menu: reset to LEVEL 1 and speak the entry + first option. */
 function openManualMenu() {
   unlockAudio().then(() => {
     manualOpen  = true;
-    manualLevel = 0;
+    manualLevel = LVL_MODE;
     manMode     = audioMode;
     manToneVolDb  = toneVolDb;
     manVoiceVolDb = voiceVolDb;
+    // The optional features start at their firmware defaults each walk (the real menu
+    // wipes config first); they are re-defaulted again as each level is entered.
+    manGearSel = 0; manPosRate = false; manVario = 0; manToneStartSel = 0;
 
     // Cap index seeded from the live cap against the ascending ladder.
     const asc = [...cfg.callouts].sort((a, b) => a - b);
@@ -874,16 +1100,27 @@ function announceCapManual() {
   scheduleCalloutAt(asc[manCapIdx], audioCtx.currentTime + 0.05);
 }
 
+/** The ascending gear-check stops for the active profile: [OFF, low..high]. */
+function manGearStops() {
+  const opts = [];
+  const n = api.nGearCheckOpts();
+  for (let i = 0; i < n; i++) opts.push(api.gearCheckOpt(i));
+  return [0, ...opts.sort((a, b) => a - b)];   // 0 == OFF
+}
+
+/** The two tone-start altitude options the menu toggles between (100 / 200 ft). */
+function manToneStartOpts() { return [api.toneStartDefaultFt(), api.toneStartHighFt()]; }
+
 /** A single tap: cycle the current level's option (+ announce/preview it). */
 function manualTap() {
   if (!manualOpen) return;
   switch (manualLevel) {
-    case 0:   // audio mode
+    case LVL_MODE:   // audio mode
       manMode = (manMode + 1) % api.audioModeCount();
       applyAudioMode(manMode);          // apply live so prompts honour the mode
       announceModeManual();
       break;
-    case 1: { // start altitude (only reached when callouts are enabled)
+    case LVL_STARTALT: { // start altitude (only reached when callouts are enabled)
       const asc = [...cfg.callouts].sort((a, b) => a - b);
       // Firmware steps DOWN the descending ladder; on the ascending slider that is
       // a step toward index 0, wrapping to the top.
@@ -891,88 +1128,148 @@ function manualTap() {
       announceCapManual();
       break;
     }
-    case 2:   // tone volume (cut OR boost) — step DOWN, wrap from below MIN to MAX
+    case LVL_TONEVOL:   // tone volume (cut OR boost) — step DOWN, wrap below MIN -> MAX
       manToneVolDb -= api.toneVolStepDb();
       if (manToneVolDb < api.toneVolMinDb() - 0.001) manToneVolDb = api.toneVolMaxDb();
       applyToneVolume(manToneVolDb);    // apply live so the preview is at-level
       previewBalance();
       break;
-    case 3:   // voice volume (cut only) — step DOWN, wrap from below MIN to 0
+    case LVL_VOICEVOL:  // voice volume (cut only) — step DOWN, wrap below MIN -> 0
       manVoiceVolDb -= api.voiceVolStepDb();
       if (manVoiceVolDb < api.voiceVolMinDb() - 0.001) manVoiceVolDb = 0;
       applyVoiceVolume(manVoiceVolDb);
       previewBalance();
       break;
+    case LVL_GEAR: {   // check-gear altitude — cycle OFF -> opts... -> OFF, speak each
+      const stops = manGearStops();
+      manGearSel = (manGearSel + 1) % stops.length;
+      const ft = stops[manGearSel];
+      if (ft > 0) scheduleCalloutAt(ft, audioCtx.currentTime + 0.05);
+      else        schedulePieceAt('off', audioCtx.currentTime + 0.05);
+      break;
+    }
+    case LVL_POSRATE:   // positive-rate ON/OFF — toggle, speak on/off
+      manPosRate = !manPosRate;
+      schedulePieceAt(manPosRate ? 'on' : 'off', audioCtx.currentTime + 0.05);
+      break;
+    case LVL_VARIO:     // vario OFF -> SINK -> CLIMB -> OFF, speak the new selection
+      manVario = (manVario + 1) % 3;
+      schedulePieceAt(manVario === 1 ? 'sink_rate'
+                    : manVario === 2 ? 'climb_rate' : 'off',
+                      audioCtx.currentTime + 0.05);
+      break;
+    case LVL_TONESTART: {  // tone-start 100 <-> 200, apply live + announce the number
+      manToneStartSel = (manToneStartSel + 1) % 2;
+      applyToneStart(manToneStartOpts()[manToneStartSel]);
+      let when = schedulePieceAt('tone_only', audioCtx.currentTime + 0.05) + 0.12;
+      scheduleCalloutAt(manToneStartOpts()[manToneStartSel], when);
+      break;
+    }
   }
   renderManual();
+}
+
+/**
+ * Is level @p lvl reached in the current mode? The voice features — start-alt cap,
+ * voice volume, check-gear and positive-rate — are skipped in a tone-only mode,
+ * exactly like run_config_menu(); the tone features (mode, tone volume, vario,
+ * tone-start) always run.
+ */
+function manualLevelApplicable(lvl) {
+  const calloutsOn = api.modeCallouts(manMode) === 1;
+  if (lvl === LVL_STARTALT || lvl === LVL_VOICEVOL ||
+      lvl === LVL_GEAR || lvl === LVL_POSRATE) return calloutsOn;
+  return true;
+}
+
+/** Announce a volume level ("Volume Adjustment" + stream piece) then preview it. */
+function announceVolumeLevel(streamPiece) {
+  let when = schedulePieceAt('volume_adjustment', audioCtx.currentTime + 0.12) + 0.12;
+  when = schedulePieceAt(streamPiece, when) + 0.12;
+  setTimeout(() => { if (manualOpen) previewBalance(); },
+             Math.max(0, (when - audioCtx.currentTime) * 1000));
+}
+
+/**
+ * Enter level @p lvl: set it current, reset its pick to the firmware's starting value
+ * where the menu does, and speak the same prompt + starting selection the box would.
+ * The level order + prompts mirror run_config_menu() one-for-one.
+ */
+function manualEnterLevel(lvl) {
+  manualLevel = lvl;
+  switch (lvl) {
+    case LVL_STARTALT: {  // "Callout Start Altitude" + the starting (live) height
+      let when = schedulePieceAt('start_alt', audioCtx.currentTime + 0.12) + 0.12;
+      const asc = [...cfg.callouts].sort((a, b) => a - b);
+      scheduleCalloutAt(asc[manCapIdx], when);
+      break;
+    }
+    case LVL_TONEVOL:     // "Volume Adjustment, Tone Only" — starts at 0 dB
+      manToneVolDb = 0; applyToneVolume(0);
+      announceVolumeLevel('tone_only');
+      break;
+    case LVL_VOICEVOL:    // "Volume Adjustment, Callouts Only" — starts at 0 dB
+      manVoiceVolDb = 0; applyVoiceVolume(0);
+      announceVolumeLevel('callouts_only');
+      break;
+    case LVL_GEAR: {      // "Check Gear" + starting OFF
+      manGearSel = 0;
+      let when = schedulePieceAt('check_gear', audioCtx.currentTime + 0.12) + 0.12;
+      schedulePieceAt('off', when);
+      break;
+    }
+    case LVL_POSRATE: {   // "Positive Rate" + starting OFF
+      manPosRate = false;
+      let when = schedulePieceAt('positive_rate', audioCtx.currentTime + 0.12) + 0.12;
+      schedulePieceAt('off', when);
+      break;
+    }
+    case LVL_VARIO:       // vario starts OFF
+      manVario = 0;
+      schedulePieceAt('off', audioCtx.currentTime + 0.12);
+      break;
+    case LVL_TONESTART: { // "Tone Only" + the starting (default) altitude number
+      manToneStartSel = 0;
+      applyToneStart(manToneStartOpts()[0]);   // apply live so the tone reflects it
+      let when = schedulePieceAt('tone_only', audioCtx.currentTime + 0.12) + 0.12;
+      scheduleCalloutAt(manToneStartOpts()[0], when);
+      break;
+    }
+  }
+  renderManual();
+}
+
+/** Move on from the current level to the next applicable one, or commit past the end. */
+function manualAdvance() {
+  let n = manualLevel + 1;
+  while (n < LVL_DONE && !manualLevelApplicable(n)) n++;
+  if (n >= LVL_DONE) { commitManualMenu(); return; }
+  manualEnterLevel(n);
 }
 
 /** A double-tap: confirm the current level and advance (mirrors TAP_DOUBLE). */
 function manualConfirm() {
   if (!manualOpen) return;
   schedulePieceAt('chirp', audioCtx.currentTime + 0.03);   // confirm chirp
-
-  if (manualLevel === 0) {
-    // Committed the mode. LEVEL 2 is skipped entirely for a tone-only mode (no
-    // callouts to gate), exactly like the firmware.
-    applyAudioMode(manMode);
-    if (api.modeCallouts(manMode) === 1) {
-      manualLevel = 1;
-      // Announce "Callout Start Altitude" + the starting (top) height.
-      let when = schedulePieceAt('start_alt', audioCtx.currentTime + 0.12) + 0.12;
-      const asc = [...cfg.callouts].sort((a, b) => a - b);
-      scheduleCalloutAt(asc[manCapIdx], when);
-    } else {
-      enterToneVolumeLevel();
-    }
-  } else if (manualLevel === 1) {
-    enterToneVolumeLevel();
-  } else if (manualLevel === 2) {
-    // Tone volume committed. The voice-volume level is skipped for a tone-only mode
-    // (no callouts to trim), exactly like the firmware.
-    if (api.modeCallouts(manMode) === 1) {
-      enterVoiceVolumeLevel();
-    } else {
-      commitManualMenu();
-      return;
-    }
-  } else if (manualLevel === 3) {
-    commitManualMenu();
-    return;
-  }
-  renderManual();
-}
-
-/** Advance into LEVEL 3 (tone volume): announce "Volume Adjustment, Tone Only". */
-function enterToneVolumeLevel() {
-  manualLevel = 2;
-  manToneVolDb = 0;                     // firmware starts each volume level at 0 dB
-  applyToneVolume(manToneVolDb);
-  let when = schedulePieceAt('volume_adjustment', audioCtx.currentTime + 0.12) + 0.12;
-  when = schedulePieceAt('tone_only', when) + 0.12;
-  // Preview the mini-flare after the announcement finishes.
-  setTimeout(() => { if (manualOpen) previewBalance(); },
-             Math.max(0, (when - audioCtx.currentTime) * 1000));
-}
-
-/** Advance into LEVEL 4 (voice volume): announce "Volume Adjustment, Callouts Only". */
-function enterVoiceVolumeLevel() {
-  manualLevel = 3;
-  manVoiceVolDb = 0;                    // firmware starts each volume level at 0 dB
-  applyVoiceVolume(manVoiceVolDb);
-  let when = schedulePieceAt('volume_adjustment', audioCtx.currentTime + 0.12) + 0.12;
-  when = schedulePieceAt('callouts_only', when) + 0.12;
-  setTimeout(() => { if (manualOpen) previewBalance(); },
-             Math.max(0, (when - audioCtx.currentTime) * 1000));
+  if (manualLevel === LVL_MODE) applyAudioMode(manMode);    // lock in the chosen mode
+  manualAdvance();
 }
 
 /** Commit the manual walk: apply all picks + recalibrate to ground, like reboot. */
 function commitManualMenu() {
   applyAudioMode(manMode);
+  const calloutsOn = api.modeCallouts(manMode) === 1;
   const asc = [...cfg.callouts].sort((a, b) => a - b);
-  startAltFt = api.modeCallouts(manMode) === 1 ? asc[manCapIdx] : cfg.callouts[0];
+  startAltFt = calloutsOn ? asc[manCapIdx] : cfg.callouts[0];
   applyToneVolume(manToneVolDb);
   applyVoiceVolume(manVoiceVolDb);
+  // Optional features: gear-check + positive-rate are voice callouts -> OFF in a
+  // tone-only mode, like the firmware skipping their levels. Vario + tone-start apply
+  // in every mode.
+  gearCheckFt = calloutsOn ? manGearStops()[manGearSel] : 0;
+  posRateOn   = calloutsOn ? manPosRate : false;
+  setVario(manVario === 1 ? 'sink' : manVario === 2 ? 'climb' : 'off');
+  applyToneStart(manToneStartOpts()[manToneStartSel]);
   calibrateToGround();
   closeManualMenu();
 }
@@ -1001,21 +1298,43 @@ function manualButtonPress() {
 function renderManual() {
   const levelEl = document.getElementById('manualLevel');
   const valueEl = document.getElementById('manualValue');
-  const LEVELS = ['Audio mode', 'Start-altitude cap', 'Tone volume', 'Voice volume'];
-  levelEl.textContent = `Step ${manualLevel + 1} of ${LEVELS.length} · ${LEVELS[manualLevel] ?? '—'}`;
+  const LEVELS = ['Audio mode', 'Start-altitude cap', 'Tone volume', 'Voice volume',
+                  'Check gear', 'Positive rate', 'Variometer blip', 'Tone start'];
+  levelEl.textContent =
+    `Step ${manualLevel + 1} of ${LEVELS.length} · ${LEVELS[manualLevel] ?? '—'}`;
 
   let v = '—';
-  if (manualLevel === 0) {
-    v = AUDIO_MODE_META[manMode]?.title ?? `mode ${manMode}`;
-  } else if (manualLevel === 1) {
-    const asc = [...cfg.callouts].sort((a, b) => a - b);
-    const ft = asc[manCapIdx];
-    v = ft >= cfg.callouts[0] ? `${ft} ft · all` : `${ft} ft`;
-  } else if (manualLevel === 2) {
-    v = manToneVolDb === 0 ? '0 dB · flat'
-                           : `${manToneVolDb > 0 ? '+' : ''}${manToneVolDb} dB`;
-  } else if (manualLevel === 3) {
-    v = manVoiceVolDb >= 0 ? '0 dB · full' : `${manVoiceVolDb} dB`;
+  switch (manualLevel) {
+    case LVL_MODE:
+      v = AUDIO_MODE_META[manMode]?.title ?? `mode ${manMode}`;
+      break;
+    case LVL_STARTALT: {
+      const asc = [...cfg.callouts].sort((a, b) => a - b);
+      const ft = asc[manCapIdx];
+      v = ft >= cfg.callouts[0] ? `${ft} ft · all` : `${ft} ft`;
+      break;
+    }
+    case LVL_TONEVOL:
+      v = manToneVolDb === 0 ? '0 dB · flat'
+                             : `${manToneVolDb > 0 ? '+' : ''}${manToneVolDb} dB`;
+      break;
+    case LVL_VOICEVOL:
+      v = manVoiceVolDb >= 0 ? '0 dB · full' : `${manVoiceVolDb} dB`;
+      break;
+    case LVL_GEAR: {
+      const ft = manGearStops()[manGearSel];
+      v = ft > 0 ? `${ft} ft` : 'Off';
+      break;
+    }
+    case LVL_POSRATE:
+      v = manPosRate ? 'On' : 'Off';
+      break;
+    case LVL_VARIO:
+      v = manVario === 1 ? 'Sink rate' : manVario === 2 ? 'Climb rate' : 'Off';
+      break;
+    case LVL_TONESTART:
+      v = `${manToneStartOpts()[manToneStartSel]} ft`;
+      break;
   }
   valueEl.textContent = v;
 }
@@ -1042,12 +1361,15 @@ function startApproach() {
 
   targetAgl  = startFt;
   displayAgl = startFt;                   // snap the glyph; the run glides from here
-  api.init(0 /* ST_GROUND */);            // clean restart...
+  initMachine(0 /* ST_GROUND */);         // clean restart (re-applies tone start)...
   api.step(startFt, 0.001);               // ...then seat the machine at altitude
   lastFiredFt = null;
   flareFade   = 1;                        // re-arm the flare fade for the descent
 
-  approach = { sink: GLIDESLOPE_SINK };   // open on the glideslope sink rate
+  // Open on the glideslope sink. `nominal` carries the on-rails altitude so the
+  // hand-fly deviation can be layered on top without feeding back into itself.
+  approach = { sink: GLIDESLOPE_SINK, nominal: startFt };
+  ilsDev = 0; ilsDevV = 0;                // start every approach dead on the needle
   updateApproachButton();
 }
 
@@ -1069,15 +1391,11 @@ function cancelApproach() {
 function stepApproach(dt) {
   if (!approach) return;
 
-  // Choose the target sink rate for THIS height. On the glideslope it's constant;
-  // inside the flare it eases from the current sink toward the touchdown sink with
-  // a first-order (exponential) approach — the standard flare feel.
-  let targetSink;
-  if (targetAgl > FLARE_START_FT) {
-    targetSink = GLIDESLOPE_SINK;
-  } else {
-    targetSink = FLARE_TOUCHDOWN_SINK;
-  }
+  // Choose the target sink rate for THIS height, off the ON-RAILS altitude (not the
+  // hand-flown one, so the flare timing stays deterministic). On the glideslope it's
+  // constant; inside the flare it eases toward the touchdown sink — the standard feel.
+  const targetSink = approach.nominal > FLARE_START_FT ? GLIDESLOPE_SINK
+                                                       : FLARE_TOUCHDOWN_SINK;
 
   // First-order relaxation of the live sink toward the target. The 1 - e^(-dt/tau)
   // factor makes the transition frame-rate independent and smoothly continuous as
@@ -1085,16 +1403,71 @@ function stepApproach(dt) {
   const k = 1 - Math.exp(-dt / FLARE_TAU);
   approach.sink += (targetSink - approach.sink) * k;
 
-  // Integrate altitude. Sink is positive-down, so subtract it from the target AGL.
-  targetAgl = Math.max(0, targetAgl - approach.sink * dt);
+  // Integrate the on-rails altitude. Sink is positive-down, so subtract it.
+  approach.nominal = Math.max(0, approach.nominal - approach.sink * dt);
 
-  // Touchdown: once we're on the ground, hold at 0 and let the run finish. We keep
-  // approach alive for one settle frame so the final low callout + flare-fade tail
-  // can play, then clear it on the next pass.
-  if (targetAgl <= APPROACH_HOLD_FT) {
+  // Layer the hand-flying deviation on top (tapered to zero near the ground), so the
+  // firmware sees a realistically-flown needle rather than a perfect rail. At 0 %
+  // error stepIlsError returns 0 and the approach is the old on-rails descent.
+  const dev = stepIlsError(dt, approach.nominal);
+  targetAgl = Math.max(0, approach.nominal + dev);
+
+  // Touchdown: once the on-rails path is on the ground, hold at 0 and let the run
+  // finish. We keep approach alive for one settle frame so the final low callout +
+  // flare-fade tail can play, then clear it on the next pass.
+  if (approach.nominal <= APPROACH_HOLD_FT) {
     targetAgl = 0;
     cancelApproach();
   }
+}
+
+/**
+ * Advance the hand-flying deviation by dt and return the (tapered) feet to add to the
+ * ideal glideslope. A 1:1 port of the bench sim's altitude_model._step_error: an
+ * under-damped spring chasing the needle (so corrections overshoot == over-correction),
+ * driven by white control jitter, with random partial level-offs layered on, all
+ * scaled by ilsErrorRate (0..0.25) and faded out near the ground for a clean flare.
+ *
+ * @param {number} dt       Frame time in seconds.
+ * @param {number} nominal  On-rails AGL (ft), for the level-off scale + the taper.
+ * @returns {number}        Feet to add to the glideslope this frame (signed).
+ */
+function stepIlsError(dt, nominal) {
+  const r = ilsErrorRate;
+  if (r < 1e-6 || dt <= 0) { ilsDev = 0; ilsDevV = 0; return 0; }
+
+  // Under-damped restoring dynamics. Control jitter is white ACCELERATION noise scaled
+  // by 1/sqrt(dt) so its felt amplitude is frame-rate independent (the rAF cadence must
+  // not change how sloppy the approach looks).
+  const wn = ERR_NAT_FREQ;
+  const gust  = gauss(0, ERR_GUST_SIGMA * r / Math.sqrt(dt));
+  const accel = -(wn * wn) * ilsDev - (2 * ERR_DAMPING * wn) * ilsDevV + gust;
+
+  // Occasional partial level-off: shove the deviation UP (stop descending as fast for
+  // a beat), which the spring then has to pull back down through == re-correction.
+  if (Math.random() < ERR_LEVELOFF_HZ * r * dt) {
+    const frac = ERR_LEVELOFF_FRAC[0] +
+                 Math.random() * (ERR_LEVELOFF_FRAC[1] - ERR_LEVELOFF_FRAC[0]);
+    ilsDevV += GLIDESLOPE_SINK * frac;     // nominal descent rate (ft/s)
+  }
+
+  // Integrate, then clamp the deviation (bleeding the velocity that pushed it past the
+  // cap so it doesn't slam the rail and stick).
+  ilsDevV += accel * dt;
+  ilsDev  += ilsDevV * dt;
+  if (ilsDev > ERR_DEV_CAP_FT)       { ilsDev = ERR_DEV_CAP_FT;  ilsDevV = Math.min(ilsDevV, 0); }
+  else if (ilsDev < -ERR_DEV_CAP_FT) { ilsDev = -ERR_DEV_CAP_FT; ilsDevV = Math.max(ilsDevV, 0); }
+
+  // Fade the deviation out as the ground nears so the touchdown is precise.
+  const taper = ERR_TAPER_FT > 0 ? Math.min(1, nominal / ERR_TAPER_FT) : 1;
+  return ilsDev * taper;
+}
+
+/** A Gaussian random sample (Box-Muller), driving the hand-fly control jitter. */
+function gauss(mean, sigma) {
+  const u1 = Math.random() || 1e-12;       // guard against log(0)
+  const u2 = Math.random();
+  return mean + sigma * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
 }
 
 /** Reflect the run state on the Fly-approach button (label + cancel affordance). */
@@ -1213,10 +1586,60 @@ async function loadCallouts() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = await audioCtx.decodeAudioData(await res.arrayBuffer());
       configBuffers.set(name, buf);
+      // The two clips that can sound IN FLIGHT (over the presence tone) get a
+      // precomputed sidechain envelope so they duck the tone just like a callout.
+      if (name === 'check_gear' || name === 'positive_rate') {
+        voiceEnv.set(name, precomputeEnv(buf));
+      }
     } catch (e) {
       console.warn(`config piece ${file} unavailable:`, e.message);
     }
   }));
+}
+
+/**
+ * Play a named voice clip (configBuffers) in flight — the positive-rate call and the
+ * check-gear reminder. Routed through the voice-volume node + the stereo lean exactly
+ * like a numeric callout, and registered as the sidechain source so it ducks the tone.
+ * No-op when the active mode mutes callouts.
+ *
+ * @param {string} name  Key into configBuffers (e.g. 'positive_rate', 'check_gear').
+ */
+function playVoicePiece(name) {
+  const buf = configBuffers.get(name);
+  if (!buf || !audioCtx || !modeCallouts) return;
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  const pan = audioCtx.createStereoPanner();
+  pan.pan.value = modeStereo ? +api.stereoPan() : 0;   // voice leans right in stereo
+  src.connect(pan).connect(voiceVolNode);
+  src.start();
+
+  const env = voiceEnv.get(name);
+  if (env) {
+    activeVoice = {
+      env,
+      fs: buf.sampleRate,
+      startTime: audioCtx.currentTime,
+      endTime: audioCtx.currentTime + buf.duration,
+    };
+  }
+}
+
+/**
+ * Queue the "check gear" reminder right after the just-fired altitude number, so the
+ * box speaks "<height> … check gear". We wait the number's own duration (a small gap
+ * after) then play the clip via playVoicePiece, so each clip ducks the tone over its
+ * own span — the audible equivalent of the firmware queueing CO_CHECK_GEAR after the
+ * number.
+ *
+ * @param {number} ft  The gear-check altitude whose number just fired.
+ */
+function playGearCheckAfter(ft) {
+  const numBuf = calloutBuffers.get(ft);
+  const gap = ((numBuf ? numBuf.duration : 0) + 0.08) * 1000;   // ms after the number
+  setTimeout(() => { if (audioUnlocked) playVoicePiece('check_gear'); }, gap);
 }
 
 /**
@@ -1384,10 +1807,26 @@ function frame(ts) {
   // --- Audio: callout + tone ------------------------------------------------
   // Suppress any callout ABOVE the configured start-altitude cap, exactly like
   // app_main.c (the tone is unaffected). With the cap at the profile top this
-  // never suppresses. The readout still reflects the last AUDIBLE callout only.
-  if (firedFt >= 0 && firedFt <= startAltFt) {
-    lastFiredFt = firedFt;
-    if (audioUnlocked) playCallout(firedFt);
+  // never suppresses. The gear-check altitude is the ONE exception: it is a
+  // deliberate safety reminder, so it is let through even above the cap and the
+  // "check gear" clip is queued right after the number ("<height> … check gear"),
+  // mirroring the logic_task. The readout reflects the last AUDIBLE callout only.
+  if (firedFt >= 0) {
+    const isGear = gearCheckFt > 0 && Math.abs(firedFt - gearCheckFt) < 0.5;
+    if (firedFt <= startAltFt || isGear) {
+      lastFiredFt = firedFt;
+      if (audioUnlocked) {
+        playCallout(firedFt);
+        if (isGear) playGearCheckAfter(firedFt);
+      }
+    }
+  }
+
+  // "Positive rate" climb callout: the state machine confirms a sustained post-liftoff
+  // climb (sm_step's detector); we voice it only when the pilot enabled the feature
+  // (LEVEL 6) and the mode plays callouts — exactly app_main's s_posrate_enabled gate.
+  if (api.firedPositiveRate() === 1 && posRateOn && audioUnlocked && modeCallouts) {
+    playVoicePiece('positive_rate');
   }
 
   // --- Flare fade: mirror audio.c's s_flare_fade ----------------------------
@@ -1582,6 +2021,15 @@ function updateTelemetry(st, toneAgl, toneOn, pollMs) {
   const tStr = toneVolDb  === 0 ? '0' : `${toneVolDb > 0 ? '+' : ''}${toneVolDb}`;
   const vStr = voiceVolDb === 0 ? '0' : `${voiceVolDb}`;
   document.getElementById('volValTelem').textContent = `T ${tStr} · V ${vStr} dB`;
+
+  // Optional features (config-menu LEVELs 5, 6, 8) so a Commit visibly changes the
+  // panel and the active config is always readable at a glance.
+  document.getElementById('gearValTelem').textContent =
+    gearCheckFt > 0 ? `${Math.round(gearCheckFt)} ft` : 'off';
+  const posEl = document.getElementById('posRateValTelem');
+  posEl.textContent = posRateOn ? 'on' : 'off';
+  posEl.style.color = posRateOn ? 'var(--good)' : 'var(--text-dim)';
+  document.getElementById('toneStartValTelem').textContent = `${Math.round(toneStartFt)} ft`;
 }
 
 /* =============================================================================
@@ -1780,7 +2228,7 @@ function setupDom() {
     cancelApproach();              // ladder is changing out from under the run
     profileIdx = parseInt(e.target.value, 10) || 0;
     api.setProfile(profileIdx);
-    api.init(0 /* ST_GROUND */);   // clean restart under the new ladder
+    initMachine(0 /* ST_GROUND */);   // clean restart under the new ladder
     lastFiredFt = null;
     flareFade = 1;                 // re-arm the flare fade for the fresh run
     readConfig();
@@ -1789,23 +2237,24 @@ function setupDom() {
   document.getElementById('resetBtn').addEventListener('click', () => {
     cancelApproach();
     targetAgl = 0;
-    api.init(0 /* ST_GROUND */);
+    initMachine(0 /* ST_GROUND */);
     lastFiredFt = null;
     flareFade = 1;                 // re-arm the flare fade
   });
 
-  // Vario blip direction (firmware LEVEL 7): one mutually-exclusive choice. Pure JS
-  // state the gate reads every frame; resetting blipNextFlip makes a switch start a
-  // fresh blip on a beep at once. Off => both false => steady tone.
-  const onVario = (mode) => {
-    sinkRateOn   = (mode === 'sink');
-    climbRateOn  = (mode === 'climb');
-    blipInBeep   = false;
-    blipNextFlip = 0;
-  };
-  document.getElementById('varioOff').addEventListener('change',   () => onVario('off'));
-  document.getElementById('varioSink').addEventListener('change',  () => onVario('sink'));
-  document.getElementById('varioClimb').addEventListener('change', () => onVario('climb'));
+  // Vario blip direction (firmware LEVEL 7): one mutually-exclusive choice, shared with
+  // the config menu's vario segmented control via setVario() (which keeps both in sync).
+  document.getElementById('varioOff').addEventListener('change',   () => setVario('off'));
+  document.getElementById('varioSink').addEventListener('change',  () => setVario('sink'));
+  document.getElementById('varioClimb').addEventListener('change', () => setVario('climb'));
+
+  // ILS hand-fly error: how sloppily the scripted approach is flown (0..25 %). Takes
+  // effect immediately, including on a run already in progress. Default 7 %.
+  const ilsErr = document.getElementById('ilsErrRange');
+  ilsErr.addEventListener('input', () => {
+    ilsErrorRate = clamp(parseInt(ilsErr.value, 10) / 100, 0, 0.25);
+    document.getElementById('ilsErrVal').textContent = `${Math.round(ilsErrorRate * 100)}%`;
+  });
 
   document.getElementById('cruiseBtn').addEventListener('click', () => {
     cancelApproach();
