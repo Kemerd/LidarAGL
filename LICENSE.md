@@ -18,7 +18,9 @@ Required Notice: Copyright 2026 D Everett Hinton — Novabox.Works (https://nova
 - ❌ **No commercial use without a separate license.** Selling units, charging for it, or using it
   inside a paid product/service is **not** covered here.
 - ⚠️ **No warranty.** It's an *advisory* aid for experimental aircraft, provided "as is." See
-  [No Liability](#no-liability).
+  [No Liability](#no-liability) below **and the separate, more detailed
+  [DISCLAIMER.md](DISCLAIMER.md)** — experimental/advisory use only, not certified, no
+  warranty, not a substitute for proper instruments and pilot judgment, use at your own risk.
 
 ### Want to use it commercially?
 
@@ -84,6 +86,12 @@ The first time you are notified in writing that you have violated any of these t
 ## No Liability
 
 ***As far as the law allows, the software comes as is, without any warranty or condition, and the licensor will not be liable to you for any damages arising out of these terms or the use or nature of the software, under any kind of legal claim.***
+
+> **Additional disclaimer (incorporated by reference).** The Project is an *advisory*
+> aid for *experimental* aircraft and is **not certified**. A separate
+> **[Disclaimer of Warranty, Liability, and Fitness for Use](DISCLAIMER.md)** applies
+> in addition to this section and is incorporated into these terms by reference. Using
+> the software constitutes acceptance of it. See **[DISCLAIMER.md](DISCLAIMER.md)**.
 
 ## Definitions
 

@@ -41,7 +41,9 @@ short flare window). WiFi/Bluetooth are **off by design** — no EMI into the av
 
 > ⚠️ **Advisory only. Not certified equipment. Never a substitute for visual flare
 > judgment.** A wrong or late callout is worse than silence — the firmware
-> prioritizes correct, on-time numbers over features.
+> prioritizes correct, on-time numbers over features. **Experimental/advisory use only,
+> no warranty, use at your own risk — read the full
+> [DISCLAIMER](DISCLAIMER.md) before you build, install, or fly it.**
 
 > 🛒 **Novabox project.** Files and build kits available at
 > **[novabox.works](https://novabox.works/)**. A complete unit (including the smart
@@ -64,6 +66,7 @@ short flare window). WiFi/Bluetooth are **off by design** — no EMI into the av
 - [Project layout](#project-layout)
 - [Tests](#tests)
 - [Web emulator (no hardware)](#web-emulator-no-hardware)
+- [License & disclaimer](#license--disclaimer)
 
 ---
 
@@ -710,4 +713,22 @@ on `http://localhost:8000`, and opens the emulator page in your browser:
 
 ---
 
-*LidarAGL is an open-source project by [Novabox.Works](https://novabox.works/). Advisory use only.*
+## License & disclaimer
+
+LidarAGL is released under the **[PolyForm Noncommercial License 1.0.0](LICENSE.md)** —
+free for any *noncommercial* purpose (personal, hobby, study, research, non-profit,
+public-safety). **Commercial use requires a separate license** — contact
+**[Novabox.Works](https://novabox.works/)**. See **[LICENSE.md](LICENSE.md)** for the
+full terms.
+
+> ⚠️ **Read [DISCLAIMER.md](DISCLAIMER.md) before building, installing, or flying.**
+> LidarAGL is an **experimental, advisory aid** for experimental aircraft. It is **not
+> certified**, carries **no warranty**, and is **never** a substitute for proper flight
+> instruments and pilot judgment. **Use entirely at your own risk.** A non-commercial
+> license does not shield you, or anyone, from the risks of an advisory device on an
+> aircraft — the [full disclaimer](DISCLAIMER.md) governs your use.
+
+---
+
+*LidarAGL is an open-source project by [Novabox.Works](https://novabox.works/). Advisory
+use only — see the [License](LICENSE.md) and [Disclaimer](DISCLAIMER.md).*
