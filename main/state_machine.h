@@ -61,6 +61,12 @@ typedef struct {
     bool       have_prev;    /**< False until the first step seeds prev_agl.   */
     float      ground_ms;    /**< Continuous time held in GROUND (ms); disarms */
                              /**< at GROUND_RESET_MS, resets on leaving ground.*/
+
+    /*  "Positive rate" (climb) callout detector — see sm_step() and config.h.  */
+    bool       posrate_armed;  /**< Armed once settled in the flare region.     */
+    float      posrate_low_ms; /**< Continuous time at/below POSRATE_ARM_FT;    */
+                               /**< arms when it reaches FLARE_FADE_OUT_MS.      */
+    float      posrate_ms;     /**< Continuous sustained-climb time above gate. */
 } sm_ctx_t;
 
 /** Result of one sm_step() evaluation. */
@@ -70,6 +76,8 @@ typedef struct {
     poll_profile_t poll;           /**< Poll profile to apply.                */
     float          tone_agl;       /**< AGL to hand the audio engine.         */
     bool           tone_active;    /**< Whether the presence tone should play. */
+    bool           fired_positive_rate; /**< True the one tick a confirmed     */
+                                        /**< climb fires the "positive rate" call.*/
 } sm_out_t;
 
 /**

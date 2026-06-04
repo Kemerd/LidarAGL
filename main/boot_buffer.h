@@ -169,6 +169,49 @@ void config_save_tone_volume(float db);
 void config_wipe_tone_volume(void);
 
 /**
+ * @brief Load the saved "check gear" descent-callout altitude (ft) from NVS.
+ *
+ * @details Stored as a u16 of feet. The feature is OFF (disabled) by default, so
+ *          an ABSENT key — or an explicitly stored 0 — both mean OFF; any other
+ *          value is the gear-check altitude in feet.
+ *
+ * @return The stored altitude in feet, or 0 (OFF) if absent / unreadable.
+ */
+float config_load_gear_check_alt(void);
+
+/**
+ * @brief Persist the chosen "check gear" altitude (ft) to NVS.
+ * @param ft  Altitude in feet, or 0 to disable (OFF). Stored as a u16 (rounded).
+ */
+void config_save_gear_check_alt(float ft);
+
+/**
+ * @brief Erase the saved gear-check altitude (next load returns OFF).
+ */
+void config_wipe_gear_check_alt(void);
+
+/**
+ * @brief Load the saved "positive rate" climb-callout enable flag from NVS.
+ *
+ * @details Stored as a u8 (0/1). The feature is DISABLED by default, so an absent
+ *          / unreadable / zero value all mean disabled.
+ *
+ * @return true if the positive-rate callout is enabled, false otherwise.
+ */
+bool config_load_positive_rate(void);
+
+/**
+ * @brief Persist the "positive rate" climb-callout enable flag to NVS.
+ * @param enabled  Whether the callout is enabled.
+ */
+void config_save_positive_rate(bool enabled);
+
+/**
+ * @brief Erase the saved positive-rate flag (next load returns disabled).
+ */
+void config_wipe_positive_rate(void);
+
+/**
  * @brief Load the stored ground readings.
  * @param out  Destination array (capacity @p cap).
  * @param cap  Capacity in entries.

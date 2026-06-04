@@ -360,6 +360,107 @@ static void test_ground_dwell_disarm(const sensor_profile_t *p)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ *  "Positive rate" climb callout. A confirmed-climb detector: armed only once
+ *  settled in the flare region (held at/below POSRATE_ARM_FT for the flare
+ *  fade-out time), then fires one-shot after a sustained >= POSRATE_MIN_FPS climb
+ *  above the gate for POSRATE_SUSTAIN_MS. Re-arms on every settled touch, so it
+ *  fires on every takeoff — not just the first.
+ * ------------------------------------------------------------------------- */
+
+/* Step once and report whether the positive-rate callout fired this tick. */
+static bool step_posrate(sm_ctx_t *c, float agl, const sensor_profile_t *p)
+{
+    sm_out_t out;
+    sm_step(c, agl, DT, p, &out);
+    return out.fired_positive_rate;
+}
+
+/* Ramp AGL from 'from' to 'to' in 'step' increments; return the number of ticks
+ * on which the positive-rate callout fired. */
+static int ramp_posrate(sm_ctx_t *c, const sensor_profile_t *p,
+                        float from, float to, float step)
+{
+    int fires = 0;
+    float agl = from;
+    while ((step < 0 && agl >= to) || (step > 0 && agl <= to)) {
+        if (step_posrate(c, agl, p)) {
+            ++fires;
+        }
+        agl += step;
+    }
+    return fires;
+}
+
+/* Hold AGL steady for 'ticks' and return the number of positive-rate fires. */
+static int hold_posrate(sm_ctx_t *c, const sensor_profile_t *p, float agl, int ticks)
+{
+    int fires = 0;
+    for (int i = 0; i < ticks; ++i) {
+        if (step_posrate(c, agl, p)) {
+            ++fires;
+        }
+    }
+    return fires;
+}
+
+static void test_positive_rate(const sensor_profile_t *p)
+{
+    char msg[96];
+
+    /* A brisk but realistic climb: 0.4 ft/tick = 16 ft/s (~960 fpm), well above
+     * the 100 fpm floor. Settled-low arming needs FLARE_FADE_OUT_MS continuously
+     * at/below the gate; with DT this is that many ticks plus a margin.          */
+    const float CLIMB_STEP   = 0.4f;
+    const int   SETTLE_TICKS = (int)(FLARE_FADE_OUT_MS / (DT * 1000.0f)) + 10;
+
+    /* --- Part A: a confirmed climb from the ground fires exactly once. -------- */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_GROUND);                 /* seeded on the ground -> armed */
+        hold_posrate(&c, p, 0.0f, 5);           /* settle a moment on the ground */
+        int fires = ramp_posrate(&c, p, 0.0f, 150.0f, CLIMB_STEP);
+        snprintf(msg, sizeof msg, "[%s] positive rate fires once on a real climb", p->name);
+        ASSERT_TRUE(fires == 1, msg);
+    }
+
+    /* --- Part B: it re-arms on the ground and fires again on the NEXT takeoff. */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_GROUND);
+        ramp_posrate(&c, p, 0.0f, 150.0f, CLIMB_STEP);   /* first takeoff (fires) */
+        ramp_posrate(&c, p, 150.0f, 0.0f, -CLIMB_STEP);  /* land back down        */
+        hold_posrate(&c, p, 0.0f, SETTLE_TICKS);         /* settle -> re-arm      */
+        int fires = ramp_posrate(&c, p, 0.0f, 150.0f, CLIMB_STEP);
+        snprintf(msg, sizeof msg, "[%s] positive rate re-fires on a second takeoff", p->name);
+        ASSERT_TRUE(fires == 1, msg);
+    }
+
+    /* --- Part C: a bounce (brief dip below the gate) must NOT arm it. --------- */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_ARMED);                  /* flying seed -> NOT armed      */
+        /* Dip to 5 ft only briefly — far less than the fade-out settle time —
+         * then climb away. The settle never completes, so nothing arms or fires. */
+        hold_posrate(&c, p, 5.0f, SETTLE_TICKS / 4);
+        int fires = ramp_posrate(&c, p, 5.0f, 150.0f, CLIMB_STEP);
+        snprintf(msg, sizeof msg, "[%s] a bounce below the gate never arms positive rate", p->name);
+        ASSERT_TRUE(fires == 0, msg);
+    }
+
+    /* --- Part D: a brief, non-sustained climb (window never fills) is silent. - */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_GROUND);                 /* armed */
+        /* Hop to ~20 ft then hold level: the climb is above the gate only briefly
+         * and the rate then collapses, so the 2 s sustain window never fills.    */
+        ramp_posrate(&c, p, 0.0f, 20.0f, CLIMB_STEP);
+        int fires = hold_posrate(&c, p, 20.0f, 200);   /* 5 s level at 20 ft */
+        snprintf(msg, sizeof msg, "[%s] an unsustained hop does not fire positive rate", p->name);
+        ASSERT_TRUE(fires == 0, msg);
+    }
+}
+
 int main(void)
 {
     const sensor_profile_t *profiles[2] = { &SF30C_PROFILE, &SF30D_PROFILE };
@@ -376,6 +477,7 @@ int main(void)
         test_initial_state(p);
         test_trend_deadband(p);
         test_ground_dwell_disarm(p);
+        test_positive_rate(p);
     }
     printf("-- profile-specific high callouts --\n");
     test_high_callouts_profile_specific();

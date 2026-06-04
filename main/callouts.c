@@ -40,6 +40,9 @@ DECLARE_CLIP(_binary_three_hundred_pcm);
 DECLARE_CLIP(_binary_four_hundred_pcm);
 DECLARE_CLIP(_binary_five_hundred_pcm);
 DECLARE_CLIP(_binary_six_hundred_pcm);
+/*  Non-numeric spoken callouts. */
+DECLARE_CLIP(_binary_check_gear_pcm);
+DECLARE_CLIP(_binary_positive_rate_pcm);
 DECLARE_CLIP(_binary_calibration_error_pcm);
 /*  Spoken instruction played right after the calibration-error chirp: the chirp
  *  grabs attention, this voice line tells the pilot what to do.                 */
@@ -49,7 +52,9 @@ DECLARE_CLIP(_binary_please_reset_unit_on_the_ground_pcm);
  *  from small pieces to save flash. Filenames in assets/clips/ map to these
  *  symbols: chirp.pcm, config_mode.pcm, mono.pcm, stereo.pcm,
  *  callouts_and_tone.pcm, callouts_only.pcm, tone_only.pcm,
- *  callout_start_altitude.pcm. Start-altitude numbers reuse the CO_* clips.    */
+ *  callout_start_altitude.pcm, volume_adjustment.pcm, off.pcm. Start-altitude
+ *  and gear-check numbers reuse the CO_* clips; the gear-check and positive-rate
+ *  page titles reuse check_gear.pcm / positive_rate.pcm via callout_clip().     */
 DECLARE_CLIP(_binary_chirp_pcm);
 DECLARE_CLIP(_binary_config_mode_pcm);
 DECLARE_CLIP(_binary_mono_pcm);
@@ -59,6 +64,7 @@ DECLARE_CLIP(_binary_callouts_only_pcm);
 DECLARE_CLIP(_binary_tone_only_pcm);
 DECLARE_CLIP(_binary_callout_start_altitude_pcm);
 DECLARE_CLIP(_binary_volume_adjustment_pcm);
+DECLARE_CLIP(_binary_off_pcm);
 
 /* Compute the byte length of an embedded clip, or 0 if it is absent. */
 #define CLIP_LEN(sym) ((sym##_start && sym##_end) \
@@ -106,6 +112,8 @@ static void build_manifest(void)
     s_clips[CO_FOUR_HUNDRED]  = make_clip(_binary_four_hundred_pcm_start,  _binary_four_hundred_pcm_end,  "four hundred");
     s_clips[CO_FIVE_HUNDRED]  = make_clip(_binary_five_hundred_pcm_start,  _binary_five_hundred_pcm_end,  "five hundred");
     s_clips[CO_SIX_HUNDRED]   = make_clip(_binary_six_hundred_pcm_start,   _binary_six_hundred_pcm_end,   "six hundred");
+    s_clips[CO_CHECK_GEAR]    = make_clip(_binary_check_gear_pcm_start,    _binary_check_gear_pcm_end,    "check gear");
+    s_clips[CO_POSITIVE_RATE] = make_clip(_binary_positive_rate_pcm_start, _binary_positive_rate_pcm_end, "positive rate");
 
     s_chirp       = make_clip(_binary_calibration_error_pcm_start, _binary_calibration_error_pcm_end, "calib error");
     s_calib_voice = make_clip(_binary_please_reset_unit_on_the_ground_pcm_start,
@@ -122,6 +130,7 @@ static void build_manifest(void)
     s_cfg_pieces[CFG_PIECE_TONE_ONLY]         = make_clip(_binary_tone_only_pcm_start,              _binary_tone_only_pcm_end,              "tone only");
     s_cfg_pieces[CFG_PIECE_START_ALT]         = make_clip(_binary_callout_start_altitude_pcm_start, _binary_callout_start_altitude_pcm_end, "callout start altitude");
     s_cfg_pieces[CFG_PIECE_VOLUME_ADJ]        = make_clip(_binary_volume_adjustment_pcm_start,      _binary_volume_adjustment_pcm_end,      "volume adjustment");
+    s_cfg_pieces[CFG_PIECE_OFF]               = make_clip(_binary_off_pcm_start,                    _binary_off_pcm_end,                    "off");
 
     s_built = true;
 }

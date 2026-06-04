@@ -35,6 +35,12 @@ typedef enum {
     CO_FOUR_HUNDRED,
     CO_FIVE_HUNDRED,
     CO_SIX_HUNDRED,
+    /*  Non-numeric spoken callouts (no altitude maps to them via
+     *  callout_id_for_ft). CO_CHECK_GEAR is queued right AFTER the altitude
+     *  number at the gear-check altitude to say "... check gear"; CO_POSITIVE_RATE
+     *  is the standalone takeoff climb call.                                      */
+    CO_CHECK_GEAR,
+    CO_POSITIVE_RATE,
     CO_COUNT
 } callout_id_t;
 
@@ -61,6 +67,7 @@ typedef enum {
     CFG_PIECE_TONE_ONLY,         /**< "Tone Only"                                */
     CFG_PIECE_START_ALT,         /**< "Callout Start Altitude"                   */
     CFG_PIECE_VOLUME_ADJ,        /**< "Volume Adjustment"                        */
+    CFG_PIECE_OFF,               /**< "Off" — disabled choice in the new menus   */
     CFG_PIECE_COUNT
 } config_piece_t;
 

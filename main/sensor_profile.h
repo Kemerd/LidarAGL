@@ -43,6 +43,14 @@ typedef struct {
     const float   *callouts;       /**< Descending callout heights (ft AGL).   */
     size_t         n_callouts;     /**< Number of entries in @ref callouts.    */
     float          cruise_ft;      /**< At/above this -> low-power CRUISE.      */
+
+    /*  Altitudes the config menu offers for the "check gear" descent callout,
+     *  highest first. A subset of @ref callouts kept a notch below the sensor's
+     *  noisy ceiling (the very top callout is excluded so the reminder always
+     *  fires on a trustworthy reading). The menu also offers an OFF choice on top
+     *  of these. SF30/C: {200,100}; SF30/D: {500,400,300,200,100}.              */
+    const float   *gear_check_opts;   /**< Descending gear-check altitude menu.  */
+    size_t         n_gear_check_opts; /**< Number of entries in gear_check_opts. */
 } sensor_profile_t;
 
 /* The two built-in profiles. Defined once in sensor_profile.c. */

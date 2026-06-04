@@ -33,6 +33,18 @@ static const float SF30D_CALLOUTS[] = {
     600.0f, 500.0f, 400.0f, 300.0f, 200.0f, 100.0f, 50.0f, 40.0f, 30.0f, 20.0f, 10.0f
 };
 
+/* ---------------------------------------------------------------------------
+ *  "Check gear" descent-callout altitude options offered in the config menu
+ *  (descending, highest first; the menu adds an OFF choice on top of these).
+ *
+ *  Each list is the profile's "hundreds" callouts MINUS the very top one, so the
+ *  reminder always lands on a reading with sensor headroom to spare: the SF30/C
+ *  tops its ladder at 300 ft (near its ~328 ft ceiling) so gear-check maxes at
+ *  200; the SF30/D tops at 600 ft so gear-check maxes at 500.
+ * ------------------------------------------------------------------------- */
+static const float SF30C_GEAR_CHECK_OPTS[] = { 200.0f, 100.0f };
+static const float SF30D_GEAR_CHECK_OPTS[] = { 500.0f, 400.0f, 300.0f, 200.0f, 100.0f };
+
 /* ---- The immutable profiles --------------------------------------------- */
 
 const sensor_profile_t SF30C_PROFILE = {
@@ -41,7 +53,9 @@ const sensor_profile_t SF30C_PROFILE = {
     .max_range_ft = 328.0f,                 /* 100 m                          */
     .callouts     = SF30C_CALLOUTS,
     .n_callouts   = sizeof(SF30C_CALLOUTS) / sizeof(SF30C_CALLOUTS[0]),
-    .cruise_ft    = 305.0f,                 /* margin below the 328 ft ceiling */
+    .cruise_ft    = 318.0f,                 /* margin below the 328 ft ceiling */
+    .gear_check_opts   = SF30C_GEAR_CHECK_OPTS,
+    .n_gear_check_opts = sizeof(SF30C_GEAR_CHECK_OPTS) / sizeof(SF30C_GEAR_CHECK_OPTS[0]),
 };
 
 const sensor_profile_t SF30D_PROFILE = {
@@ -51,6 +65,8 @@ const sensor_profile_t SF30D_PROFILE = {
     .callouts     = SF30D_CALLOUTS,
     .n_callouts   = sizeof(SF30D_CALLOUTS) / sizeof(SF30D_CALLOUTS[0]),
     .cruise_ft    = 605.0f,                 /* sleep above the top callout     */
+    .gear_check_opts   = SF30D_GEAR_CHECK_OPTS,
+    .n_gear_check_opts = sizeof(SF30D_GEAR_CHECK_OPTS) / sizeof(SF30D_GEAR_CHECK_OPTS[0]),
 };
 
 /* ---- Selectors ----------------------------------------------------------- */

@@ -322,6 +322,104 @@ void config_wipe_tone_volume(void)
     ESP_LOGW(TAG, "tone volume wiped (will use 0 dB)");
 }
 
+/* ---- "Check gear" descent-callout altitude (0 == OFF) -------------------- */
+
+float config_load_gear_check_alt(void)
+{
+    /* Stored as a u16 of feet. OFF by default: an absent key OR a stored 0 both
+     * mean disabled, so we never need to distinguish "never set" from "set OFF". */
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return 0.0f;   /* OFF */
+    }
+    uint16_t v = 0;
+    esp_err_t err = nvs_get_u16(h, NVS_KEY_GEARCHK, &v);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return 0.0f;   /* absent / unreadable -> OFF */
+    }
+    return (float)v;   /* 0 == OFF, else the chosen altitude in feet */
+}
+
+void config_save_gear_check_alt(float ft)
+{
+    if (ft < 0.0f) {
+        ft = 0.0f;
+    }
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed; gear-check altitude not persisted");
+        return;
+    }
+    /* Round to the nearest foot; the menu only offers integer callout heights
+     * (or 0 for OFF).                                                            */
+    uint16_t v = (uint16_t)(ft + 0.5f);
+    if (nvs_set_u16(h, NVS_KEY_GEARCHK, v) == ESP_OK) {
+        nvs_commit(h);
+        ESP_LOGI(TAG, "gear-check altitude saved: %u ft%s", v, v == 0 ? " (OFF)" : "");
+    } else {
+        ESP_LOGE(TAG, "nvs_set_u16 failed; gear-check altitude not persisted");
+    }
+    nvs_close(h);
+}
+
+void config_wipe_gear_check_alt(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, NVS_KEY_GEARCHK);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "gear-check altitude wiped (will use OFF)");
+}
+
+/* ---- "Positive rate" climb-callout enable flag (disabled by default) ----- */
+
+bool config_load_positive_rate(void)
+{
+    /* Stored as a u8 (0/1). Disabled by default: absent / unreadable / zero all
+     * read as OFF, so a corrupt value can never enable an unwanted callout.      */
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    uint8_t v = 0;
+    esp_err_t err = nvs_get_u8(h, NVS_KEY_POSRATE, &v);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return false;
+    }
+    return v != 0;
+}
+
+void config_save_positive_rate(bool enabled)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed; positive-rate flag not persisted");
+        return;
+    }
+    if (nvs_set_u8(h, NVS_KEY_POSRATE, enabled ? 1u : 0u) == ESP_OK) {
+        nvs_commit(h);
+        ESP_LOGI(TAG, "positive-rate callout saved: %s", enabled ? "ON" : "OFF");
+    } else {
+        ESP_LOGE(TAG, "nvs_set_u8 failed; positive-rate flag not persisted");
+    }
+    nvs_close(h);
+}
+
+void config_wipe_positive_rate(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, NVS_KEY_POSRATE);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "positive-rate flag wiped (will use disabled)");
+}
+
 /* ---- Load / commit ------------------------------------------------------- */
 
 size_t boot_buffer_load(boot_entry_t *out, size_t cap)

@@ -242,6 +242,8 @@ until you change it again.
 |---|---|---|
 | **Audio mode** | **Stereo, Callouts & Tone** | `DEFAULT_AUDIO_MODE` in `config.h` |
 | **Callout start altitude** | **Profile top** — 200 ft (SF30/C) / 500 ft (SF30/D) | the highest number that speaks |
+| **Check-gear altitude** | **OFF** | descent "check gear" reminder; off until you set it |
+| **Positive rate** | **OFF** | takeoff climb callout; off until you enable it |
 | Ground reference | learned at every boot | not a menu item — see [Ground reference](#ground-reference-no-manual-calibration) |
 
 ### Entering config mode
@@ -283,6 +285,31 @@ operation with your settings.
 > **Example:** pick *Stereo, Callouts & Tone*, then set start altitude to **100** on
 > an SF30/C → you'll hear "one hundred, fifty, forty…" down to ten, but never
 > "two hundred", with the stereo presence tone the whole way down.
+
+After the start-altitude there are the two **volume-adjustment** levels (tone, then
+voice), then the two optional callouts below. *All of these are skipped automatically
+if you picked **Tone Only*** — there are no spoken callouts to attach them to.
+
+**"Check Gear" altitude.** *Off by default.* You'll hear *"check gear"* then the
+current value. Tap to cycle **OFF → highest → … → lowest → OFF**; double-tap (or wait)
+to confirm. When set, the box speaks the altitude number **then "check gear"** as you
+descend through it — e.g. *"two hundred … check gear"* — and the reminder always
+speaks even if it sits above your start-altitude cap (it's a deliberate, independent
+call):
+
+- **SF30/C:** OFF → 200 → 100
+- **SF30/D:** OFF → 500 → 400 → 300 → 200 → 100
+
+**"Positive Rate" callout.** *Off by default.* A takeoff "positive rate of climb"
+reminder. You'll hear *"positive rate"* then the current setting; tap to toggle
+**ON / OFF**, double-tap (or wait) to confirm. When ON, the box says *"positive rate"*
+once after each takeoff (and touch-and-go) — but only after a **confirmed** climb: it
+arms once the aircraft has settled in the flare region (held below 10 ft long enough
+for the tone's fade-out to finish, so a bounce never arms it), then fires after the
+climb rate holds **≥ 100 fpm for a continuous 2 s** above 10 ft. That confirmation
+window is what rejects a bounce, a flare balloon, or sensor jitter.
+
+After confirming this last level the unit **reboots** into normal operation.
 
 ### Wiring for stereo
 Mono vs stereo is a runtime choice and the DAC **always drives both channels**, so
@@ -348,6 +375,10 @@ phrase, and the start-altitude reuses the existing number clips:
 | `callouts_only.pcm` | "Callouts Only" (stream piece) |
 | `tone_only.pcm` | "Tone Only" (stream piece) |
 | `callout_start_altitude.pcm` | "Callout Start Altitude" |
+| `volume_adjustment.pcm` | "Volume Adjustment" |
+| `check_gear.pcm` | "Check gear" (descent reminder + its menu title) |
+| `positive_rate.pcm` | "Positive rate" (climb callout + its menu title) |
+| `off.pcm` | "Off" (the OFF choice in the check-gear / positive-rate menus) |
 
 The converter sniffs the header, so a `.pcm` file that is secretly a renamed WAV
 still converts — you can pass `assets/original_audio/*.pcm` alongside the WAVs.

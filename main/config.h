@@ -310,6 +310,41 @@
 #define FLARE_FADE_OUT_MS   3000      /* full->silent fade-out time              */
 #define FLARE_FADE_IN_MS    100       /* silent->full quick restore on re-cross  */
 
+/* ---- "Positive rate" climb callout (takeoff / touch-and-go) -------------- */
+/*  A spoken "positive rate" reminder on the way UP, modelled on the standard
+ *  "positive rate, gear up" cockpit call. It is DISABLED by default (a config-
+ *  menu toggle enables it) and is deliberately NOT a single AGL crossing: a lone
+ *  sample at some height would fire on a bounce, a flare balloon, or sensor
+ *  jitter. Instead we CONFIRM a genuine sustained climb:
+ *
+ *    1) ARM the detector only once the aircraft has SETTLED in the flare /
+ *       touch-and-go region — held at or below POSRATE_ARM_FT (intentionally the
+ *       same 10 ft as FLARE_FADE_FT) continuously long enough for the tone's
+ *       flare FADE-OUT to have finished, i.e. for FLARE_FADE_OUT_MS. Tying the
+ *       arm gate to the fade-out completion is the bounce guard the user asked
+ *       for: a bounce — a brief dip below 10 ft that pops back up before the fade
+ *       completes — never arms it. This still re-arms on EVERY landing/touch, so
+ *       a true touch-and-go re-arms for the next departure.
+ *    2) Once armed, the callout fires only after the aircraft has climbed back
+ *       ABOVE POSRATE_ARM_FT and the smoothed climb rate has held at or above
+ *       POSRATE_MIN_FPS CONTINUOUSLY for POSRATE_SUSTAIN_MS. The sustain window
+ *       is the part that rejects noise — we are confirming that the climb is real
+ *       and persistent, not measuring a specific climb performance. 100 fpm is a
+ *       floor comfortably above lidar jitter; a real Glasair III climb of many
+ *       hundreds of fpm clears it almost instantly.
+ *    3) One-shot: after firing it disarms until the aircraft has settled back in
+ *       the arm region (i.e. the next landing / touch completes its fade-out).    */
+#define POSRATE_ARM_FT      10.0f     /* arm at/below this AGL (matches FLARE_FADE_FT) */
+#define POSRATE_MIN_FPS     1.667f    /* 100 fpm climb floor (100/60 ft/s)        */
+#define POSRATE_SUSTAIN_MS  2000u     /* rate must hold this long, continuously   */
+
+/* ---- "Check gear" descent callout ---------------------------------------- */
+/*  At a pilot-configurable descent altitude the box speaks the altitude number
+ *  then "check gear" (e.g. "two hundred ... check gear"). The altitude is chosen
+ *  in the config menu from a per-profile list (see sensor_profile.c's
+ *  gear_check_opts) or turned OFF. It is OFF (disabled) by default — the stored
+ *  NVS value is 0 for OFF, or the chosen altitude in feet (see NVS_KEY_GEARCHK). */
+
 /* ---- Equal-loudness (ISO 226) correction --------------------------------- */
 /*  The tone's pitch ascends as the ground nears. The ear is more sensitive to
  *  higher pitches, so WITHOUT correction the tone would sound progressively
@@ -361,6 +396,8 @@
 #define NVS_KEY_STARTALT  "startalt"   /* u16: callout start-altitude cap in ft   */
 #define NVS_KEY_VOLOFS    "volofs"     /* u8: voice volume CUT magnitude in dB     */
 #define NVS_KEY_TONEVOL   "tonevol"    /* i8: tone volume offset in dB (signed)    */
+#define NVS_KEY_GEARCHK   "gearchk"    /* u16: gear-check altitude in ft (0 == OFF)*/
+#define NVS_KEY_POSRATE   "posrate"    /* u8: positive-rate callout enable (0/1)   */
 
 /* ---- Bench HIL simulation (USB-Serial-JTAG side-door) -------------------- */
 /*  A developer can bench-test THIS firmware with headphones and NO LiDAR fitted

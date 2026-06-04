@@ -29,6 +29,13 @@ void sm_init(sm_ctx_t *c, sm_state_t initial)
     c->have_prev  = false;
     c->ground_ms  = 0.0f;   /* fresh ground-dwell timer */
 
+    /*  Positive-rate detector. We pre-arm only when seeded on the ground; a
+     *  flying seed (in-flight reboot) starts DISARMED so a reboot mid-climb can
+     *  never blurt "positive rate". The low-dwell timer starts fresh either way. */
+    c->posrate_armed  = (initial == ST_GROUND);
+    c->posrate_low_ms = 0.0f;
+    c->posrate_ms     = 0.0f;
+
     /* If we are seeded into a flying state, the descent callouts must already
      * be armed — we may have rebooted mid-descent and need to fire on the way
      * down without first having to climb through ARM_FT again.                 */
@@ -271,6 +278,48 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
         c->ground_ms = 0.0f;
     }
 
+    /* --- "Positive rate" climb callout (takeoff / touch-and-go) ----------- */
+    /*  A confirmed-climb detector, deliberately NOT a single AGL crossing (a lone
+     *  sample would fire on a bounce, a flare balloon, or sensor jitter). See the
+     *  POSRATE_* block in config.h for the full rationale. In brief:
+     *
+     *    ARM gate (bounce guard): we arm only once the aircraft has SETTLED in the
+     *    flare region — held continuously at/below POSRATE_ARM_FT long enough for
+     *    the tone's flare fade-out to finish (FLARE_FADE_OUT_MS). A bounce that
+     *    pops back above the gate before the fade completes resets the dwell and
+     *    never arms. This re-arms on every landing/touch, so each departure (the
+     *    first or a touch-and-go) gets its own one-shot.
+     *
+     *    FIRE: once armed, the call fires after the aircraft has climbed back ABOVE
+     *    the gate AND the smoothed climb rate has held at/above POSRATE_MIN_FPS
+     *    (100 fpm) CONTINUOUSLY for POSRATE_SUSTAIN_MS. Then it disarms (one-shot)
+     *    until the next settled touch re-arms it.                                   */
+    bool posrate_fire = false;
+    if (agl_ft <= POSRATE_ARM_FT) {
+        /* In the flare / touch region: a real climb can't be in progress, so the
+         * sustain window is held at zero. Accrue settled-low time toward the arm. */
+        c->posrate_ms     = 0.0f;
+        c->posrate_low_ms += dt_s * 1000.0f;
+        if (c->posrate_low_ms >= (float)FLARE_FADE_OUT_MS) {
+            c->posrate_armed = true;   /* fade-out finished -> genuinely settled */
+        }
+    } else {
+        /* Above the gate: any low-dwell is broken, so a future dip must re-settle
+         * from scratch before it can arm again.                                   */
+        c->posrate_low_ms = 0.0f;
+        if (c->posrate_armed && trend >= POSRATE_MIN_FPS) {
+            /* Armed and climbing convincingly: grow the sustain window. */
+            c->posrate_ms += dt_s * 1000.0f;
+            if (c->posrate_ms >= (float)POSRATE_SUSTAIN_MS) {
+                posrate_fire     = true;   /* climb confirmed */
+                c->posrate_armed = false;  /* one-shot until re-armed on a touch */
+            }
+        } else {
+            /* Not armed, or the climb broke before the window filled: restart it. */
+            c->posrate_ms = 0.0f;
+        }
+    }
+
     /* --- Tone gating ------------------------------------------------------ */
     /*  The audio engine owns the dB swell curve; here we only decide WHETHER a
      *  tone should sound and feed it the current AGL. The tone is active only
@@ -280,9 +329,10 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
                        next != ST_GROUND &&
                        agl_ft <= TONE_START_FT;
 
-    out->state         = next;
-    out->fired_callout = fired;
-    out->poll          = poll_for_state(next);
-    out->tone_agl      = agl_ft;
-    out->tone_active   = tone_active;
+    out->state               = next;
+    out->fired_callout       = fired;
+    out->poll                = poll_for_state(next);
+    out->tone_agl            = agl_ft;
+    out->tone_active         = tone_active;
+    out->fired_positive_rate = posrate_fire;
 }

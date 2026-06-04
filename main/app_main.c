@@ -32,6 +32,7 @@
 #include "audio.h"
 #include "callouts.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -65,6 +66,16 @@ static float s_ground_ref_ft = MOUNT_OFFSET_FALLBACK_FT;
  *  during boot from the saved config; defaults to the profile's top callout, so
  *  the behaviour is unchanged unless the pilot lowers it in the config menu.    */
 static float s_start_alt_ft = 0.0f;   /* 0 == uncapped until boot sets it       */
+
+/*  "Check gear" descent-callout altitude (ft): when a fired descent callout lands
+ *  on this height the box appends a "check gear" clip after the number and lets it
+ *  through even if the start-altitude cap would otherwise suppress it. 0 == OFF
+ *  (the default). Set once during boot from the saved config.                     */
+static float s_gear_check_ft = 0.0f;
+
+/*  "Positive rate" climb callout enable flag. Disabled by default; the state
+ *  machine always evaluates the detector, but we only speak it when enabled.      */
+static bool  s_posrate_enabled = false;
 
 /*  Bench HIL: set during the boot attach probe when the connected bench tool
  *  asked to open the config menu this boot. Runtime-only (never persisted).      */
@@ -146,7 +157,11 @@ static size_t capture_ground_fill(float *out, size_t want)
  *       the selected offset. Skipped for the tone-only mode (no callouts to trim).
  *       Both offsets apply live so prompts afterward reflect them; DOUBLE-TAP /
  *       timeout confirms each.
- *    6. A chirp marks each confirm. Persist all values and reboot.
+ *    6. LEVEL 5 — "Check Gear" altitude. Skipped in tone-only mode. Cycle OFF ->
+ *       the profile's gear-check altitudes -> OFF, starting on OFF (the default).
+ *    7. LEVEL 6 — "Positive Rate" enable toggle. Skipped in tone-only mode. A
+ *       simple ON/OFF, starting OFF (the default).
+ *    8. A chirp marks each confirm. Persist all values and reboot.
  *
  *  This function does not return — it always ends in esp_restart().
  * ------------------------------------------------------------------------- */
@@ -300,6 +315,8 @@ static void run_config_menu(void)
     config_wipe_start_alt();
     config_wipe_tone_volume();
     config_wipe_voice_volume();
+    config_wipe_gear_check_alt();
+    config_wipe_positive_rate();
 
     /* Start the menu at 0 dB on BOTH offsets (no change) so the prompts/previews
      * play un-trimmed until the pilot chooses levels in LEVELs 3 & 4 below.       */
@@ -440,6 +457,79 @@ static void run_config_menu(void)
         ESP_LOGI(TAG, "config: tone-only mode, skipping voice-volume menu");
     }
 
+    /* ---- LEVEL 5: "Check Gear" altitude ----------------------------------- */
+    /* The descent "check gear" reminder. Cycle is OFF -> highest -> ... -> lowest
+     * -> OFF, starting on OFF (the default). The page title reuses the "check gear"
+     * clip itself; altitudes are spoken with the existing number clips and OFF with
+     * the "off" piece. Skipped in tone-only mode (it is a voice callout).         */
+    if (chosen.callouts_enabled) {
+        const float *opts   = g_profile->gear_check_opts;
+        size_t       n_opts = g_profile->n_gear_check_opts;
+        /* Selection index across [OFF, opts[0], opts[1], ...]: 0 == OFF, and
+         * 1..n_opts select opts[sel-1]. Start on OFF.                            */
+        size_t sel = 0;
+
+        audio_play_clip_blocking(callout_clip(CO_CHECK_GEAR));      /* "check gear" */
+        vTaskDelay(pdMS_TO_TICKS(120));
+        audio_play_clip_blocking(config_clip_piece(CFG_PIECE_OFF)); /* starting OFF */
+
+        idle_ms = 0;
+        for (;;) {
+            tap_event_t ev = wait_tap_event(&idle_ms);
+            if (ev == TAP_DOUBLE || ev == TAP_TIMEOUT) {
+                break;                          /* confirm this altitude (or OFF) */
+            }
+            if (ev == TAP_SINGLE) {
+                sel = (sel + 1) % (n_opts + 1); /* cycle OFF -> opts... -> OFF */
+                if (sel == 0) {
+                    ESP_LOGI(TAG, "config: gear-check -> OFF");
+                    audio_play_clip_blocking(config_clip_piece(CFG_PIECE_OFF));
+                } else {
+                    float ft = opts[sel - 1];
+                    ESP_LOGI(TAG, "config: gear-check -> %.0f ft", ft);
+                    audio_play_clip_blocking(callout_clip(callout_id_for_ft(ft)));
+                }
+            }
+        }
+        audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
+        config_save_gear_check_alt(sel == 0 ? 0.0f : opts[sel - 1]);
+    } else {
+        ESP_LOGI(TAG, "config: tone-only mode, skipping gear-check menu");
+    }
+
+    /* ---- LEVEL 6: "Positive Rate" enable toggle --------------------------- */
+    /* A simple ON/OFF toggle for the takeoff climb callout, starting OFF (the
+     * default). The page title reuses the "positive rate" clip; ON auditions that
+     * same clip and OFF speaks the "off" piece. Skipped in tone-only mode.        */
+    if (chosen.callouts_enabled) {
+        bool pr_on = false;                     /* start OFF (the default) */
+
+        audio_play_clip_blocking(callout_clip(CO_POSITIVE_RATE));   /* title */
+        vTaskDelay(pdMS_TO_TICKS(120));
+        audio_play_clip_blocking(config_clip_piece(CFG_PIECE_OFF)); /* starting OFF */
+
+        idle_ms = 0;
+        for (;;) {
+            tap_event_t ev = wait_tap_event(&idle_ms);
+            if (ev == TAP_DOUBLE || ev == TAP_TIMEOUT) {
+                break;                          /* confirm this setting */
+            }
+            if (ev == TAP_SINGLE) {
+                pr_on = !pr_on;
+                ESP_LOGI(TAG, "config: positive-rate -> %s", pr_on ? "ON" : "OFF");
+                if (pr_on) {
+                    audio_play_clip_blocking(callout_clip(CO_POSITIVE_RATE));
+                } else {
+                    audio_play_clip_blocking(config_clip_piece(CFG_PIECE_OFF));
+                }
+            }
+        }
+        audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
+        config_save_positive_rate(pr_on);
+    } else {
+        ESP_LOGI(TAG, "config: tone-only mode, skipping positive-rate menu");
+    }
+
     ESP_LOGW(TAG, "config committed (mode %d); rebooting", selected_mode);
     vTaskDelay(pdMS_TO_TICKS(50));   /* let the log + DMA flush */
     esp_restart();                   /* does not return */
@@ -489,19 +579,39 @@ static void logic_task(void *arg)
         /* Fire the callout, if any, mapping the profile height -> clip id.
          * Suppress any callout ABOVE the configured start-altitude cap so the
          * pilot only hears numbers from their chosen ceiling down (the tone is
-         * unaffected). With the cap at the profile top this never suppresses.   */
+         * unaffected). With the cap at the profile top this never suppresses.
+         *
+         * The "check gear" reminder rides on this fire: when the crossed height
+         * is the pilot's gear-check altitude we (a) let the number through even
+         * if the start-altitude cap would have suppressed it — the reminder is a
+         * deliberate, independent safety call — and (b) queue the "check gear"
+         * clip right after the number so it speaks "<height> ... check gear".    */
         if (out.fired_callout >= 0) {
             float ft = g_profile->callouts[out.fired_callout];
-            if (ft <= s_start_alt_ft) {
+            bool  is_gear_check = (s_gear_check_ft > 0.0f) &&
+                                  (fabsf(ft - s_gear_check_ft) < 0.5f);
+            if (ft <= s_start_alt_ft || is_gear_check) {
                 callout_id_t cid = callout_id_for_ft(ft);
                 if (cid != CO_COUNT) {
-                    audio_request_callout(cid);
+                    audio_request_callout(cid);           /* the altitude number */
                 }
-                ESP_LOGI(TAG, "callout %.0f ft (state=%d)", ft, out.state);
+                if (is_gear_check) {
+                    audio_request_callout(CO_CHECK_GEAR); /* "... check gear"     */
+                }
+                ESP_LOGI(TAG, "callout %.0f ft%s (state=%d)",
+                         ft, is_gear_check ? " + check gear" : "", out.state);
             } else {
                 ESP_LOGI(TAG, "callout %.0f ft suppressed (cap %.0f ft)",
                          ft, s_start_alt_ft);
             }
+        }
+
+        /* "Positive rate" climb callout: the state machine confirms a sustained
+         * post-liftoff climb (see sm_step); we only voice it when the pilot has
+         * enabled the feature.                                                    */
+        if (out.fired_positive_rate && s_posrate_enabled) {
+            audio_request_callout(CO_POSITIVE_RATE);
+            ESP_LOGI(TAG, "positive rate (climb confirmed, state=%d)", out.state);
         }
 
         /* Publish tone params + poll cadence. */
@@ -666,6 +776,15 @@ void app_main(void)
      * callout is the default when nothing has been configured).                 */
     s_start_alt_ft = config_load_start_alt(g_profile->callouts[0]);
     ESP_LOGI(TAG, "callout start-altitude cap: %.0f ft", s_start_alt_ft);
+
+    /* Resolve the two new optional callouts. Gear-check is OFF (0) by default and
+     * positive-rate is disabled by default, so an un-configured box behaves exactly
+     * as before until the pilot turns them on in the menu.                        */
+    s_gear_check_ft   = config_load_gear_check_alt();
+    s_posrate_enabled = config_load_positive_rate();
+    ESP_LOGI(TAG, "gear-check altitude: %.0f ft%s | positive-rate: %s",
+             s_gear_check_ft, s_gear_check_ft <= 0.0f ? " (OFF)" : "",
+             s_posrate_enabled ? "ON" : "OFF");
 
     /* Apply the saved TONE + VOICE volume offsets (0 dB == no change). Done after
      * the menu branch so freshly-committed values are the ones in effect this boot. */
