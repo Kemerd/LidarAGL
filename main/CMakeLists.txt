@@ -13,9 +13,24 @@
 #  We glob rather than enumerate so a partial clip set never breaks the build.
 #  CONFIGURE_DEPENDS makes CMake re-run the glob when files are added/removed,
 #  so newly generated clips get picked up without a manual clean.
+#
+#  Caveat (ESP-IDF v6+): before the real configure, the build system parses each
+#  component's CMakeLists.txt in CMake *script mode* (cmake -P) purely to harvest
+#  its REQUIRES. CONFIGURE_DEPENDS is illegal in script mode and aborts that pass
+#  ("CONFIGURE_DEPENDS is invalid for script and find package modes"). The
+#  built-in CMAKE_SCRIPT_MODE_FILE variable is defined ONLY during that pass, so
+#  we omit CONFIGURE_DEPENDS there and keep it for the normal project-mode
+#  configure, where the auto-reglob is the part that actually matters.
 # -----------------------------------------------------------------------------
-file(GLOB CLIP_FILES CONFIGURE_DEPENDS
-     "${CMAKE_CURRENT_LIST_DIR}/../assets/clips/*.pcm")
+if(CMAKE_SCRIPT_MODE_FILE)
+    # Requirement-harvest pass: plain glob (CONFIGURE_DEPENDS not allowed here).
+    file(GLOB CLIP_FILES "${CMAKE_CURRENT_LIST_DIR}/../assets/clips/*.pcm")
+else()
+    # Normal configure: keep CONFIGURE_DEPENDS so added/removed clips re-trigger
+    # the glob without a manual clean.
+    file(GLOB CLIP_FILES CONFIGURE_DEPENDS
+         "${CMAKE_CURRENT_LIST_DIR}/../assets/clips/*.pcm")
+endif()
 
 idf_component_register(
     SRCS
