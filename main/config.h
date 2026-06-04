@@ -213,6 +213,15 @@
  *  volume preview plays at the same net level the running box will.               */
 #define OUTPUT_HEADROOM_DB  -3.2f
 
+/*  Output makeup gain — a deliberate loudness LIFT applied to the final mix (tone +
+ *  voice together), on top of the headroom above and the pilot's volume offset. The
+ *  render meter showed the hottest real sample sitting near -7 dBFS, i.e. ~7 dB of
+ *  unused headroom, so we spend some of it here to drive the line output harder by
+ *  default. The hard limiter in f32_to_s16() remains the safety net for the rare
+ *  worst-case peak, and OUTPUT_HEADROOM_DB still reserves margin for the
+ *  equal-loudness boost; this just decides how much of the remaining room to use.   */
+#define OUTPUT_MAKEUP_DB    6.0f
+
 /* ---- Audio: voice-sidechain duck (a real compressor, keyed off the voice) -- */
 /*  The tone ducks UNDER the voice the way a broadcast "voice over music" ducker
  *  does: instead of slamming to a fixed attenuation the instant a clip starts

@@ -109,6 +109,11 @@ static volatile float s_master_gain = 1.0f;
  *  the mix to full scale (see OUTPUT_HEADROOM_DB in config.h). 1.0 until init runs.  */
 static float s_headroom = 1.0f;
 
+/*  Output makeup gain as a LINEAR multiplier (db_to_gain(OUTPUT_MAKEUP_DB)). A
+ *  deliberate loudness lift applied alongside the headroom to every output sample
+ *  (flight render + blocking config playback). 1.0 until init runs. See config.h.   */
+static float s_makeup = 1.0f;
+
 /*  Steady baseline trim applied to the presence tone whenever the active mode
  *  plays callouts (TONE_TRIM_WITH_VOICE_DB). Resolved once at init from
  *  s_cfg.callouts_enabled into a linear gain so the per-sample path is a bare
@@ -259,6 +264,7 @@ void audio_init(const audio_config_t *cfg)
      * sample so the equal-loudness boost can never reach full scale — see
      * OUTPUT_HEADROOM_DB. The hard limiter in f32_to_s16() stays as a backstop. */
     s_headroom = db_to_gain(OUTPUT_HEADROOM_DB);
+    s_makeup   = db_to_gain(OUTPUT_MAKEUP_DB);   /* deliberate loudness lift */
 
     /* Flare-fade steps: a full 0..1 swing covers the configured fade time. The
      * out-step is the SLOW 3 s fade under the flare; the in-step is the QUICK
@@ -425,7 +431,8 @@ void audio_play_clip_blocking(const clip_t *c)
             /* Same fixed output headroom as the flight render path so the spoken
              * config-menu prompts (and the volume preview) play at the exact net
              * level the running box will use — not 3.2 dB hotter. */
-            int16_t s = (int16_t)((float)pcm[written_total + i] * mg * s_headroom);
+            int16_t s = (int16_t)((float)pcm[written_total + i] * mg
+                                  * s_headroom * s_makeup);
             buf[2 * i]     = s;   /* L */
             buf[2 * i + 1] = s;   /* R */
         }
@@ -589,8 +596,8 @@ static inline float mix_limit(float x, bool voice_active)
  *       so a future gain mistake degrades to a tick instead of a wrap.             */
 static inline int16_t f32_to_s16(float x)
 {
-    x *= s_headroom;                      /* primary: reserve headroom (gain-stage) */
-    if (x >  1.0f) x =  1.0f;             /* backstop limiter — should never fire   */
+    x *= s_headroom * s_makeup;           /* reserve headroom, then the loudness lift */
+    if (x >  1.0f) x =  1.0f;             /* backstop limiter — guards the rare peak  */
     if (x < -1.0f) x = -1.0f;
     return (int16_t)(x * 32767.0f);
 }
@@ -814,8 +821,8 @@ void audio_task(void *arg)
 
             /* TEMP DEBUG: measure the post-headroom magnitude so we can see whether
              * the backstop limiter is firing (peak > 1.0) and how often. */
-            float dl = fabsf(left  * mg) * s_headroom;
-            float dr = fabsf(right * mg) * s_headroom;
+            float dl = fabsf(left  * mg) * s_headroom * s_makeup;
+            float dr = fabsf(right * mg) * s_headroom * s_makeup;
             if (dl > dbg_peak) dbg_peak = dl;
             if (dr > dbg_peak) dbg_peak = dr;
             if (dl > 1.0f || dr > 1.0f) dbg_clip++;
