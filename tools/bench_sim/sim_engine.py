@@ -32,6 +32,8 @@ class SimEngine:
         self.ground_offset_ft = 3.0             # simulated mount height
         self.sigma_ft = 0.0                     # gaussian range jitter
         self.dropout_prob = 0.0                 # per-frame lost-signal probability
+        self.max_range_ft = 328.0               # sensor max range (SF30/C ~100 m);
+                                                # beyond it the bench sends lost-signal
 
         # Read-back for the UI.
         self.last_agl_ft = 0.0
@@ -70,7 +72,8 @@ class SimEngine:
             # Advance the altitude source and synthesise the sensor reading.
             agl = self.model.update(dt)
             cm = noise.distance_cm(agl, self.ground_offset_ft,
-                                   self.sigma_ft, self.dropout_prob, self._rng)
+                                   self.sigma_ft, self.dropout_prob, self._rng,
+                                   self.max_range_ft)
             self.serial.send(codec.build_distance_frame(cm))
 
             self.last_agl_ft = agl

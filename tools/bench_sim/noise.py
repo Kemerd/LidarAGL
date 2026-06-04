@@ -19,19 +19,37 @@ import protocol as P
 
 
 def distance_cm(agl_ft: float, ground_offset_ft: float,
-                sigma_ft: float, dropout_prob: float, rng) -> int:
+                sigma_ft: float, dropout_prob: float, rng,
+                max_range_ft: float = 0.0, edge_band_ft: float = 30.0) -> int:
     """Turn a desired AGL into the centimetre value the sensor would report.
 
     The firmware computes AGL = range - ground_ref, so the bench sends RANGE:
         range_ft = agl_ft + ground_offset_ft   (+ gaussian jitter)
-    With probability `dropout_prob` we instead emit the lost-signal sentinel.
+
+    Out-of-range modelling: a real SF30 can't see the ground past its max range
+    (SF30/C ~328 ft / 100 m), so beyond it the bench emits the lost-signal
+    sentinel just like the sensor would. We ramp into it across the last
+    `edge_band_ft` (returns get progressively flakier near the limit) and go to
+    100% lost above it -- which exercises the firmware's last-good HOLD exactly
+    as a real out-of-range climb would.
 
     `rng` is a random.Random instance (passed in so the engine controls seeding).
     """
+    true_ft = agl_ft + ground_offset_ft
+
+    if max_range_ft > 0.0:
+        if true_ft >= max_range_ft:
+            return P.SF30_LOST_SIGNAL_CM            # past range: always lost
+        if true_ft > max_range_ft - edge_band_ft:
+            # In the edge band the lost-signal probability ramps 0 -> 1.
+            t = (true_ft - (max_range_ft - edge_band_ft)) / edge_band_ft
+            if rng.random() < t:
+                return P.SF30_LOST_SIGNAL_CM
+
     if dropout_prob > 0.0 and rng.random() < dropout_prob:
         return P.SF30_LOST_SIGNAL_CM
 
-    rng_ft = agl_ft + ground_offset_ft
+    rng_ft = true_ft
     if sigma_ft > 0.0:
         rng_ft += rng.gauss(0.0, sigma_ft)
     if rng_ft < 0.0:

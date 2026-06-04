@@ -29,7 +29,7 @@ WARN   = "#ff9f0a"      # iOS orange (attaching)
 DANGER = "#ff453a"      # iOS red    (reboot / disconnected)
 MUTED  = "#8e8e93"
 
-ALT_MAX_FT = 250.0      # top of the altitude tape
+ALT_MAX_FT = 1000.0     # top of the altitude tape (climb well past sensor range)
 
 
 class BenchApp(ctk.CTk):
@@ -194,20 +194,29 @@ class BenchApp(ctk.CTk):
                      font=ctk.CTkFont(size=11), wraplength=520, justify="left"
                      ).grid(row=2, column=0, columnspan=3, padx=16, sticky="w")
 
+        self.range_entry = self._labelled_entry(
+            card, 3, "Sensor max range (ft)", "328")
+        ctk.CTkLabel(card, text="(SF30/C ~328 ft / 100 m. Above this the bench "
+                     "sends lost-signal — like the real sensor losing the return "
+                     "— so the box holds last-good until you descend back in range)",
+                     text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=520,
+                     justify="left").grid(row=4, column=0, columnspan=3, padx=16,
+                                          sticky="w")
+
         self.sigma_lbl = ctk.CTkLabel(card, text="Jitter σ: 0.0 ft")
-        self.sigma_lbl.grid(row=3, column=0, columnspan=3, padx=16, pady=(10, 0),
+        self.sigma_lbl.grid(row=5, column=0, columnspan=3, padx=16, pady=(10, 0),
                             sticky="w")
         self.sigma_slider = ctk.CTkSlider(card, from_=0, to=5, command=self._on_sigma)
         self.sigma_slider.set(0)
-        self.sigma_slider.grid(row=4, column=0, columnspan=3, padx=16, pady=4,
+        self.sigma_slider.grid(row=6, column=0, columnspan=3, padx=16, pady=4,
                                sticky="ew")
 
         self.drop_lbl = ctk.CTkLabel(card, text="Lost-signal dropouts: 0 %")
-        self.drop_lbl.grid(row=5, column=0, columnspan=3, padx=16, pady=(10, 0),
+        self.drop_lbl.grid(row=7, column=0, columnspan=3, padx=16, pady=(10, 0),
                            sticky="w")
         self.drop_slider = ctk.CTkSlider(card, from_=0, to=30, command=self._on_drop)
         self.drop_slider.set(0)
-        self.drop_slider.grid(row=6, column=0, columnspan=3, padx=16,
+        self.drop_slider.grid(row=8, column=0, columnspan=3, padx=16,
                               pady=(4, 14), sticky="ew")
 
     def _build_menu_card(self, parent):
@@ -360,8 +369,9 @@ class BenchApp(ctk.CTk):
     # =========================================================================
 
     def _tick(self):
-        # Keep the ground offset live from its entry (cheap, once per tick).
+        # Keep the ground offset + sensor max range live from their entries.
         self.engine.ground_offset_ft = self._read_float(self.offset_entry, 3.0)
+        self.engine.max_range_ft = self._read_float(self.range_entry, 328.0)
 
         # Drain RX log lines (thread -> UI handoff via the queue).
         drained = 0
