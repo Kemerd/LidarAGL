@@ -1,4 +1,7 @@
 # LidarAGL — open source, by [Novabox.Works](https://novabox.works/)
+![3D Printed Design](banner.jpg)
+
+STL files releasing soon.
 
 **Configurable advisory AGL box for experimental aircraft — spoken height callouts,
 an ascending flare tone, a variometer sink/climb cue, gear & positive-rate reminders,
