@@ -60,6 +60,7 @@ short flare window). WiFi/Bluetooth are **off by design** — no EMI into the av
 - [Enclosure (3D-printed housing)](#enclosure-3d-printed-housing)
 - [Project layout](#project-layout)
 - [Tests](#tests)
+- [Web emulator (no hardware)](#web-emulator-no-hardware)
 
 ---
 
@@ -427,8 +428,18 @@ to mono still works perfectly — the lean just isn't there.
 
 ## Software setup & flashing
 
-Prerequisites: **ESP-IDF v5.x** installed and `IDF_PATH` set, plus **Python 3** for the
-clip tools.
+### Prerequisites
+
+- **ESP-IDF v5.x or newer** (developed against **v6.0.1**) — the Espressif toolchain.
+  Install via the [ESP-IDF installer / VS Code extension](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/get-started/)
+  or the offline EIM, then activate its environment so `idf.py` is on your PATH
+  (`export.sh` / `export.ps1`, or the EIM-generated PowerShell profile on Windows).
+- **Target chip: ESP32-S3.** Set once with `idf.py set-target esp32s3` (below).
+- **A USB cable + driver** for the board's native **USB-Serial-JTAG** (the S3 enumerates
+  as a generic USB serial device — no extra driver on Win 11; identify its COM port by
+  USB VID `303A` if several serial devices are present).
+- **Python 3** — pulled in by ESP-IDF itself, and also used standalone for the voice-clip
+  tools below.
 
 ```sh
 # 0. Clone, then from the project root:
@@ -663,6 +674,36 @@ gcc -I../main -DUNIT_TEST ../main/robust.c ../main/sensor_profile.c \
 
 The pure modules include no `esp_*` / `driver/*` / `freertos/*` headers, which is why
 they build and run on a desktop compiler.
+
+---
+
+## Web emulator (no hardware)
+
+The same pure logic modules also compile to **WebAssembly**, so you can fly the *real*
+firmware callouts, tone, and state machine in a browser — no ESP32, no SF30, no flashing.
+See [`emulator/README.md`](emulator/README.md) for the full write-up.
+
+### Prerequisites
+- **Emscripten SDK** (`emcc`) — the C→WASM compiler. One-time install (the build script
+  auto-sources it from `L:\Dev\emsdk` if it isn't already on PATH):
+  ```powershell
+  git clone https://github.com/emscripten-core/emsdk.git L:\Dev\emsdk
+  cd L:\Dev\emsdk; ./emsdk install latest; ./emsdk activate latest
+  ```
+- **Python 3** — only to serve the files over http for local testing.
+
+### Run it (one click)
+From the repo root, double-click **[`run_emulator.bat`](run_emulator.bat)** (or run it
+from a terminal). It builds the WASM via `emulator/build_wasm.ps1`, serves the repo root
+on `http://localhost:8000`, and opens the emulator page in your browser:
+
+```powershell
+.\run_emulator.bat
+```
+
+> Serving from the **repo root** (not `emulator/`) is deliberate — both `emulator/` and
+> the `assets/` voice clips must be reachable over http. Ctrl+C in the window stops the
+> server.
 
 ---
 

@@ -15,6 +15,9 @@ sdkconfig.old
 __pycache__/
 *.pyc
 
+# flash_esp32.bat's remembered default COM port (per-machine, not shared)
+flash_esp32_default.txt
+
 # Editor / OS cruft
 .vscode/
 *.swp
