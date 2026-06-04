@@ -310,6 +310,37 @@
 #define FLARE_FADE_OUT_MS   3000      /* full->silent fade-out time              */
 #define FLARE_FADE_IN_MS    100       /* silent->full quick restore on re-cross  */
 
+/* ---- Variometer "blip" cadence (sink/climb-rate feature) ----------------- */
+/*  A glider-vario behaviour folded into the presence tone: when the SINK RATE
+ *  config toggle is ON, the below-100 ft tone is CHOPPED into blips whose cadence
+ *  tracks the aircraft's vertical speed — faster sink => faster, tighter blips —
+ *  so the pilot hears the rate of descent on short final without looking at
+ *  anything. When SINK RATE is OFF the gate is held at 1.0 and the tone is the
+ *  steady sound it has always been. The CLIMB RATE toggle additionally lets a
+ *  climb drive the blips; with it OFF a climb is treated as 0 fpm (lazy baseline
+ *  beep). Both default OFF (see NVS_KEY_SINKRATE / NVS_KEY_CLIMBRATE).
+ *
+ *  The mapping (see audio.c blip gate + the emulator mirror):
+ *    rate_fpm   = climb_on ? max(sink_fpm, climb_fpm) : sink_fpm
+ *    t          = clamp(rate_fpm / VARIO_REF_FPM, 0, 1)
+ *    silence_ms = VARIO_SIL_BASE_MS + t*(VARIO_SIL_MIN_MS - VARIO_SIL_BASE_MS)
+ *    beep_ms    = clamp(VARIO_BEEP_FACTOR*silence_ms
+ *                       + VARIO_ACCEL_MS_GAIN*dsink_fpm_per_s,
+ *                       VARIO_BEEP_MIN_MS, VARIO_BEEP_MAX_MS)
+ *  where dsink_fpm_per_s is the first derivative of sink rate (vertical
+ *  acceleration, +ve when the sink is worsening). The SILENCE length is the
+ *  sink-rate knob (long when level, short when sinking fast); the BEEP length is
+ *  half that plus the acceleration term, so beeps stretch when the sink is rapidly
+ *  building. Tune all of these on the bench / in the emulator.                   */
+#define VARIO_REF_FPM         1000.0f /* rate that maps to the fastest blips      */
+#define VARIO_SIL_BASE_MS     550.0f  /* silence at 0 fpm (lazy baseline beep)    */
+#define VARIO_SIL_MIN_MS      70.0f   /* silence at/above the reference rate      */
+#define VARIO_BEEP_FACTOR     0.5f    /* beep length = this * the sink-rate term  */
+#define VARIO_ACCEL_MS_GAIN   0.05f   /* ms of beep added per (fpm/s) of worsening*/
+#define VARIO_BEEP_MIN_MS     30.0f   /* beep length floor                        */
+#define VARIO_BEEP_MAX_MS     400.0f  /* beep length ceiling                      */
+#define VARIO_EDGE_MS         6.0f    /* raised-cosine-ish gate ramp (anti-click) */
+
 /* ---- "Positive rate" climb callout (takeoff / touch-and-go) -------------- */
 /*  A spoken "positive rate" reminder on the way UP, modelled on the standard
  *  "positive rate, gear up" cockpit call. It is DISABLED by default (a config-
@@ -398,6 +429,8 @@
 #define NVS_KEY_TONEVOL   "tonevol"    /* i8: tone volume offset in dB (signed)    */
 #define NVS_KEY_GEARCHK   "gearchk"    /* u16: gear-check altitude in ft (0 == OFF)*/
 #define NVS_KEY_POSRATE   "posrate"    /* u8: positive-rate callout enable (0/1)   */
+#define NVS_KEY_SINKRATE  "sinkrate"   /* u8: sink-rate vario-blip enable (0/1)    */
+#define NVS_KEY_CLIMBRATE "climbrate"  /* u8: climb-rate vario-blip enable (0/1)   */
 
 /* ---- Bench HIL simulation (USB-Serial-JTAG side-door) -------------------- */
 /*  A developer can bench-test THIS firmware with headphones and NO LiDAR fitted

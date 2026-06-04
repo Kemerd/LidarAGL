@@ -43,6 +43,9 @@ DECLARE_CLIP(_binary_six_hundred_pcm);
 /*  Non-numeric spoken callouts. */
 DECLARE_CLIP(_binary_check_gear_pcm);
 DECLARE_CLIP(_binary_positive_rate_pcm);
+/*  Vario config-menu page titles (sink_rate.pcm / climb_rate.pcm). */
+DECLARE_CLIP(_binary_sink_rate_pcm);
+DECLARE_CLIP(_binary_climb_rate_pcm);
 DECLARE_CLIP(_binary_calibration_error_pcm);
 /*  Spoken instruction played right after the calibration-error chirp: the chirp
  *  grabs attention, this voice line tells the pilot what to do.                 */
@@ -65,6 +68,7 @@ DECLARE_CLIP(_binary_tone_only_pcm);
 DECLARE_CLIP(_binary_callout_start_altitude_pcm);
 DECLARE_CLIP(_binary_volume_adjustment_pcm);
 DECLARE_CLIP(_binary_off_pcm);
+DECLARE_CLIP(_binary_on_pcm);
 
 /* Compute the byte length of an embedded clip, or 0 if it is absent. */
 #define CLIP_LEN(sym) ((sym##_start && sym##_end) \
@@ -114,6 +118,8 @@ static void build_manifest(void)
     s_clips[CO_SIX_HUNDRED]   = make_clip(_binary_six_hundred_pcm_start,   _binary_six_hundred_pcm_end,   "six hundred");
     s_clips[CO_CHECK_GEAR]    = make_clip(_binary_check_gear_pcm_start,    _binary_check_gear_pcm_end,    "check gear");
     s_clips[CO_POSITIVE_RATE] = make_clip(_binary_positive_rate_pcm_start, _binary_positive_rate_pcm_end, "positive rate");
+    s_clips[CO_SINK_RATE]     = make_clip(_binary_sink_rate_pcm_start,    _binary_sink_rate_pcm_end,     "sink rate");
+    s_clips[CO_CLIMB_RATE]    = make_clip(_binary_climb_rate_pcm_start,   _binary_climb_rate_pcm_end,    "climb rate");
 
     s_chirp       = make_clip(_binary_calibration_error_pcm_start, _binary_calibration_error_pcm_end, "calib error");
     s_calib_voice = make_clip(_binary_please_reset_unit_on_the_ground_pcm_start,
@@ -131,6 +137,7 @@ static void build_manifest(void)
     s_cfg_pieces[CFG_PIECE_START_ALT]         = make_clip(_binary_callout_start_altitude_pcm_start, _binary_callout_start_altitude_pcm_end, "callout start altitude");
     s_cfg_pieces[CFG_PIECE_VOLUME_ADJ]        = make_clip(_binary_volume_adjustment_pcm_start,      _binary_volume_adjustment_pcm_end,      "volume adjustment");
     s_cfg_pieces[CFG_PIECE_OFF]               = make_clip(_binary_off_pcm_start,                    _binary_off_pcm_end,                    "off");
+    s_cfg_pieces[CFG_PIECE_ON]                = make_clip(_binary_on_pcm_start,                     _binary_on_pcm_end,                     "on");
 
     s_built = true;
 }

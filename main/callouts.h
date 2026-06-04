@@ -41,6 +41,11 @@ typedef enum {
      *  is the standalone takeoff climb call.                                      */
     CO_CHECK_GEAR,
     CO_POSITIVE_RATE,
+    /*  Vario "blip" config-menu titles. Like CO_POSITIVE_RATE these voice the menu
+     *  PAGE TITLE ("sink rate" / "climb rate"); they are not fired in flight — the
+     *  sink/climb-rate features modulate the presence TONE, not a spoken callout.  */
+    CO_SINK_RATE,
+    CO_CLIMB_RATE,
     CO_COUNT
 } callout_id_t;
 
@@ -68,6 +73,7 @@ typedef enum {
     CFG_PIECE_START_ALT,         /**< "Callout Start Altitude"                   */
     CFG_PIECE_VOLUME_ADJ,        /**< "Volume Adjustment"                        */
     CFG_PIECE_OFF,               /**< "Off" — disabled choice in the new menus   */
+    CFG_PIECE_ON,                /**< "On"  — enabled choice in the toggle menus  */
     CFG_PIECE_COUNT
 } config_piece_t;
 

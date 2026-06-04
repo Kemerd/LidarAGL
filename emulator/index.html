@@ -340,6 +340,7 @@
             </div>
             <div class="row"><span class="k">AGL</span><span class="v" id="aglVal">— ft</span></div>
             <div class="row"><span class="k">Vertical trend</span><span class="v" id="trendVal">—</span></div>
+            <div class="row"><span class="k">Vario blip</span><span class="v" id="varioVal">off</span></div>
             <div class="row"><span class="k">Tone</span><span class="v" id="toneVal">off</span></div>
             <div class="row"><span class="k">Tone pitch</span><span class="v" id="hzVal">— Hz</span></div>
             <div class="row"><span class="k">Tone level</span><span class="v" id="dbVal">— dB</span></div>
@@ -372,6 +373,18 @@
           <div class="btn-row">
             <button class="btn secondary" id="resetBtn">Reset to ground</button>
             <button class="btn secondary" id="cruiseBtn">Jump to cruise</button>
+          </div>
+
+          <!-- Variometer "blip" toggles (firmware LEVEL 7/8). With Sink Rate on the
+               below-100 ft tone is chopped into blips that track the descent rate;
+               Climb Rate additionally lets a climb drive them. Mirrors the device. -->
+          <div class="vario-toggles" style="margin-top:10px; display:flex; gap:16px;">
+            <label class="vario-toggle">
+              <input type="checkbox" id="sinkRateChk"> Sink rate blip
+            </label>
+            <label class="vario-toggle">
+              <input type="checkbox" id="climbRateChk"> Climb rate blip
+            </label>
           </div>
 
           <!-- Calibrate opens the boot config menu (audio mode + start-alt cap)

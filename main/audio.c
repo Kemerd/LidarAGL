@@ -129,6 +129,33 @@ static float s_tone_trim = 1.0f;
  *  through the fade reverses smoothly from wherever the envelope sits.          */
 static float s_flare_fade      = 1.0f;            /* current flare-fade level    */
 
+/* ---- Variometer "blip" gate (sink/climb-rate feature) -------------------- */
+
+/*  Feature enables, set once at boot from NVS via audio_set_vario_enable(). When
+ *  s_vario_sink_on is false the gate is held fully OPEN (1.0) and the tone is the
+ *  steady sound it has always been — the whole blip path is bypassed. s_vario_
+ *  climb_on additionally lets a CLIMB drive the blips (otherwise a climb reads as
+ *  0 fpm). Atomic single-bool stores, read lock-free by the render loop.          */
+static volatile bool  s_vario_sink_on  = false;
+static volatile bool  s_vario_climb_on = false;
+
+/*  The live vertical rate + acceleration the logic task publishes (ft/s, +up),
+ *  snapshotted from g_audio_params each frame. They drive the beep/silence
+ *  durations recomputed at every phase flip.                                      */
+static volatile float s_vario_vfps = 0.0f;
+static volatile float s_vario_vacc = 0.0f;
+
+/*  Gate phase state. The gate is a slow square wave with asymmetric, rate-driven
+ *  half-periods: s_blip_in_beep says which half we're in, s_blip_timer counts the
+ *  remaining samples in it, and s_blip_gate is the actual multiplier — slewed
+ *  toward 1.0 (beep) or 0.0 (silence) over VARIO_EDGE_MS so the edges don't click.
+ *  Durations are recomputed only when the timer expires (a phase flip), so the
+ *  per-sample cost is a compare + a slew.                                          */
+static bool  s_blip_in_beep = false;              /* current half (beep vs silence)*/
+static int   s_blip_timer   = 0;                  /* samples left in this half     */
+static float s_blip_gate    = 1.0f;               /* current gate multiplier [0,1] */
+static float s_blip_edge_step = 1.0f;             /* per-sample slew (VARIO_EDGE_MS)*/
+
 /* ---- Callout playback state ---------------------------------------------- */
 
 /*  The clip currently playing (NULL = none). PCM is s16le in flash.            */
@@ -295,6 +322,15 @@ void audio_init(const audio_config_t *cfg)
     s_lpf_l = 0.0f;
     s_lpf_r = 0.0f;
 
+    /* Vario blip-gate edge slew: a full 0..1 swing covers VARIO_EDGE_MS, so each
+     * beep/silence transition is a short raised-cosine-ish ramp rather than a hard
+     * gate (which would click). The mix-bus LPF further rounds whatever remains.   */
+    float blip_edge_samples = (VARIO_EDGE_MS / 1000.0f) * (float)SAMPLE_RATE;
+    s_blip_edge_step = (blip_edge_samples > 0.0f) ? (1.0f / blip_edge_samples) : 1.0f;
+    s_blip_in_beep   = false;    /* first phase flip turns this true -> opens on a beep*/
+    s_blip_timer     = 0;        /* expires immediately -> durations set on tick 1    */
+    s_blip_gate      = 1.0f;
+
     /* --- I2S standard mode, TX only, 16-bit. The hardware ALWAYS runs stereo
      * (interleaved L/R) so the unit works however the panel is wired; whether we
      * pan the streams apart or duplicate them to both channels is decided per
@@ -368,13 +404,26 @@ void audio_init(const audio_config_t *cfg)
  *  Public setters (called from the logic task)
  * ------------------------------------------------------------------------- */
 
-void audio_set_params(float tone_agl, bool tone_active)
+void audio_set_params(float tone_agl, bool tone_active,
+                      float vert_fps, float vert_accel_fps2)
 {
     if (g_audio_mutex && xSemaphoreTake(g_audio_mutex, 0) == pdTRUE) {
-        g_audio_params.tone_agl    = tone_agl;
-        g_audio_params.tone_active = tone_active;
+        g_audio_params.tone_agl         = tone_agl;
+        g_audio_params.tone_active      = tone_active;
+        g_audio_params.vert_fps         = vert_fps;
+        g_audio_params.vert_accel_fps2  = vert_accel_fps2;
         xSemaphoreGive(g_audio_mutex);
     }
+}
+
+void audio_set_vario_enable(bool sink_on, bool climb_on)
+{
+    /* Plain single-bool stores — the render loop reads them lock-free, exactly like
+     * the tone/voice volume gains. Climb only matters while sink is on (they share
+     * the one gate), but we keep both flags verbatim so the caller's intent is
+     * exactly what flies.                                                          */
+    s_vario_sink_on  = sink_on;
+    s_vario_climb_on = climb_on;
 }
 
 void audio_set_tone_db(float db)
@@ -728,6 +777,73 @@ static inline float duck_step(float *env, float voice)
     return duck;
 }
 
+/*  Vario blip — turn the live vertical rate + acceleration into the beep / silence
+ *  half-period lengths (in SAMPLES). The SILENCE is the sink-rate knob: a long lazy
+ *  gap when level (VARIO_SIL_BASE_MS), shrinking toward VARIO_SIL_MIN_MS at the
+ *  reference rate, so faster sink => faster, tighter blips. The BEEP is half that
+ *  silence term plus a derivative term — vertical acceleration (the first derivative
+ *  of sink rate) stretches the beep when the descent is rapidly building. See the
+ *  VARIO_* block in config.h for the full mapping + tuning rationale.               */
+static void blip_durations(float vfps, float vacc, int *beep_samples, int *silence_samples)
+{
+    /* Work in fpm (how the pilot thinks). vfps is +up, so a descent is negative.    */
+    float v_fpm     = vfps * 60.0f;
+    float sink_fpm  = (v_fpm < 0.0f) ? -v_fpm : 0.0f;
+    float climb_fpm = (v_fpm > 0.0f) ?  v_fpm : 0.0f;
+
+    /* Sink always drives the cadence; a climb only counts when the pilot enabled the
+     * climb-rate toggle (otherwise a climb reads as 0 fpm => the baseline beep).     */
+    float rate_fpm = s_vario_climb_on ? fmaxf(sink_fpm, climb_fpm) : sink_fpm;
+
+    /* Normalise 0..reference -> 0..1 and ramp the SILENCE from base down to min.     */
+    float t = rate_fpm / VARIO_REF_FPM;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    float silence_ms = VARIO_SIL_BASE_MS + t * (VARIO_SIL_MIN_MS - VARIO_SIL_BASE_MS);
+
+    /* Derivative term: vacc is +up, so a WORSENING sink is negative — negate to get
+     * "fpm/s of deepening descent", which lengthens the beep.                        */
+    float dsink_fpm_s = -vacc * 60.0f;
+    float beep_ms = VARIO_BEEP_FACTOR * silence_ms + VARIO_ACCEL_MS_GAIN * dsink_fpm_s;
+    if (beep_ms < VARIO_BEEP_MIN_MS) beep_ms = VARIO_BEEP_MIN_MS;
+    if (beep_ms > VARIO_BEEP_MAX_MS) beep_ms = VARIO_BEEP_MAX_MS;
+
+    *beep_samples    = (int)(beep_ms    * (float)SAMPLE_RATE / 1000.0f);
+    *silence_samples = (int)(silence_ms * (float)SAMPLE_RATE / 1000.0f);
+    if (*beep_samples    < 1) *beep_samples    = 1;
+    if (*silence_samples < 1) *silence_samples = 1;
+}
+
+/*  Advance the blip gate one sample and return its multiplier [0,1]. When the
+ *  sink-rate feature is OFF the gate is held fully OPEN, so the tone is byte-for-byte
+ *  the steady sound it has always been. Durations are recomputed only at a phase
+ *  flip (timer expiry) from the latest published rate, so a changing sink retimes
+ *  from the very next blip; the per-sample cost is a compare + the edge slew.        */
+static inline float blip_advance_gate(float vfps, float vacc)
+{
+    if (!s_vario_sink_on) {
+        /* Feature off: hold open and prime the phase so the first blip after an
+         * enable would open on a BEEP (next flip turns s_blip_in_beep true).        */
+        s_blip_gate    = 1.0f;
+        s_blip_in_beep = false;
+        s_blip_timer   = 0;
+        return 1.0f;
+    }
+
+    if (s_blip_timer <= 0) {
+        int beep_n, sil_n;
+        blip_durations(vfps, vacc, &beep_n, &sil_n);
+        s_blip_in_beep = !s_blip_in_beep;                 /* flip into the next half */
+        s_blip_timer   = s_blip_in_beep ? beep_n : sil_n;
+    }
+    s_blip_timer--;
+
+    /* Slew toward the half's target so the gate opens/closes without a click. */
+    float target = s_blip_in_beep ? 1.0f : 0.0f;
+    s_blip_gate  = slew_limit(s_blip_gate, target, s_blip_edge_step);
+    return s_blip_gate;
+}
+
 /*  Final float -> s16 conversion. Two-stage by design:
  *    1) Apply the fixed OUTPUT HEADROOM (s_headroom). This is the PRIMARY defence:
  *       it gain-stages the whole mix down so the equal-loudness boost can never
@@ -825,13 +941,19 @@ void audio_task(void *arg)
          * The snapshot is static so a lost lock is just a held value, never a glitch. */
         static float s_snap_agl    = TONE_START_FT;
         static bool  s_snap_active = false;
+        static float s_snap_vfps   = 0.0f;   /* vertical rate  (held on a lost lock) */
+        static float s_snap_vacc   = 0.0f;   /* vertical accel (held on a lost lock) */
         if (g_audio_mutex && xSemaphoreTake(g_audio_mutex, 0) == pdTRUE) {
             s_snap_agl    = g_audio_params.tone_agl;
             s_snap_active = g_audio_params.tone_active;
+            s_snap_vfps   = g_audio_params.vert_fps;
+            s_snap_vacc   = g_audio_params.vert_accel_fps2;
             xSemaphoreGive(g_audio_mutex);
         }
         float tone_agl    = s_snap_agl;
         bool  tone_active = s_snap_active;
+        float vert_fps    = s_snap_vfps;
+        float vert_accel  = s_snap_vacc;
 
         /* The tone-disabled modes (callouts-only) silence the tone outright. */
         if (!s_cfg.tone_enabled) {
@@ -918,14 +1040,20 @@ void audio_task(void *arg)
             float f = agl_to_pitch_hz(s_tone_agl_smooth);
             float eql_gain = db_to_gain(equal_loudness_db(f));
 
+            /* Vario blip gate: chops the tone into rate-driven blips when the sink-
+             * rate feature is on, else holds fully open (1.0 => today's steady tone).
+             * It sits OUTSIDE s_flare_fade below, so the flare fade-out under 10 ft
+             * still wins; advanced once per sample so the cadence stays sample-exact. */
+            float blip_gate = blip_advance_gate(vert_fps, vert_accel);
+
             /* Build the tone: schedule gain · sidechain duck · equal-loudness ·
-             * flare fade · steady callout trim · pilot tone volume. tone_sample() =
-             * fundamental + a small 2nd harmonic (warmth); s_flare_fade silences it
-             * under the flare; s_tone_trim holds it a constant TONE_TRIM_WITH_VOICE_DB
-             * down while callouts are enabled (1.0 in tone-only modes); s_tone_gain is
-             * the pilot's tone volume offset (may cut OR boost).                     */
+             * flare fade · steady callout trim · pilot tone volume · vario blip gate.
+             * tone_sample() = fundamental + a small 2nd harmonic (warmth); s_flare_fade
+             * silences it under the flare; s_tone_trim holds it a constant
+             * TONE_TRIM_WITH_VOICE_DB down while callouts are enabled (1.0 in tone-only
+             * modes); s_tone_gain is the pilot's tone volume offset (may cut OR boost). */
             float tone = tone_sample(f) * s_gain_cur * duck * eql_gain
-                         * s_flare_fade * s_tone_trim * s_tone_gain;
+                         * s_flare_fade * s_tone_trim * s_tone_gain * blip_gate;
 
             float left, right;
             if (s_cfg.stereo) {

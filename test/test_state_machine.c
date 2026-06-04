@@ -461,6 +461,72 @@ static void test_positive_rate(const sensor_profile_t *p)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ *  Vertical rate + acceleration outputs. These feed the audio engine's vario
+ *  "blip": vert_fps must track the smoothed descent rate (sign + magnitude), and
+ *  vert_accel_fps2 (its first derivative) must read negative while the sink is
+ *  WORSENING and positive while it EASES. Both are profile-independent.
+ * ------------------------------------------------------------------------- */
+static void test_vertical_rate(const sensor_profile_t *p)
+{
+    char msg[96];
+
+    /* --- Part A: a steady descent converges vert_fps to the true rate. -------- */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_ARMED);
+        sm_out_t out;
+        memset(&out, 0, sizeof out);
+
+        /* Descend 0.25 ft per 25 ms tick = -10 ft/s (~600 fpm). Run long enough for
+         * the one-pole rate EMA to settle, then check the reported rate + sign.    */
+        float agl = 90.0f;
+        for (int i = 0; i < 80; ++i) {
+            sm_step(&c, agl, DT, p, &out);
+            agl -= 0.25f;
+        }
+        snprintf(msg, sizeof msg, "[%s] steady descent -> vert_fps negative", p->name);
+        ASSERT_TRUE(out.vert_fps < 0.0f, msg);
+        snprintf(msg, sizeof msg, "[%s] steady descent -> vert_fps ~= -10 ft/s", p->name);
+        ASSERT_TRUE(fabsf(out.vert_fps - (-10.0f)) < 1.5f, msg);
+        snprintf(msg, sizeof msg, "[%s] steady descent -> accel settles ~0", p->name);
+        ASSERT_TRUE(fabsf(out.vert_accel_fps2) < 3.0f, msg);
+    }
+
+    /* --- Part B: a steepening then easing sink flips the accel sign. ---------- */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_ARMED);
+        sm_out_t out;
+        memset(&out, 0, sizeof out);
+
+        /* Settle a gentle -4 ft/s descent. */
+        float agl = 90.0f;
+        for (int i = 0; i < 40; ++i) { sm_step(&c, agl, DT, p, &out); agl -= 0.10f; }
+
+        /* Now sink much faster (-16 ft/s): the rate becomes MORE negative, so the
+         * acceleration (d/dt of rate) must read negative through the transient.    */
+        bool saw_neg_accel = false;
+        for (int i = 0; i < 20; ++i) {
+            sm_step(&c, agl, DT, p, &out);
+            agl -= 0.40f;
+            if (out.vert_accel_fps2 < -2.0f) saw_neg_accel = true;
+        }
+        snprintf(msg, sizeof msg, "[%s] steepening sink -> negative accel", p->name);
+        ASSERT_TRUE(saw_neg_accel, msg);
+
+        /* Ease back toward level: the rate climbs toward 0, so accel goes positive. */
+        bool saw_pos_accel = false;
+        for (int i = 0; i < 30; ++i) {
+            sm_step(&c, agl, DT, p, &out);
+            agl -= 0.02f;                 /* nearly level now */
+            if (out.vert_accel_fps2 > 2.0f) saw_pos_accel = true;
+        }
+        snprintf(msg, sizeof msg, "[%s] easing sink -> positive accel", p->name);
+        ASSERT_TRUE(saw_pos_accel, msg);
+    }
+}
+
 int main(void)
 {
     const sensor_profile_t *profiles[2] = { &SF30C_PROFILE, &SF30D_PROFILE };
@@ -478,6 +544,7 @@ int main(void)
         test_trend_deadband(p);
         test_ground_dwell_disarm(p);
         test_positive_rate(p);
+        test_vertical_rate(p);
     }
     printf("-- profile-specific high callouts --\n");
     test_high_callouts_profile_specific();

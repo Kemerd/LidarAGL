@@ -43,6 +43,8 @@ typedef struct {
 typedef struct {
     float tone_agl;      /**< AGL the tone should track (already smoothed).      */
     bool  tone_active;   /**< Whether the presence tone should sound.            */
+    float vert_fps;      /**< Smoothed vertical rate for the vario blip (+up).   */
+    float vert_accel_fps2;/**< Smoothed vertical accel for the blip's deriv term.*/
 } audio_params_t;
 
 /* ---- Globals (defined in app_main.c) ------------------------------------ */

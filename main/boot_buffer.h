@@ -212,6 +212,50 @@ void config_save_positive_rate(bool enabled);
 void config_wipe_positive_rate(void);
 
 /**
+ * @brief Load the saved "sink rate" vario-blip enable flag from NVS.
+ *
+ * @details Stored as a u8 (0/1). DISABLED by default, so an absent / unreadable /
+ *          zero value all mean OFF (the steady tone). When ON the presence tone
+ *          blips with the descent rate (see the VARIO_* tunables in config.h).
+ *
+ * @return true if the sink-rate vario blip is enabled, false otherwise.
+ */
+bool config_load_sink_rate(void);
+
+/**
+ * @brief Persist the "sink rate" vario-blip enable flag to NVS.
+ * @param enabled  Whether the feature is enabled.
+ */
+void config_save_sink_rate(bool enabled);
+
+/**
+ * @brief Erase the saved sink-rate flag (next load returns disabled).
+ */
+void config_wipe_sink_rate(void);
+
+/**
+ * @brief Load the saved "climb rate" vario-blip enable flag from NVS.
+ *
+ * @details Stored as a u8 (0/1). DISABLED by default. When ON, a CLIMB also drives
+ *          the tone blips; with it OFF a climb is treated as 0 fpm. Only meaningful
+ *          alongside the sink-rate feature (both share the blip gate).
+ *
+ * @return true if the climb-rate vario blip is enabled, false otherwise.
+ */
+bool config_load_climb_rate(void);
+
+/**
+ * @brief Persist the "climb rate" vario-blip enable flag to NVS.
+ * @param enabled  Whether the feature is enabled.
+ */
+void config_save_climb_rate(bool enabled);
+
+/**
+ * @brief Erase the saved climb-rate flag (next load returns disabled).
+ */
+void config_wipe_climb_rate(void);
+
+/**
  * @brief Load the stored ground readings.
  * @param out  Destination array (capacity @p cap).
  * @param cap  Capacity in entries.

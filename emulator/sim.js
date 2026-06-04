@@ -166,6 +166,7 @@ let osc          = null; // continuous OscillatorNode for the presence tone
 let osc2         = null; // 2nd-harmonic oscillator (warmth) — runs at 2x osc
 let osc2Gain     = null; // fixed gain on osc2 == TONE_HARMONIC2_LVL / (1 + lvl)
 let toneGainNode = null; // GainNode — 0 == silent
+let blipGainNode = null; // GainNode — the vario blip gate (1 == open, 0 == silence)
 let tonePanNode  = null; // StereoPannerNode — leans the tone left in stereo mode
 let mixLpfNode   = null; // BiquadFilter (lowpass) — anti-harshness mix-bus LPF
 let toneVolNode  = null; // GainNode — the pilot's TONE volume offset (cut or boost)
@@ -184,6 +185,16 @@ const configBuffers  = new Map(); // piece name -> decoded AudioBuffer (menu pro
 // knee to a duck multiplier. activeVoice tracks the currently-sounding clip.
 let duckCur     = 1;      // current duck multiplier (1 = un-ducked), for readout
 let activeVoice = null;   // { env, startTime, durSamples } of the playing callout, or null
+
+// Vario "blip", mirroring audio.c's blip_advance_gate. The two enables are the
+// firmware's LEVEL 7/8 toggles (NVS sink/climb-rate). The gate is a slow square
+// wave with asymmetric, rate-driven half-periods: blipInBeep says which half we
+// are in and blipNextFlip is the audioCtx time of the next flip. With sink off the
+// gate is held open (1.0) so the tone is the steady sound it has always been.
+let sinkRateOn  = false;  // LEVEL 7: chop the tone into descent-rate blips
+let climbRateOn = false;  // LEVEL 8: let a climb drive the blips too
+let blipInBeep  = false;  // current half (false => next flip opens on a beep)
+let blipNextFlip = 0;     // audioCtx time of the next beep<->silence flip
 
 // Canvas / layout.
 let canvas, ctx, dpr = 1;
@@ -234,6 +245,19 @@ async function main() {
     flareFadeFt:     M.cwrap('sim_flare_fade_ft',     num, []),
     flareFadeOutMs:  M.cwrap('sim_flare_fade_out_ms', num, []),
     flareFadeInMs:   M.cwrap('sim_flare_fade_in_ms',  num, []),
+
+    // Vario "blip": the live vertical rate/accel + the cadence tunables, so the
+    // JS blip scheduler chops the tone with exactly the firmware's mapping.
+    vertFps:         M.cwrap('sim_vert_fps',          num, []),
+    vertAccel:       M.cwrap('sim_vert_accel',        num, []),
+    varioRefFpm:     M.cwrap('sim_vario_ref_fpm',     num, []),
+    varioSilBaseMs:  M.cwrap('sim_vario_sil_base_ms', num, []),
+    varioSilMinMs:   M.cwrap('sim_vario_sil_min_ms',  num, []),
+    varioBeepFactor: M.cwrap('sim_vario_beep_factor', num, []),
+    varioAccelMsGain:M.cwrap('sim_vario_accel_ms_gain',num,[]),
+    varioBeepMinMs:  M.cwrap('sim_vario_beep_min_ms', num, []),
+    varioBeepMaxMs:  M.cwrap('sim_vario_beep_max_ms', num, []),
+    varioEdgeMs:     M.cwrap('sim_vario_edge_ms',     num, []),
 
     // Boot config menu — audio mode flags + stereo lean (see sim_glue.c).
     audioModeCount: M.cwrap('sim_audio_mode_count',   num, []),
@@ -323,6 +347,17 @@ function readConfig() {
     flareFadeFt:    api.flareFadeFt(),
     flareFadeOutMs: api.flareFadeOutMs(),
     flareFadeInMs:  api.flareFadeInMs(),
+
+    // Vario blip cadence tunables (mirror config.h VARIO_*). The JS scheduler turns
+    // the live vertical rate/accel into beep/silence lengths with this same mapping.
+    varioRefFpm:     api.varioRefFpm(),
+    varioSilBaseMs:  api.varioSilBaseMs(),
+    varioSilMinMs:   api.varioSilMinMs(),
+    varioBeepFactor: api.varioBeepFactor(),
+    varioAccelMsGain:api.varioAccelMsGain(),
+    varioBeepMinMs:  api.varioBeepMinMs(),
+    varioBeepMaxMs:  api.varioBeepMaxMs(),
+    varioEdgeMs:     api.varioEdgeMs(),
   };
 
   // Visible tape top: a little headroom above the highest callout / cruise so
@@ -1107,6 +1142,12 @@ function setupAudioGraph() {
   toneGainNode = audioCtx.createGain();
   toneGainNode.gain.value = 0;       // start silent
 
+  // Vario blip gate — sits right after the tone gain, before the pan, exactly where
+  // audio.c multiplies s_blip_gate into the tone before panning. 1.0 == open (the
+  // steady tone); the frame loop chops it to 0 between blips when sink-rate is on.
+  blipGainNode = audioCtx.createGain();
+  blipGainNode.gain.value = 1;
+
   // Stereo lean for the tone. The firmware pans the TONE to the LEFT by
   // STEREO_PAN in STEREO_BOTH and centres it in every mono mode; a StereoPanner
   // reproduces that. pan = -STEREO_PAN (left) when stereo, 0 (centre) otherwise.
@@ -1141,7 +1182,8 @@ function setupAudioGraph() {
   fundGain.gain.value = norm;        // fundamental weight (1/(1+lvl))
   osc.connect(fundGain).connect(toneGainNode);
   osc2.connect(osc2Gain).connect(toneGainNode);
-  toneGainNode.connect(tonePanNode).connect(mixLpfNode).connect(toneVolNode);
+  toneGainNode.connect(blipGainNode).connect(tonePanNode)
+              .connect(mixLpfNode).connect(toneVolNode);
   osc.start();
   osc2.start();
 }
@@ -1276,6 +1318,37 @@ async function unlockAudio() {
   document.getElementById('audioGate').classList.add('hidden');
 }
 
+/**
+ * Turn the live vertical rate + acceleration into the vario blip's beep / silence
+ * half-period lengths (ms), mirroring audio.c's blip_durations(). The SILENCE is
+ * the sink-rate knob (long when level, short when sinking fast => faster blips);
+ * the BEEP is half that silence term plus a derivative term (vertical acceleration
+ * stretches the beep when the descent is rapidly building). climbRateOn lets a
+ * climb count toward the rate; otherwise a climb reads as 0 fpm (baseline beep).
+ *
+ * @param {number} vfps  Vertical rate, ft/s (+up).
+ * @param {number} vacc  Vertical acceleration, ft/s^2 (+up).
+ * @returns {{beepMs:number, silenceMs:number}}
+ */
+function blipDurations(vfps, vacc) {
+  const vFpm     = vfps * 60;
+  const sinkFpm  = vFpm < 0 ? -vFpm : 0;
+  const climbFpm = vFpm > 0 ?  vFpm : 0;
+  const rateFpm  = climbRateOn ? Math.max(sinkFpm, climbFpm) : sinkFpm;
+
+  let t = rateFpm / cfg.varioRefFpm;
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  const silenceMs = cfg.varioSilBaseMs + t * (cfg.varioSilMinMs - cfg.varioSilBaseMs);
+
+  const dsinkFpmS = -vacc * 60;     // +ve when the sink is worsening
+  let beepMs = cfg.varioBeepFactor * silenceMs + cfg.varioAccelMsGain * dsinkFpmS;
+  if (beepMs < cfg.varioBeepMinMs) beepMs = cfg.varioBeepMinMs;
+  if (beepMs > cfg.varioBeepMaxMs) beepMs = cfg.varioBeepMaxMs;
+
+  return { beepMs, silenceMs };
+}
+
 /* =============================================================================
  *  Main loop
  * ===========================================================================*/
@@ -1384,6 +1457,30 @@ function frame(ts) {
     }
   }
 
+  // --- Vario blip gate: mirror audio.c's blip_advance_gate ------------------
+  // A slow square wave on blipGainNode with rate-driven half-periods. We schedule
+  // each flip on the AudioContext clock (decoupled from the frame rate) so the
+  // cadence stays smooth even at low frame rates. Sink off (or tone silent) holds
+  // the gate open and primes blipInBeep=false so the next enable opens on a beep —
+  // exactly the firmware's s_blip_in_beep priming.
+  if (audioUnlocked && blipGainNode) {
+    const now  = audioCtx.currentTime;
+    const edge = Math.max(cfg.varioEdgeMs / 1000, 0.001);   // VARIO_EDGE_MS
+    if (sinkRateOn && toneOn && modeTone) {
+      if (now >= blipNextFlip) {
+        blipInBeep = !blipInBeep;                            // flip into the next half
+        const d = blipDurations(api.vertFps(), api.vertAccel());
+        const halfMs = blipInBeep ? d.beepMs : d.silenceMs;
+        blipNextFlip = now + halfMs / 1000;
+        blipGainNode.gain.setTargetAtTime(blipInBeep ? 1 : 0, now, edge);
+      }
+    } else {
+      blipGainNode.gain.setTargetAtTime(1, now, edge);      // held open (steady tone)
+      blipInBeep   = false;
+      blipNextFlip = 0;
+    }
+  }
+
   // --- Visuals: ease the glyph toward target, then paint --------------------
   // During a scripted approach the target moves smoothly already, so track it
   // tightly (a hard ease would trail a fast descent); otherwise keep the gentle
@@ -1418,6 +1515,16 @@ function updateTelemetry(st, toneAgl, toneOn, pollMs) {
   const trend = Math.abs(dv) < 0.3 ? 'level'
               : dv > 0 ? '▲ climbing' : '▼ descending';
   document.getElementById('trendVal').textContent = trend;
+
+  // Vario blip readout: show the feature state + the live blip rate while sounding.
+  let varioTxt = 'off';
+  if (sinkRateOn) {
+    const d = blipDurations(api.vertFps(), api.vertAccel());
+    const hz = 1000 / (d.beepMs + d.silenceMs);   // full beep+silence cycles / sec
+    varioTxt = (toneOn ? `${hz.toFixed(1)} Hz` : 'armed')
+             + (climbRateOn ? ' · ±' : ' · sink');
+  }
+  document.getElementById('varioVal').textContent = varioTxt;
 
   document.getElementById('toneVal').textContent = toneOn ? 'active' : 'off';
   document.getElementById('toneVal').style.color = toneOn ? 'var(--good)' : 'var(--text-dim)';
@@ -1668,6 +1775,17 @@ function setupDom() {
     api.init(0 /* ST_GROUND */);
     lastFiredFt = null;
     flareFade = 1;                 // re-arm the flare fade
+  });
+
+  // Vario blip toggles (firmware LEVEL 7/8). Pure JS state — the gate reads these
+  // every frame. Resetting blipNextFlip makes a fresh enable open on a beep at once.
+  document.getElementById('sinkRateChk').addEventListener('change', (e) => {
+    sinkRateOn   = e.target.checked;
+    blipInBeep   = false;
+    blipNextFlip = 0;
+  });
+  document.getElementById('climbRateChk').addEventListener('change', (e) => {
+    climbRateOn = e.target.checked;
   });
 
   document.getElementById('cruiseBtn').addEventListener('click', () => {

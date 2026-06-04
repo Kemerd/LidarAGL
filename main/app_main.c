@@ -77,6 +77,12 @@ static float s_gear_check_ft = 0.0f;
  *  machine always evaluates the detector, but we only speak it when enabled.      */
 static bool  s_posrate_enabled = false;
 
+/*  Vario "blip" enables. Both disabled by default. The state machine always
+ *  publishes the vertical rate/accel; the audio engine only chops the tone into
+ *  blips when sink-rate is on (climb-rate additionally lets a climb drive them).  */
+static bool  s_sinkrate_enabled  = false;
+static bool  s_climbrate_enabled = false;
+
 /*  Bench HIL: set during the boot attach probe when the connected bench tool
  *  asked to open the config menu this boot. Runtime-only (never persisted).      */
 static volatile bool s_sim_want_config = false;
@@ -317,6 +323,8 @@ static void run_config_menu(void)
     config_wipe_voice_volume();
     config_wipe_gear_check_alt();
     config_wipe_positive_rate();
+    config_wipe_sink_rate();
+    config_wipe_climb_rate();
 
     /* Start the menu at 0 dB on BOTH offsets (no change) so the prompts/previews
      * play un-trimmed until the pilot chooses levels in LEVELs 3 & 4 below.       */
@@ -499,8 +507,8 @@ static void run_config_menu(void)
 
     /* ---- LEVEL 6: "Positive Rate" enable toggle --------------------------- */
     /* A simple ON/OFF toggle for the takeoff climb callout, starting OFF (the
-     * default). The page title reuses the "positive rate" clip; ON auditions that
-     * same clip and OFF speaks the "off" piece. Skipped in tone-only mode.        */
+     * default). The page title reuses the "positive rate" clip; ON speaks the "on"
+     * piece and OFF speaks the "off" piece. Skipped in tone-only mode.            */
     if (chosen.callouts_enabled) {
         bool pr_on = false;                     /* start OFF (the default) */
 
@@ -517,17 +525,75 @@ static void run_config_menu(void)
             if (ev == TAP_SINGLE) {
                 pr_on = !pr_on;
                 ESP_LOGI(TAG, "config: positive-rate -> %s", pr_on ? "ON" : "OFF");
-                if (pr_on) {
-                    audio_play_clip_blocking(callout_clip(CO_POSITIVE_RATE));
-                } else {
-                    audio_play_clip_blocking(config_clip_piece(CFG_PIECE_OFF));
-                }
+                audio_play_clip_blocking(config_clip_piece(pr_on ? CFG_PIECE_ON
+                                                                 : CFG_PIECE_OFF));
             }
         }
         audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
         config_save_positive_rate(pr_on);
     } else {
         ESP_LOGI(TAG, "config: tone-only mode, skipping positive-rate menu");
+    }
+
+    /* ---- LEVEL 7: "Sink Rate" vario-blip enable toggle -------------------- */
+    /* When ON the below-100 ft presence tone is chopped into blips that track the
+     * descent rate (faster sink => faster blips). ON/OFF like LEVEL 6, starting OFF.
+     * Skipped in tone-only mode only because the menu is voice-driven — the feature
+     * itself acts on the TONE, so it still flies in any mode the toggle was set in. */
+    if (chosen.callouts_enabled) {
+        bool sr_on = false;                     /* start OFF (the default) */
+
+        audio_play_clip_blocking(callout_clip(CO_SINK_RATE));      /* title "sink rate" */
+        vTaskDelay(pdMS_TO_TICKS(120));
+        audio_play_clip_blocking(config_clip_piece(CFG_PIECE_OFF)); /* starting OFF */
+
+        idle_ms = 0;
+        for (;;) {
+            tap_event_t ev = wait_tap_event(&idle_ms);
+            if (ev == TAP_DOUBLE || ev == TAP_TIMEOUT) {
+                break;                          /* confirm this setting */
+            }
+            if (ev == TAP_SINGLE) {
+                sr_on = !sr_on;
+                ESP_LOGI(TAG, "config: sink-rate -> %s", sr_on ? "ON" : "OFF");
+                audio_play_clip_blocking(config_clip_piece(sr_on ? CFG_PIECE_ON
+                                                                 : CFG_PIECE_OFF));
+            }
+        }
+        audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
+        config_save_sink_rate(sr_on);
+    } else {
+        ESP_LOGI(TAG, "config: tone-only mode, skipping sink-rate menu");
+    }
+
+    /* ---- LEVEL 8: "Climb Rate" vario-blip enable toggle ------------------- */
+    /* When ON a CLIMB also drives the blips (otherwise a climb reads as 0 fpm and
+     * the tone stays at the lazy baseline beep). Only meaningful alongside SINK
+     * RATE; ON/OFF like the levels above, starting OFF.                           */
+    if (chosen.callouts_enabled) {
+        bool cr_on = false;                     /* start OFF (the default) */
+
+        audio_play_clip_blocking(callout_clip(CO_CLIMB_RATE));     /* title "climb rate" */
+        vTaskDelay(pdMS_TO_TICKS(120));
+        audio_play_clip_blocking(config_clip_piece(CFG_PIECE_OFF)); /* starting OFF */
+
+        idle_ms = 0;
+        for (;;) {
+            tap_event_t ev = wait_tap_event(&idle_ms);
+            if (ev == TAP_DOUBLE || ev == TAP_TIMEOUT) {
+                break;                          /* confirm this setting */
+            }
+            if (ev == TAP_SINGLE) {
+                cr_on = !cr_on;
+                ESP_LOGI(TAG, "config: climb-rate -> %s", cr_on ? "ON" : "OFF");
+                audio_play_clip_blocking(config_clip_piece(cr_on ? CFG_PIECE_ON
+                                                                 : CFG_PIECE_OFF));
+            }
+        }
+        audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
+        config_save_climb_rate(cr_on);
+    } else {
+        ESP_LOGI(TAG, "config: tone-only mode, skipping climb-rate menu");
     }
 
     ESP_LOGW(TAG, "config committed (mode %d); rebooting", selected_mode);
@@ -614,8 +680,10 @@ static void logic_task(void *arg)
             ESP_LOGI(TAG, "positive rate (climb confirmed, state=%d)", out.state);
         }
 
-        /* Publish tone params + poll cadence. */
-        audio_set_params(out.tone_agl, out.tone_active);
+        /* Publish tone params + poll cadence. The vertical rate/accel ride along so
+         * the audio engine's vario blip can chop the tone by descent rate.          */
+        audio_set_params(out.tone_agl, out.tone_active,
+                         out.vert_fps, out.vert_accel_fps2);
         g_poll_period_ms = poll_profile_to_ms(out.poll);
 
         /* Light-sleep policy: allowed only in GROUND/CRUISE, where the tone is
@@ -777,14 +845,22 @@ void app_main(void)
     s_start_alt_ft = config_load_start_alt(g_profile->callouts[0]);
     ESP_LOGI(TAG, "callout start-altitude cap: %.0f ft", s_start_alt_ft);
 
-    /* Resolve the two new optional callouts. Gear-check is OFF (0) by default and
-     * positive-rate is disabled by default, so an un-configured box behaves exactly
-     * as before until the pilot turns them on in the menu.                        */
-    s_gear_check_ft   = config_load_gear_check_alt();
-    s_posrate_enabled = config_load_positive_rate();
+    /* Resolve the optional callouts + vario blips. Gear-check is OFF (0) by default,
+     * positive-rate is disabled, and both vario blips are disabled, so an un-config-
+     * ured box behaves exactly as before until the pilot turns them on in the menu. */
+    s_gear_check_ft     = config_load_gear_check_alt();
+    s_posrate_enabled   = config_load_positive_rate();
+    s_sinkrate_enabled  = config_load_sink_rate();
+    s_climbrate_enabled = config_load_climb_rate();
     ESP_LOGI(TAG, "gear-check altitude: %.0f ft%s | positive-rate: %s",
              s_gear_check_ft, s_gear_check_ft <= 0.0f ? " (OFF)" : "",
              s_posrate_enabled ? "ON" : "OFF");
+    ESP_LOGI(TAG, "vario blip: sink-rate %s, climb-rate %s",
+             s_sinkrate_enabled ? "ON" : "OFF",
+             s_climbrate_enabled ? "ON" : "OFF");
+
+    /* Hand the vario enables to the audio engine once (lock-free bools thereafter). */
+    audio_set_vario_enable(s_sinkrate_enabled, s_climbrate_enabled);
 
     /* Apply the saved TONE + VOICE volume offsets (0 dB == no change). Done after
      * the menu branch so freshly-committed values are the ones in effect this boot. */

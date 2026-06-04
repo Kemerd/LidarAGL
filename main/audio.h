@@ -56,8 +56,28 @@ void audio_init(const audio_config_t *cfg);
  * @brief Publish the current tone parameters (called by the logic task).
  * @param tone_agl     AGL the tone should track (already smoothed).
  * @param tone_active  Whether the presence tone should sound.
+ * @param vert_fps     Smoothed vertical rate (ft/s, +up) for the vario blip.
+ * @param vert_accel_fps2  Smoothed vertical acceleration (ft/s^2, +up) for the
+ *                     blip's derivative term.
  */
-void audio_set_params(float tone_agl, bool tone_active);
+void audio_set_params(float tone_agl, bool tone_active,
+                      float vert_fps, float vert_accel_fps2);
+
+/**
+ * @brief Enable/disable the variometer "blip" gate (called once at boot).
+ *
+ * @param sink_on   When true, the below-100 ft presence tone is chopped into blips
+ *                  whose cadence tracks the DESCENT rate (faster sink => faster
+ *                  blips). When false the gate stays open and the tone is steady.
+ * @param climb_on  When true a CLIMB also drives the blips; when false a climb is
+ *                  treated as 0 fpm (the lazy baseline beep). Only meaningful while
+ *                  @p sink_on is set, since both share the one blip gate.
+ *
+ * @details Both flags come from NVS at boot (config_load_sink_rate /
+ *          config_load_climb_rate). Lock-free single-bool stores, read by the
+ *          render loop — same pattern as the tone/voice volume setters.
+ */
+void audio_set_vario_enable(bool sink_on, bool climb_on);
 
 /**
  * @brief Set the pilot's TONE volume offset (dB), applied to the presence tone.

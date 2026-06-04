@@ -170,10 +170,22 @@ class BenchApp(ctk.CTk):
 
         self.gs_entry  = self._labelled_entry(card, 1, "Glideslope (deg)", "3.0")
         self.spd_entry = self._labelled_entry(card, 2, "Groundspeed (kt)", "70")
-        self.alt_entry = self._labelled_entry(card, 3, "Start AGL (ft)", "200")
+        self.alt_entry = self._labelled_entry(card, 3, "Start AGL (ft)", "400")
+
+        # Hand-flying error: 0 % = perfect on-rails glideslope, up to 25 % = a sloppy
+        # hand-flown approach (wander + over-corrections + partial level-offs) so the
+        # firmware sees a realistic, jittery descent instead of a ruler-straight one.
+        self.ils_err_lbl = ctk.CTkLabel(card, text="Hand-flying error: 0 %")
+        self.ils_err_lbl.grid(row=4, column=0, columnspan=3, padx=16, pady=(10, 0),
+                              sticky="w")
+        self.ils_err_slider = ctk.CTkSlider(card, from_=0, to=25,
+                                            command=self._on_ils_error)
+        self.ils_err_slider.set(0)              # default: perfect glideslope
+        self.ils_err_slider.grid(row=5, column=0, columnspan=3, padx=16, pady=4,
+                                 sticky="ew")
 
         row = ctk.CTkFrame(card, fg_color="transparent")
-        row.grid(row=4, column=0, columnspan=3, padx=12, pady=(8, 14), sticky="ew")
+        row.grid(row=6, column=0, columnspan=3, padx=12, pady=(8, 14), sticky="ew")
         for i in range(3):
             row.grid_columnconfigure(i, weight=1)
         self.fly_btn = ctk.CTkButton(row, text="Fly approach", fg_color=GOOD,
@@ -362,7 +374,8 @@ class BenchApp(ctk.CTk):
     def _fly_ils(self):
         self.model.glideslope_deg = self._read_float(self.gs_entry, 3.0)
         self.model.groundspeed_kt = self._read_float(self.spd_entry, 70.0)
-        self.model.start_alt_ft = self._read_float(self.alt_entry, 200.0)
+        self.model.start_alt_ft = self._read_float(self.alt_entry, 400.0)
+        self.model.set_error_rate(self.ils_err_slider.get() / 100.0)
         self.model.arm_ils()
         self.model.play_ils()
 
@@ -370,10 +383,19 @@ class BenchApp(ctk.CTk):
         self.model.pause_ils()
 
     def _reset_ils(self):
-        self.model.start_alt_ft = self._read_float(self.alt_entry, 200.0)
+        self.model.start_alt_ft = self._read_float(self.alt_entry, 400.0)
         self.model.glideslope_deg = self._read_float(self.gs_entry, 3.0)
+        self.model.set_error_rate(self.ils_err_slider.get() / 100.0)
         self.model.arm_ils()
         self._set_slider(self.model.current_agl())
+
+    def _on_ils_error(self, value):
+        # Live: a real pilot's sloppiness as a 0..25 % deviation from the glideslope.
+        # The model re-reads error_rate every tick, so dragging this re-flies the
+        # current approach dirtier/cleaner immediately (no restart).
+        pct = float(value)
+        self.ils_err_lbl.configure(text="Hand-flying error: %d %%" % int(round(pct)))
+        self.model.set_error_rate(pct / 100.0)
 
     def _on_sigma(self, value):
         self.engine.sigma_ft = float(value)

@@ -420,6 +420,97 @@ void config_wipe_positive_rate(void)
     ESP_LOGW(TAG, "positive-rate flag wiped (will use disabled)");
 }
 
+/* ---- "Sink rate" vario-blip enable flag (disabled by default) ------------ */
+
+bool config_load_sink_rate(void)
+{
+    /* Same OFF-by-default u8 contract as the positive-rate flag: absent /
+     * unreadable / zero all read as OFF, so a corrupt value never enables blips. */
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    uint8_t v = 0;
+    esp_err_t err = nvs_get_u8(h, NVS_KEY_SINKRATE, &v);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return false;
+    }
+    return v != 0;
+}
+
+void config_save_sink_rate(bool enabled)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed; sink-rate flag not persisted");
+        return;
+    }
+    if (nvs_set_u8(h, NVS_KEY_SINKRATE, enabled ? 1u : 0u) == ESP_OK) {
+        nvs_commit(h);
+        ESP_LOGI(TAG, "sink-rate vario saved: %s", enabled ? "ON" : "OFF");
+    } else {
+        ESP_LOGE(TAG, "nvs_set_u8 failed; sink-rate flag not persisted");
+    }
+    nvs_close(h);
+}
+
+void config_wipe_sink_rate(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, NVS_KEY_SINKRATE);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "sink-rate flag wiped (will use disabled)");
+}
+
+/* ---- "Climb rate" vario-blip enable flag (disabled by default) ----------- */
+
+bool config_load_climb_rate(void)
+{
+    /* OFF-by-default u8, identical contract to the sink-rate flag above. */
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    uint8_t v = 0;
+    esp_err_t err = nvs_get_u8(h, NVS_KEY_CLIMBRATE, &v);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return false;
+    }
+    return v != 0;
+}
+
+void config_save_climb_rate(bool enabled)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed; climb-rate flag not persisted");
+        return;
+    }
+    if (nvs_set_u8(h, NVS_KEY_CLIMBRATE, enabled ? 1u : 0u) == ESP_OK) {
+        nvs_commit(h);
+        ESP_LOGI(TAG, "climb-rate vario saved: %s", enabled ? "ON" : "OFF");
+    } else {
+        ESP_LOGE(TAG, "nvs_set_u8 failed; climb-rate flag not persisted");
+    }
+    nvs_close(h);
+}
+
+void config_wipe_climb_rate(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, NVS_KEY_CLIMBRATE);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "climb-rate flag wiped (will use disabled)");
+}
+
 /* ---- Load / commit ------------------------------------------------------- */
 
 size_t boot_buffer_load(boot_entry_t *out, size_t cap)
