@@ -320,26 +320,23 @@
  *  climb drive the blips; with it OFF a climb is treated as 0 fpm (lazy baseline
  *  beep). Both default OFF (see NVS_KEY_SINKRATE / NVS_KEY_CLIMBRATE).
  *
- *  The mapping (see audio.c blip gate + the emulator mirror):
+ *  The mapping (see audio.c blip gate + the emulator mirror) — cadence is a pure
+ *  function of the vertical RATE (no derivative term):
  *    rate_fpm   = climb_on ? max(sink_fpm, climb_fpm) : sink_fpm
  *    t          = clamp(rate_fpm / VARIO_REF_FPM, 0, 1)
  *    silence_ms = VARIO_SIL_BASE_MS + t*(VARIO_SIL_MIN_MS - VARIO_SIL_BASE_MS)
- *    beep_ms    = clamp(VARIO_BEEP_FACTOR*silence_ms
- *                       + VARIO_ACCEL_MS_GAIN*dsink_fpm_per_s,
+ *    beep_ms    = clamp(VARIO_BEEP_FACTOR*silence_ms,
  *                       VARIO_BEEP_MIN_MS, VARIO_BEEP_MAX_MS)
- *  where dsink_fpm_per_s is the first derivative of sink rate (vertical
- *  acceleration, +ve when the sink is worsening). The SILENCE length is the
- *  sink-rate knob (long when level, short when sinking fast); the BEEP length is
- *  half that plus the acceleration term, so beeps stretch when the sink is rapidly
- *  building. Tune all of these on the bench / in the emulator.                   */
-#define VARIO_REF_FPM         1000.0f /* rate that maps to the fastest blips      */
-#define VARIO_SIL_BASE_MS     550.0f  /* silence at 0 fpm (lazy baseline beep)    */
-#define VARIO_SIL_MIN_MS      70.0f   /* silence at/above the reference rate      */
-#define VARIO_BEEP_FACTOR     0.5f    /* beep length = this * the sink-rate term  */
-#define VARIO_ACCEL_MS_GAIN   0.05f   /* ms of beep added per (fpm/s) of worsening*/
-#define VARIO_BEEP_MIN_MS     30.0f   /* beep length floor                        */
+ *  The SILENCE length is the sink-rate knob (long when level, short when sinking
+ *  fast => faster blips); the BEEP is simply a fraction of it, so the whole cadence
+ *  scales together. Tune all of these on the bench / in the emulator.             */
+#define VARIO_REF_FPM         800.0f  /* rate that maps to the fastest blips      */
+#define VARIO_SIL_BASE_MS     240.0f  /* silence at 0 fpm (baseline beep)         */
+#define VARIO_SIL_MIN_MS      40.0f   /* silence at/above the reference rate      */
+#define VARIO_BEEP_FACTOR     0.5f    /* beep length = this * the silence length  */
+#define VARIO_BEEP_MIN_MS     24.0f   /* beep length floor                        */
 #define VARIO_BEEP_MAX_MS     400.0f  /* beep length ceiling                      */
-#define VARIO_EDGE_MS         6.0f    /* raised-cosine-ish gate ramp (anti-click) */
+#define VARIO_EDGE_MS         4.0f    /* raised-cosine-ish gate ramp (anti-click) */
 
 /* ---- "Positive rate" climb callout (takeoff / touch-and-go) -------------- */
 /*  A spoken "positive rate" reminder on the way UP, modelled on the standard
@@ -464,10 +461,28 @@
 /*  Bench-control opcodes (carried in payload[0]). Mirrored byte-for-byte in
  *  tools/bench_sim/protocol.py.                                                  */
 #define OP_HELLO          0x01u   /* attach: enter sim mode this boot             */
+#define OP_BENCH_REAL     0x02u   /* attach: REAL sensor + scaled-AGL debug boot  */
 #define OP_ENTER_CONFIG   0x10u   /* attach + run the boot config menu this boot  */
 #define OP_REBOOT         0x11u   /* esp_restart(); the host re-attaches after    */
 #define OP_MENU_NEXT      0x20u   /* config menu: single-tap (cycle a selection)  */
 #define OP_MENU_CONFIRM   0x21u   /* config menu: double-tap (confirm a selection)*/
+
+/* ---- Bench REAL-sensor scaled debug mode (OP_BENCH_REAL) ----------------- */
+/*  A second bench path that is the OPPOSITE of sim mode: instead of feeding
+ *  fabricated frames over USB, it keeps the REAL LiDAR on UART1 and just (a)
+ *  scales the post-ground AGL up so a close bench target exercises the full
+ *  flight-altitude callout ladder, and (b) periodically logs the raw sensor
+ *  reading so you can confirm the sensor is actually streaming.
+ *
+ *  The scaling is applied to AGL (range MINUS the learned ground), never to the
+ *  raw range — so the boot ground-fill, the MAX_VALID_FT sanity check, and the
+ *  stored NVS ground all keep working in honest small feet and nothing leaks
+ *  between this mode and a normal boot. Each foot of real range above ground
+ *  becomes BENCH_SCALE_GAIN feet of AGL, so ~5 ft of hand travel sweeps the
+ *  whole 0..400 ft band (boot distance == 0 ft AGL, +5 ft == ~400 ft AGL).
+ *  Runtime-only and never persisted, exactly like sim mode.                     */
+#define BENCH_SCALE_GAIN     80.0f   /* AGL feet produced per real foot above ground */
+#define BENCH_DEBUG_LOG_MS   250     /* min gap between bench raw-reading log lines   */
 
 /* ---- FreeRTOS task stacks (BYTES in ESP-IDF) & priorities ---------------- */
 #define SENSOR_TASK_STACK 3072

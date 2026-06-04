@@ -56,12 +56,10 @@ void audio_init(const audio_config_t *cfg);
  * @brief Publish the current tone parameters (called by the logic task).
  * @param tone_agl     AGL the tone should track (already smoothed).
  * @param tone_active  Whether the presence tone should sound.
- * @param vert_fps     Smoothed vertical rate (ft/s, +up) for the vario blip.
- * @param vert_accel_fps2  Smoothed vertical acceleration (ft/s^2, +up) for the
- *                     blip's derivative term.
+ * @param vert_fps     Smoothed vertical rate (ft/s, +up) driving the vario blip
+ *                     cadence (faster sink => faster blips).
  */
-void audio_set_params(float tone_agl, bool tone_active,
-                      float vert_fps, float vert_accel_fps2);
+void audio_set_params(float tone_agl, bool tone_active, float vert_fps);
 
 /**
  * @brief Enable/disable the variometer "blip" gate (called once at boot).

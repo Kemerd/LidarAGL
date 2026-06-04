@@ -404,14 +404,12 @@ void audio_init(const audio_config_t *cfg)
  *  Public setters (called from the logic task)
  * ------------------------------------------------------------------------- */
 
-void audio_set_params(float tone_agl, bool tone_active,
-                      float vert_fps, float vert_accel_fps2)
+void audio_set_params(float tone_agl, bool tone_active, float vert_fps)
 {
     if (g_audio_mutex && xSemaphoreTake(g_audio_mutex, 0) == pdTRUE) {
-        g_audio_params.tone_agl         = tone_agl;
-        g_audio_params.tone_active      = tone_active;
-        g_audio_params.vert_fps         = vert_fps;
-        g_audio_params.vert_accel_fps2  = vert_accel_fps2;
+        g_audio_params.tone_agl    = tone_agl;
+        g_audio_params.tone_active = tone_active;
+        g_audio_params.vert_fps    = vert_fps;
         xSemaphoreGive(g_audio_mutex);
     }
 }
@@ -777,14 +775,13 @@ static inline float duck_step(float *env, float voice)
     return duck;
 }
 
-/*  Vario blip — turn the live vertical rate + acceleration into the beep / silence
- *  half-period lengths (in SAMPLES). The SILENCE is the sink-rate knob: a long lazy
- *  gap when level (VARIO_SIL_BASE_MS), shrinking toward VARIO_SIL_MIN_MS at the
- *  reference rate, so faster sink => faster, tighter blips. The BEEP is half that
- *  silence term plus a derivative term — vertical acceleration (the first derivative
- *  of sink rate) stretches the beep when the descent is rapidly building. See the
- *  VARIO_* block in config.h for the full mapping + tuning rationale.               */
-static void blip_durations(float vfps, float vacc, int *beep_samples, int *silence_samples)
+/*  Vario blip — turn the live vertical rate into the beep / silence half-period
+ *  lengths (in SAMPLES). The SILENCE is the sink-rate knob: a long gap when level
+ *  (VARIO_SIL_BASE_MS), shrinking toward VARIO_SIL_MIN_MS at the reference rate, so
+ *  faster sink => faster, tighter blips. The BEEP is simply a fraction of the
+ *  silence (VARIO_BEEP_FACTOR), so the whole cadence scales together — no derivative
+ *  term. See the VARIO_* block in config.h for the full mapping + tuning rationale.  */
+static void blip_durations(float vfps, int *beep_samples, int *silence_samples)
 {
     /* Work in fpm (how the pilot thinks). vfps is +up, so a descent is negative.    */
     float v_fpm     = vfps * 60.0f;
@@ -801,10 +798,8 @@ static void blip_durations(float vfps, float vacc, int *beep_samples, int *silen
     if (t > 1.0f) t = 1.0f;
     float silence_ms = VARIO_SIL_BASE_MS + t * (VARIO_SIL_MIN_MS - VARIO_SIL_BASE_MS);
 
-    /* Derivative term: vacc is +up, so a WORSENING sink is negative — negate to get
-     * "fpm/s of deepening descent", which lengthens the beep.                        */
-    float dsink_fpm_s = -vacc * 60.0f;
-    float beep_ms = VARIO_BEEP_FACTOR * silence_ms + VARIO_ACCEL_MS_GAIN * dsink_fpm_s;
+    /* Beep is a fixed fraction of the silence (clamped), so faster sink shrinks both. */
+    float beep_ms = VARIO_BEEP_FACTOR * silence_ms;
     if (beep_ms < VARIO_BEEP_MIN_MS) beep_ms = VARIO_BEEP_MIN_MS;
     if (beep_ms > VARIO_BEEP_MAX_MS) beep_ms = VARIO_BEEP_MAX_MS;
 
@@ -819,7 +814,7 @@ static void blip_durations(float vfps, float vacc, int *beep_samples, int *silen
  *  the steady sound it has always been. Durations are recomputed only at a phase
  *  flip (timer expiry) from the latest published rate, so a changing sink retimes
  *  from the very next blip; the per-sample cost is a compare + the edge slew.        */
-static inline float blip_advance_gate(float vfps, float vacc)
+static inline float blip_advance_gate(float vfps)
 {
     if (!s_vario_sink_on) {
         /* Feature off: hold open and prime the phase so the first blip after an
@@ -832,7 +827,7 @@ static inline float blip_advance_gate(float vfps, float vacc)
 
     if (s_blip_timer <= 0) {
         int beep_n, sil_n;
-        blip_durations(vfps, vacc, &beep_n, &sil_n);
+        blip_durations(vfps, &beep_n, &sil_n);
         s_blip_in_beep = !s_blip_in_beep;                 /* flip into the next half */
         s_blip_timer   = s_blip_in_beep ? beep_n : sil_n;
     }
@@ -941,19 +936,16 @@ void audio_task(void *arg)
          * The snapshot is static so a lost lock is just a held value, never a glitch. */
         static float s_snap_agl    = TONE_START_FT;
         static bool  s_snap_active = false;
-        static float s_snap_vfps   = 0.0f;   /* vertical rate  (held on a lost lock) */
-        static float s_snap_vacc   = 0.0f;   /* vertical accel (held on a lost lock) */
+        static float s_snap_vfps   = 0.0f;   /* vertical rate (held on a lost lock) */
         if (g_audio_mutex && xSemaphoreTake(g_audio_mutex, 0) == pdTRUE) {
             s_snap_agl    = g_audio_params.tone_agl;
             s_snap_active = g_audio_params.tone_active;
             s_snap_vfps   = g_audio_params.vert_fps;
-            s_snap_vacc   = g_audio_params.vert_accel_fps2;
             xSemaphoreGive(g_audio_mutex);
         }
         float tone_agl    = s_snap_agl;
         bool  tone_active = s_snap_active;
         float vert_fps    = s_snap_vfps;
-        float vert_accel  = s_snap_vacc;
 
         /* The tone-disabled modes (callouts-only) silence the tone outright. */
         if (!s_cfg.tone_enabled) {
@@ -1044,7 +1036,7 @@ void audio_task(void *arg)
              * rate feature is on, else holds fully open (1.0 => today's steady tone).
              * It sits OUTSIDE s_flare_fade below, so the flare fade-out under 10 ft
              * still wins; advanced once per sample so the cadence stays sample-exact. */
-            float blip_gate = blip_advance_gate(vert_fps, vert_accel);
+            float blip_gate = blip_advance_gate(vert_fps);
 
             /* Build the tone: schedule gain · sidechain duck · equal-loudness ·
              * flare fade · steady callout trim · pilot tone volume · vario blip gate.

@@ -87,6 +87,16 @@ static bool  s_climbrate_enabled = false;
  *  asked to open the config menu this boot. Runtime-only (never persisted).      */
 static volatile bool s_sim_want_config = false;
 
+/*  Bench HIL (real-sensor variant): set during the attach probe when the bench
+ *  asked for OP_BENCH_REAL. Unlike sim mode this keeps the real LiDAR on UART1;
+ *  it only arms the AGL scaling + raw-reading debug log below.                    */
+static volatile bool s_sim_want_bench_real = false;
+
+/*  True once bench real-sensor scaled debug mode is armed for this boot. Read by
+ *  the logic task to multiply the AGL by BENCH_SCALE_GAIN and emit the throttled
+ *  raw-reading line. Never set on a normal/flight boot.                           */
+static bool s_bench_scale = false;
+
 /*  Bench HIL: a "reboot into the config menu" request that survives the SOFTWARE
  *  reboot esp_restart() performs (RTC memory keeps its value across a restart,
  *  but NOT across a power cycle — so it can never strand a real unit in config).
@@ -538,9 +548,10 @@ static void run_config_menu(void)
     /* ---- LEVEL 7: "Sink Rate" vario-blip enable toggle -------------------- */
     /* When ON the below-100 ft presence tone is chopped into blips that track the
      * descent rate (faster sink => faster blips). ON/OFF like LEVEL 6, starting OFF.
-     * Skipped in tone-only mode only because the menu is voice-driven — the feature
-     * itself acts on the TONE, so it still flies in any mode the toggle was set in. */
-    if (chosen.callouts_enabled) {
+     * Unlike the voice-callout levels above, this is NOT gated on callouts_enabled:
+     * the feature acts on the TONE, so it must be reachable in tone-only mode too
+     * (the menu prompts still speak — playback is independent of the chosen mode).  */
+    {
         bool sr_on = false;                     /* start OFF (the default) */
 
         audio_play_clip_blocking(callout_clip(CO_SINK_RATE));      /* title "sink rate" */
@@ -562,15 +573,14 @@ static void run_config_menu(void)
         }
         audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
         config_save_sink_rate(sr_on);
-    } else {
-        ESP_LOGI(TAG, "config: tone-only mode, skipping sink-rate menu");
     }
 
     /* ---- LEVEL 8: "Climb Rate" vario-blip enable toggle ------------------- */
     /* When ON a CLIMB also drives the blips (otherwise a climb reads as 0 fpm and
      * the tone stays at the lazy baseline beep). Only meaningful alongside SINK
-     * RATE; ON/OFF like the levels above, starting OFF.                           */
-    if (chosen.callouts_enabled) {
+     * RATE; ON/OFF like the levels above, starting OFF. Also a TONE feature, so it
+     * is reachable in every mode (not gated on callouts_enabled).                  */
+    {
         bool cr_on = false;                     /* start OFF (the default) */
 
         audio_play_clip_blocking(callout_clip(CO_CLIMB_RATE));     /* title "climb rate" */
@@ -592,8 +602,6 @@ static void run_config_menu(void)
         }
         audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
         config_save_climb_rate(cr_on);
-    } else {
-        ESP_LOGI(TAG, "config: tone-only mode, skipping climb-rate menu");
     }
 
     ESP_LOGW(TAG, "config committed (mode %d); rebooting", selected_mode);
@@ -637,6 +645,24 @@ static void logic_task(void *arg)
         float agl = s.range_ft - s_ground_ref_ft;
         if (agl < 0.0f) {
             agl = 0.0f;
+        }
+
+        /* Bench real-sensor debug: a close bench target only swings a few feet,
+         * so multiply the (real-feet) AGL up to flight altitudes — one foot above
+         * the learned ground becomes BENCH_SCALE_GAIN feet, so ~5 ft of hand
+         * travel sweeps the whole 0..400 ft callout band. The raw sensor reading
+         * is logged (throttled) so the dev can confirm the LiDAR is streaming.
+         * Armed only for an OP_BENCH_REAL boot; a flight build never enters here. */
+        if (s_bench_scale) {
+            static int64_t s_bench_log_us = 0;   /* logic task is single-threaded */
+            if (now_us - s_bench_log_us >= (int64_t)BENCH_DEBUG_LOG_MS * 1000) {
+                s_bench_log_us = now_us;
+                ESP_LOGI(TAG, "bench: raw=%.2f ft  ground=%.2f ft  agl=%.2f ft -> %.0f ft%s  seq=%u",
+                         (double)s.range_ft, (double)s_ground_ref_ft, (double)agl,
+                         (double)(agl * BENCH_SCALE_GAIN), s.valid ? "" : " (HOLD)",
+                         (unsigned)s.seq);
+            }
+            agl *= BENCH_SCALE_GAIN;
         }
 
         sm_out_t out;
@@ -769,6 +795,13 @@ static bool bench_attach_detected(void)
                     found = true;
                     break;
                 }
+                if (op == OP_BENCH_REAL) {
+                    /* Real-sensor scaled debug boot: caught here so the driver is
+                     * left installed for app_main to tidy up, just like HELLO.    */
+                    s_sim_want_bench_real = true;
+                    found = true;
+                    break;
+                }
             }
         }
         /* Fast-bail a normal boot: if no USB host is on the bus by the grace
@@ -803,8 +836,20 @@ void app_main(void)
      * LWNX frames from USB instead of the (absent) LiDAR. Never persisted, so a
      * plain power cycle returns the box to the real sensor.                      */
     if (bench_attach_detected()) {
-        sf30c_set_bench_ctrl_cb(bench_ctrl_handler);
-        sf30c_sim_enable();
+        if (s_sim_want_bench_real) {
+            /* Real-sensor scaled debug: the LiDAR stays on UART1 (sim mode is
+             * left OFF), so we only arm the AGL scaling + raw-reading log the
+             * logic task applies. We never read the USB stream in this mode, so
+             * uninstall the driver the attach probe left installed to restore the
+             * pristine console for log monitoring.                               */
+            s_bench_scale = true;
+            usb_serial_jtag_driver_uninstall();
+            ESP_LOGW(TAG, "BENCH REAL-SENSOR MODE: real LiDAR on UART, AGL scaled "
+                          "x%.0f for bench callout testing", (double)BENCH_SCALE_GAIN);
+        } else {
+            sf30c_set_bench_ctrl_cb(bench_ctrl_handler);
+            sf30c_sim_enable();
+        }
     }
 
     /* A bench "reboot into config" (OP_ENTER_CONFIG) lands here: the RTC flag

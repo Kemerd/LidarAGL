@@ -31,6 +31,7 @@ LWNX_CMD_UPDATE_RATE   = 76         # write u32: output rate code
 LWNX_CMD_BENCH_CTRL    = 200
 
 OP_HELLO        = 0x01              # attach: enter sim mode this boot
+OP_BENCH_REAL   = 0x02             # attach: REAL sensor + scaled-AGL debug boot
 OP_ENTER_CONFIG = 0x10             # attach + run the boot config menu this boot
 OP_REBOOT       = 0x11             # esp_restart(); host re-attaches afterwards
 OP_MENU_NEXT    = 0x20             # config menu: single-tap (cycle a selection)
