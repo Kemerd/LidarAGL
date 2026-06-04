@@ -186,14 +186,24 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
 
     /* --- Arming: the silent climb-out ------------------------------------- */
     /*  Until the aircraft has climbed through ARM_FT for the first time, NO
-     *  callout may fire. Crossing ARM_FT latches 'armed' and arms every callout
-     *  below the current height.                                              */
+     *  callout may fire. Crossing ARM_FT latches 'armed' and arms the WHOLE
+     *  ladder — every callout, not just the ones already below us.
+     *
+     *  Why arm the higher ones too? A callout only ever FIRES on a genuine
+     *  DOWNWARD crossing (see fire_descent_callout), so arming a number we're
+     *  still climbing toward is harmless: it simply waits until the aircraft
+     *  actually descends through it. Arming only "below current" here forced the
+     *  higher numbers to rely on rearm_above(), which needs a climb of
+     *  REARM_MARGIN_FT ABOVE the callout. For a TOP callout sitting close to the
+     *  sensor ceiling (e.g. SF30/C's 300 ft, only ~28 ft below the 328 ft range)
+     *  that climb is impossible, so the top number could never arm and never
+     *  spoke. Arming the full ladder fixes that while keeping the climb silent
+     *  (firing still needs the downward crossing) and the one-shot/go-around
+     *  hysteresis intact (rearm_above still gates RE-arming after a fire).        */
     if (!c->armed && agl_ft > ARM_FT) {
         c->armed = true;
         for (size_t i = 0; i < p->n_callouts; ++i) {
-            if (p->callouts[i] < agl_ft) {
-                c->armed_mask |= (1u << i);
-            }
+            c->armed_mask |= (1u << i);
         }
     }
 
