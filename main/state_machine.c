@@ -36,6 +36,10 @@ void sm_init(sm_ctx_t *c, sm_state_t initial)
     c->posrate_low_ms = 0.0f;
     c->posrate_ms     = 0.0f;
 
+    /* Default the tone gate to the compile-time start altitude; app_main overrides
+     * it from the pilot's saved config after init (host tests use the default). */
+    c->tone_start_ft  = TONE_START_FT;
+
     /* If we are seeded into a flying state, the descent callouts must already
      * be armed — we may have rebooted mid-descent and need to fire on the way
      * down without first having to climb through ARM_FT again.                 */
@@ -327,7 +331,7 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
     bool tone_active = c->armed &&
                        next != ST_CRUISE &&
                        next != ST_GROUND &&
-                       agl_ft <= TONE_START_FT;
+                       agl_ft <= c->tone_start_ft;
 
     out->state               = next;
     out->fired_callout       = fired;

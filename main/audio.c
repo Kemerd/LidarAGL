@@ -156,6 +156,13 @@ static int   s_blip_timer   = 0;                  /* samples left in this half  
 static float s_blip_gate    = 1.0f;               /* current gate multiplier [0,1] */
 static float s_blip_edge_step = 1.0f;             /* per-sample slew (VARIO_EDGE_MS)*/
 
+/*  Smoothed vertical rate that drives the cadence. The published rate can lurch
+ *  (a sharp real rate change, or a fast drag in the emulator); easing it through a
+ *  one-pole follower (VARIO_RATE_SMOOTH_MS) lets a sudden shift glide in over a few
+ *  blips instead of snapping the cadence between two consecutive phases.            */
+static float s_blip_rate_fps = 0.0f;              /* follower output (ft/s, +up)   */
+static float s_blip_rate_a   = 1.0f;              /* per-sample one-pole coeff     */
+
 /* ---- Callout playback state ---------------------------------------------- */
 
 /*  The clip currently playing (NULL = none). PCM is s16le in flash.            */
@@ -331,6 +338,13 @@ void audio_init(const audio_config_t *cfg)
     s_blip_timer     = 0;        /* expires immediately -> durations set on tick 1    */
     s_blip_gate      = 1.0f;
 
+    /* Cadence-rate follower coeff (one-pole, a = 1 - exp(-1/(tau*fs))), so a sudden
+     * rate shift eases into the cadence over ~VARIO_RATE_SMOOTH_MS. Clamped to (0,1].*/
+    float blip_rate_tau = (VARIO_RATE_SMOOTH_MS / 1000.0f) * (float)SAMPLE_RATE;
+    s_blip_rate_a   = (blip_rate_tau > 0.0f) ? (1.0f - expf(-1.0f / blip_rate_tau)) : 1.0f;
+    if (s_blip_rate_a <= 0.0f || s_blip_rate_a > 1.0f) s_blip_rate_a = 1.0f;
+    s_blip_rate_fps = 0.0f;
+
     /* --- I2S standard mode, TX only, 16-bit. The hardware ALWAYS runs stereo
      * (interleaved L/R) so the unit works however the panel is wired; whether we
      * pan the streams apart or duplicate them to both channels is decided per
@@ -422,6 +436,21 @@ void audio_set_vario_enable(bool sink_on, bool climb_on)
      * exactly what flies.                                                          */
     s_vario_sink_on  = sink_on;
     s_vario_climb_on = climb_on;
+}
+
+void audio_set_tone_start(float ft)
+{
+    /* Hand the pilot's chosen tone-start altitude to the PURE tone schedule, where
+     * both the pitch sweep and the dB fade-in anchor on it (audio_math owns the one
+     * configured value). Then re-derive the smoothed-AGL slew so the pitch still
+     * traverses the WHOLE (possibly taller, e.g. 200 ft) band in ~250 ms — the same
+     * formula audio_init() uses for the default, just with the live start altitude.
+     * Called ONCE at boot before the render task runs, so a plain float write to
+     * s_agl_step is safe (no mutex needed).                                         */
+    audio_math_set_tone_start(ft);
+
+    float agl_ramp_samples = 0.25f * (float)SAMPLE_RATE;
+    s_agl_step = (agl_ramp_samples > 0.0f) ? (ft / agl_ramp_samples) : ft;
 }
 
 void audio_set_tone_db(float db)
@@ -818,16 +847,24 @@ static inline float blip_advance_gate(float vfps)
 {
     if (!s_vario_sink_on) {
         /* Feature off: hold open and prime the phase so the first blip after an
-         * enable would open on a BEEP (next flip turns s_blip_in_beep true).        */
-        s_blip_gate    = 1.0f;
-        s_blip_in_beep = false;
-        s_blip_timer   = 0;
+         * enable would open on a BEEP (next flip turns s_blip_in_beep true). Keep the
+         * follower seeded at the live rate so a later enable starts on-cadence.      */
+        s_blip_gate     = 1.0f;
+        s_blip_in_beep  = false;
+        s_blip_timer    = 0;
+        s_blip_rate_fps = vfps;
         return 1.0f;
     }
 
+    /* Ease the cadence rate toward the live rate so a sudden shift glides in over a
+     * few blips (~VARIO_RATE_SMOOTH_MS) instead of snapping the very next phase.      */
+    s_blip_rate_fps += s_blip_rate_a * (vfps - s_blip_rate_fps);
+
+    /* Durations are recomputed ONLY here, at a phase boundary — so the current beep/
+     * silence always plays out at its committed length before the cadence changes.   */
     if (s_blip_timer <= 0) {
         int beep_n, sil_n;
-        blip_durations(vfps, &beep_n, &sil_n);
+        blip_durations(s_blip_rate_fps, &beep_n, &sil_n);
         s_blip_in_beep = !s_blip_in_beep;                 /* flip into the next half */
         s_blip_timer   = s_blip_in_beep ? beep_n : sil_n;
     }

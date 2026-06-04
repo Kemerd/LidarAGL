@@ -152,6 +152,16 @@
 #define FLARE_BAND_HI     35.0f       /* top of flare full-attention band        */
 #define FLARE_BAND_LO     20.0f       /* bottom of flare band                    */
 
+/*  TONE_START_FT above is the DEFAULT altitude at which the presence tone begins
+ *  its fade-in (and where the pitch sweep starts). It is pilot-selectable in the
+ *  boot config menu's LAST level: the default 100 ft, or a higher 200 ft for an
+ *  earlier, gentler swell on a longer final. Only these two are offered. The chosen
+ *  value is stored in NVS (NVS_KEY_TONESTART) and threaded into the PURE tone
+ *  schedule at boot via audio_set_tone_start(), so agl_to_pitch_hz() and
+ *  agl_to_tone_db() anchor their pitch + dB fade-in on whichever the pilot picked.  */
+#define TONE_START_FT_HIGH    200.0f  /* the alternate (earlier) tone-start option */
+#define DEFAULT_TONE_START_FT TONE_START_FT  /* used until the pilot picks 200 ft   */
+
 /* ---- Audio: ascending pitch map ----------------------------------------- */
 /*  Pitch ASCENDS as AGL falls (auditory "looming" bias). Energy kept in the
  *  500–3000 Hz band: cuts cockpit noise, survives ANR headsets, and is where
@@ -329,7 +339,14 @@
  *                       VARIO_BEEP_MIN_MS, VARIO_BEEP_MAX_MS)
  *  The SILENCE length is the sink-rate knob (long when level, short when sinking
  *  fast => faster blips); the BEEP is simply a fraction of it, so the whole cadence
- *  scales together. Tune all of these on the bench / in the emulator.             */
+ *  scales together. Tune all of these on the bench / in the emulator.
+ *
+ *  The current beep/silence ALWAYS plays out at its committed length — durations are
+ *  only recomputed at a phase boundary, never mid-blip. To stop the cadence LURCHING
+ *  when the rate suddenly shifts (one lazy blip then an abrupt buzz), the rate that
+ *  feeds the mapping is first run through a one-pole follower (VARIO_RATE_SMOOTH_MS):
+ *  a sudden change eases in over a few blips instead of snapping in one. Set it to a
+ *  small value for a snappy/literal response, larger for a smoother glide.          */
 #define VARIO_REF_FPM         800.0f  /* rate that maps to the fastest blips      */
 #define VARIO_SIL_BASE_MS     240.0f  /* silence at 0 fpm (baseline beep)         */
 #define VARIO_SIL_MIN_MS      40.0f   /* silence at/above the reference rate      */
@@ -337,6 +354,8 @@
 #define VARIO_BEEP_MIN_MS     24.0f   /* beep length floor                        */
 #define VARIO_BEEP_MAX_MS     400.0f  /* beep length ceiling                      */
 #define VARIO_EDGE_MS         4.0f    /* raised-cosine-ish gate ramp (anti-click) */
+#define VARIO_RATE_SMOOTH_MS  450.0f  /* one-pole time const that eases cadence    */
+                                      /* changes when the rate suddenly shifts     */
 
 /* ---- "Positive rate" climb callout (takeoff / touch-and-go) -------------- */
 /*  A spoken "positive rate" reminder on the way UP, modelled on the standard
@@ -428,6 +447,7 @@
 #define NVS_KEY_POSRATE   "posrate"    /* u8: positive-rate callout enable (0/1)   */
 #define NVS_KEY_SINKRATE  "sinkrate"   /* u8: sink-rate vario-blip enable (0/1)    */
 #define NVS_KEY_CLIMBRATE "climbrate"  /* u8: climb-rate vario-blip enable (0/1)   */
+#define NVS_KEY_TONESTART "tonestart"  /* u16: tone-start altitude in ft (100/200) */
 
 /* ---- Bench HIL simulation (USB-Serial-JTAG side-door) -------------------- */
 /*  A developer can bench-test THIS firmware with headphones and NO LiDAR fitted

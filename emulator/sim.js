@@ -195,6 +195,7 @@ let sinkRateOn  = false;  // LEVEL 7: chop the tone into descent-rate blips
 let climbRateOn = false;  // LEVEL 8: let a climb drive the blips too
 let blipInBeep  = false;  // current half (false => next flip opens on a beep)
 let blipNextFlip = 0;     // audioCtx time of the next beep<->silence flip
+let blipRateFps = 0;      // smoothed rate driving the cadence (eased toward vertFps)
 
 // Canvas / layout.
 let canvas, ctx, dpr = 1;
@@ -256,6 +257,7 @@ async function main() {
     varioBeepMinMs:  M.cwrap('sim_vario_beep_min_ms', num, []),
     varioBeepMaxMs:  M.cwrap('sim_vario_beep_max_ms', num, []),
     varioEdgeMs:     M.cwrap('sim_vario_edge_ms',     num, []),
+    varioRateSmoothMs:M.cwrap('sim_vario_rate_smooth_ms', num, []),
 
     // Boot config menu — audio mode flags + stereo lean (see sim_glue.c).
     audioModeCount: M.cwrap('sim_audio_mode_count',   num, []),
@@ -355,6 +357,7 @@ function readConfig() {
     varioBeepMinMs:  api.varioBeepMinMs(),
     varioBeepMaxMs:  api.varioBeepMaxMs(),
     varioEdgeMs:     api.varioEdgeMs(),
+    varioRateSmoothMs: api.varioRateSmoothMs(),
   };
 
   // Visible tape top: a little headroom above the highest callout / cruise so
@@ -1460,10 +1463,19 @@ function frame(ts) {
   if (audioUnlocked && blipGainNode) {
     const now  = audioCtx.currentTime;
     const edge = Math.max(cfg.varioEdgeMs / 1000, 0.001);   // VARIO_EDGE_MS
+
+    // Ease the cadence rate toward the live rate (one-pole over VARIO_RATE_SMOOTH_MS)
+    // so a sudden shift glides in over a few blips instead of snapping — mirrors
+    // audio.c's s_blip_rate_fps follower. Per-frame alpha from dt keeps it framerate-
+    // independent. Seed it live while held open so a fresh enable starts on-cadence.
+    const tau = Math.max(cfg.varioRateSmoothMs / 1000, 1e-3);
+    blipRateFps += (1 - Math.exp(-dt / tau)) * (api.vertFps() - blipRateFps);
+
     if (sinkRateOn && toneOn && modeTone) {
+      // Durations recompute ONLY at a flip, so each beep/silence plays out fully.
       if (now >= blipNextFlip) {
         blipInBeep = !blipInBeep;                            // flip into the next half
-        const d = blipDurations(api.vertFps());
+        const d = blipDurations(blipRateFps);
         const halfMs = blipInBeep ? d.beepMs : d.silenceMs;
         blipNextFlip = now + halfMs / 1000;
         blipGainNode.gain.setTargetAtTime(blipInBeep ? 1 : 0, now, edge);

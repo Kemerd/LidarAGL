@@ -22,6 +22,15 @@
  * without a separate branch (db_to_gain of this is ~1e-4).                     */
 #define TONE_SILENT_DB (-80.0f)
 
+/* The tone-start altitude (ft) the pitch + dB schedules anchor on. This is the
+ * ONE configured value the otherwise-stateless math holds: it defaults to the
+ * compile-time TONE_START_FT and is overwritten ONCE at boot, before the render
+ * task runs, by audio_set_tone_start() (which the pilot drives via the config
+ * menu). The functions stay pure/deterministic for a given anchor — host tests
+ * and the emulator never touch the setter, so they evaluate at the 100 ft default
+ * exactly as before. See TONE_START_FT_HIGH / NVS_KEY_TONESTART in config.h.      */
+static float s_tone_start_ft = TONE_START_FT;
+
 /* Clamp helper. */
 static float clampf(float v, float lo, float hi)
 {
@@ -30,16 +39,24 @@ static float clampf(float v, float lo, float hi)
     return v;
 }
 
+void audio_math_set_tone_start(float ft)
+{
+    /* Guard against a nonsensical value silencing/inverting the schedule: a
+     * tone-start at or below TONE_FULL_FT would leave no fade-in band at all, so
+     * fall back to the default if asked for something below it.                  */
+    s_tone_start_ft = (ft > TONE_FULL_FT) ? ft : TONE_START_FT;
+}
+
 float agl_to_pitch_hz(float agl_ft)
 {
     /* Constrain to the active band. Above the tone-start height we still return
      * the start frequency (the engine keeps it silent up there via the dB
      * schedule), which keeps the function continuous and warble-free at the
      * fade-in boundary.                                                         */
-    float a = clampf(agl_ft, 0.0f, TONE_START_FT);
+    float a = clampf(agl_ft, 0.0f, s_tone_start_ft);
 
-    /* t goes 0 at the top of the band (100 ft) to 1 at the ground. */
-    float t = (TONE_START_FT - a) / TONE_START_FT;
+    /* t goes 0 at the top of the band (the tone-start altitude) to 1 at the ground. */
+    float t = (s_tone_start_ft - a) / s_tone_start_ft;
 
     float f;
 #if TONE_LOG_SWEEP
@@ -57,7 +74,7 @@ float agl_to_pitch_hz(float agl_ft)
 float agl_to_tone_db(float agl_ft)
 {
     /* Off above the swell band. */
-    if (agl_ft > TONE_START_FT) {
+    if (agl_ft > s_tone_start_ft) {
         return TONE_SILENT_DB;
     }
 
@@ -66,10 +83,10 @@ float agl_to_tone_db(float agl_ft)
         return TONE_FULL_DB;
     }
 
-    /* Between TONE_START_FT and TONE_FULL_FT: ramp the LEVEL IN dB linearly.
-     * frac = 0 at TONE_START_FT (floor) -> 1 at TONE_FULL_FT (full).           */
-    float span = TONE_START_FT - TONE_FULL_FT;          /* e.g. 50 ft */
-    float frac = (TONE_START_FT - agl_ft) / span;       /* 0..1 */
+    /* Between the tone-start altitude and TONE_FULL_FT: ramp the LEVEL IN dB
+     * linearly. frac = 0 at the start (floor) -> 1 at TONE_FULL_FT (full).      */
+    float span = s_tone_start_ft - TONE_FULL_FT;        /* e.g. 50 ft (or 150)  */
+    float frac = (s_tone_start_ft - agl_ft) / span;     /* 0..1 */
     frac = clampf(frac, 0.0f, 1.0f);
 
     return TONE_FLOOR_DB + frac * (TONE_FULL_DB - TONE_FLOOR_DB);

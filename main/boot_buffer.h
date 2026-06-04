@@ -256,6 +256,29 @@ void config_save_climb_rate(bool enabled);
 void config_wipe_climb_rate(void);
 
 /**
+ * @brief Load the saved tone-start altitude (ft) from NVS.
+ *
+ * @details The altitude at which the presence tone begins its fade-in. Stored as a
+ *          u16 of feet; the menu offers only TONE_START_FT (the default) or
+ *          TONE_START_FT_HIGH. An absent / unreadable / zero value all fall back to
+ *          DEFAULT_TONE_START_FT, so a bad value can never disable the tone.
+ *
+ * @return The stored tone-start altitude in feet, or DEFAULT_TONE_START_FT if absent.
+ */
+float config_load_tone_start(void);
+
+/**
+ * @brief Persist the chosen tone-start altitude (ft) to NVS.
+ * @param ft  Tone-start altitude in feet (stored as a u16; rounded).
+ */
+void config_save_tone_start(float ft);
+
+/**
+ * @brief Erase the saved tone-start altitude (next load returns the default).
+ */
+void config_wipe_tone_start(void);
+
+/**
  * @brief Load the stored ground readings.
  * @param out  Destination array (capacity @p cap).
  * @param cap  Capacity in entries.

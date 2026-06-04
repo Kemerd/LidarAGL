@@ -78,6 +78,20 @@ void audio_set_params(float tone_agl, bool tone_active, float vert_fps);
 void audio_set_vario_enable(bool sink_on, bool climb_on);
 
 /**
+ * @brief Set the altitude (ft AGL) at which the presence tone begins (called once
+ *        at boot).
+ *
+ * @param ft  Tone-start altitude in feet — the pilot's config-menu choice
+ *            (TONE_START_FT by default, or the higher TONE_START_FT_HIGH). Both the
+ *            pitch sweep and the dB fade-in anchor on it.
+ *
+ * @details Forwards to audio_math_set_tone_start() (the pure schedule's anchor) and
+ *          re-derives the smoothed-AGL slew so the pitch still crosses the whole
+ *          band in ~250 ms. Loaded from NVS by app_main (config_load_tone_start).
+ */
+void audio_set_tone_start(float ft);
+
+/**
  * @brief Set the pilot's TONE volume offset (dB), applied to the presence tone.
  *
  * @param db  Offset in dB, clamped to [TONE_VOLUME_DB_MIN, TONE_VOLUME_DB_MAX].

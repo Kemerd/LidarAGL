@@ -67,6 +67,12 @@ typedef struct {
     float      posrate_low_ms; /**< Continuous time at/below POSRATE_ARM_FT;    */
                                /**< arms when it reaches FLARE_FADE_OUT_MS.      */
     float      posrate_ms;     /**< Continuous sustained-climb time above gate. */
+
+    /*  Pilot-chosen tone-start altitude (ft): the height at/below which the      */
+    /*  presence tone is allowed to sound. sm_init() seeds it to the default      */
+    /*  TONE_START_FT; app_main overrides it from NVS so the gate and the audio   */
+    /*  engine's fade-in schedule share the SAME start altitude (100 or 200 ft).  */
+    float      tone_start_ft;
 } sm_ctx_t;
 
 /** Result of one sm_step() evaluation. */

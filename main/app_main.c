@@ -73,6 +73,12 @@ static float s_start_alt_ft = 0.0f;   /* 0 == uncapped until boot sets it       
  *  (the default). Set once during boot from the saved config.                     */
 static float s_gear_check_ft = 0.0f;
 
+/*  Tone-start altitude (ft): the height at/below which the presence tone is allowed
+ *  to sound. Set once during boot from the saved config (default TONE_START_FT, or
+ *  the pilot's higher TONE_START_FT_HIGH). Shared by the logic task's tone gate
+ *  (via the sm context) and the audio engine's fade-in schedule so both agree.     */
+static float s_tone_start_ft = TONE_START_FT;
+
 /*  "Positive rate" climb callout enable flag. Disabled by default; the state
  *  machine always evaluates the detector, but we only speak it when enabled.      */
 static bool  s_posrate_enabled = false;
@@ -177,7 +183,14 @@ static size_t capture_ground_fill(float *out, size_t want)
  *       the profile's gear-check altitudes -> OFF, starting on OFF (the default).
  *    7. LEVEL 6 — "Positive Rate" enable toggle. Skipped in tone-only mode. A
  *       simple ON/OFF, starting OFF (the default).
- *    8. A chirp marks each confirm. Persist all values and reboot.
+ *    8. LEVEL 7 — "Sink Rate" vario-blip toggle. ON/OFF, starting OFF. Acts on the
+ *       TONE, so it runs in EVERY mode (not gated on callouts).
+ *    9. LEVEL 8 — "Climb Rate" vario-blip toggle. ON/OFF, starting OFF. Also a tone
+ *       feature, so it runs in every mode.
+ *   10. LEVEL 9 — tone-start altitude. Voice "Tone Only" + the altitude number; a
+ *       TAP toggles TONE_START_FT (100 ft) <-> TONE_START_FT_HIGH (200 ft), starting
+ *       on the default. A tone feature, so it runs in every mode.
+ *   11. A chirp marks each confirm. Persist all values and reboot.
  *
  *  This function does not return — it always ends in esp_restart().
  * ------------------------------------------------------------------------- */
@@ -335,6 +348,7 @@ static void run_config_menu(void)
     config_wipe_positive_rate();
     config_wipe_sink_rate();
     config_wipe_climb_rate();
+    config_wipe_tone_start();
 
     /* Start the menu at 0 dB on BOTH offsets (no change) so the prompts/previews
      * play un-trimmed until the pilot chooses levels in LEVELs 3 & 4 below.       */
@@ -604,6 +618,43 @@ static void run_config_menu(void)
         config_save_climb_rate(cr_on);
     }
 
+    /* ---- LEVEL 9: tone-start altitude ------------------------------------- */
+    /* The altitude at which the presence TONE begins its fade-in. Only two choices
+     * are offered: the default TONE_START_FT (100 ft) or the higher
+     * TONE_START_FT_HIGH (200 ft) for an earlier, gentler swell on a long final. A
+     * single TAP toggles between them; double-tap / timeout confirms. Like the vario
+     * levels above this acts on the TONE, so it is NOT gated on callouts_enabled —
+     * it must be reachable in tone-only mode too. The page has no dedicated voice
+     * clip, so we voice it with the existing "Tone Only" piece followed by the
+     * altitude NUMBER ("Tone Only ... one hundred") — unambiguous since this is the
+     * only level that pairs "Tone Only" with a spoken altitude.                     */
+    {
+        /* Two-entry cycle: index 0 == default, index 1 == the high option. */
+        const float ts_opts[2] = { TONE_START_FT, TONE_START_FT_HIGH };
+        size_t      ts_sel      = 0;            /* start on the default */
+
+        audio_play_clip_blocking(config_clip_piece(CFG_PIECE_TONE_ONLY)); /* "tone only" */
+        vTaskDelay(pdMS_TO_TICKS(120));
+        /* Announce the starting (default) altitude via the number clips. */
+        audio_play_clip_blocking(callout_clip(callout_id_for_ft(ts_opts[ts_sel])));
+
+        idle_ms = 0;
+        for (;;) {
+            tap_event_t ev = wait_tap_event(&idle_ms);
+            if (ev == TAP_DOUBLE || ev == TAP_TIMEOUT) {
+                break;                          /* confirm this tone-start altitude */
+            }
+            if (ev == TAP_SINGLE) {
+                ts_sel = (ts_sel + 1) % 2;      /* toggle 100 <-> 200 */
+                float ft = ts_opts[ts_sel];
+                ESP_LOGI(TAG, "config: tone-start -> %.0f ft", ft);
+                audio_play_clip_blocking(callout_clip(callout_id_for_ft(ft)));
+            }
+        }
+        audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
+        config_save_tone_start(ts_opts[ts_sel]);
+    }
+
     ESP_LOGW(TAG, "config committed (mode %d); rebooting", selected_mode);
     vTaskDelay(pdMS_TO_TICKS(50));   /* let the log + DMA flush */
     esp_restart();                   /* does not return */
@@ -621,6 +672,11 @@ static void logic_task(void *arg)
 
     sm_ctx_t sm;
     sm_init(&sm, initial);
+
+    /* Override the tone gate's start altitude with the pilot's saved choice (sm_init
+     * seeds the default). Boot resolves s_tone_start_ft before this task is created,
+     * so it is final by the time we read it here.                                  */
+    sm.tone_start_ft = s_tone_start_ft;
 
     int64_t last_us = esp_timer_get_time();
     bool sleep_allowed_prev = false;
@@ -905,6 +961,15 @@ void app_main(void)
 
     /* Hand the vario enables to the audio engine once (lock-free bools thereafter). */
     audio_set_vario_enable(s_sinkrate_enabled, s_climbrate_enabled);
+
+    /* Resolve the pilot's tone-start altitude (default 100 ft, or 200 ft) and hand
+     * it to the audio engine so the presence-tone pitch + fade-in anchor on it. The
+     * logic task also feeds it into the sm tone gate (see logic_task) so the gate and
+     * the audio schedule share one start altitude. Done after the menu branch so a
+     * freshly-committed value takes effect this boot.                              */
+    s_tone_start_ft = config_load_tone_start();
+    audio_set_tone_start(s_tone_start_ft);
+    ESP_LOGI(TAG, "tone-start altitude: %.0f ft", s_tone_start_ft);
 
     /* Apply the saved TONE + VOICE volume offsets (0 dB == no change). Done after
      * the menu branch so freshly-committed values are the ones in effect this boot. */

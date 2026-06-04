@@ -159,6 +159,7 @@ EMSCRIPTEN_KEEPALIVE float sim_vario_beep_factor(void)   { return VARIO_BEEP_FAC
 EMSCRIPTEN_KEEPALIVE float sim_vario_beep_min_ms(void)   { return VARIO_BEEP_MIN_MS; }
 EMSCRIPTEN_KEEPALIVE float sim_vario_beep_max_ms(void)   { return VARIO_BEEP_MAX_MS; }
 EMSCRIPTEN_KEEPALIVE float sim_vario_edge_ms(void)       { return VARIO_EDGE_MS; }
+EMSCRIPTEN_KEEPALIVE float sim_vario_rate_smooth_ms(void){ return VARIO_RATE_SMOOTH_MS; }
 
 /* ===========================================================================
  *  Profile introspection — lets JS draw the altitude tape from real data.

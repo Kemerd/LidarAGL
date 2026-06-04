@@ -511,6 +511,58 @@ void config_wipe_climb_rate(void)
     ESP_LOGW(TAG, "climb-rate flag wiped (will use disabled)");
 }
 
+/* ---- Tone-start altitude (presence-tone fade-in anchor) ------------------ */
+
+float config_load_tone_start(void)
+{
+    /* Stored as a u16 of feet, same contract as the start-altitude cap above:
+     * absent / unreadable / zero -> the compile-time default so a corrupt value
+     * can never push the tone-start out of band or silence the tone.            */
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return DEFAULT_TONE_START_FT;
+    }
+    uint16_t v = 0;
+    esp_err_t err = nvs_get_u16(h, NVS_KEY_TONESTART, &v);
+    nvs_close(h);
+    if (err != ESP_OK || v == 0) {
+        return DEFAULT_TONE_START_FT;
+    }
+    return (float)v;
+}
+
+void config_save_tone_start(float ft)
+{
+    if (ft < 0.0f) {
+        ft = 0.0f;
+    }
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed; tone-start altitude not persisted");
+        return;
+    }
+    /* Round to the nearest foot; the menu only offers integer altitudes. */
+    uint16_t v = (uint16_t)(ft + 0.5f);
+    if (nvs_set_u16(h, NVS_KEY_TONESTART, v) == ESP_OK) {
+        nvs_commit(h);
+        ESP_LOGI(TAG, "tone-start altitude saved: %u ft", v);
+    } else {
+        ESP_LOGE(TAG, "nvs_set_u16 failed; tone-start altitude not persisted");
+    }
+    nvs_close(h);
+}
+
+void config_wipe_tone_start(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, NVS_KEY_TONESTART);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "tone-start altitude wiped (will use default)");
+}
+
 /* ---- Load / commit ------------------------------------------------------- */
 
 size_t boot_buffer_load(boot_entry_t *out, size_t cap)

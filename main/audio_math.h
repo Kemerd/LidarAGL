@@ -17,6 +17,22 @@
 #define LIDARAGL_AUDIO_MATH_H
 
 /**
+ * @brief Set the altitude (ft AGL) at which the presence tone begins its fade-in.
+ *
+ * @param ft  Tone-start altitude in feet. Both agl_to_pitch_hz() and
+ *            agl_to_tone_db() anchor their pitch + dB schedules on it. Values at or
+ *            below TONE_FULL_FT (which would leave no fade-in band) are ignored and
+ *            the default TONE_START_FT is kept instead.
+ *
+ * @details The ONE configured value this otherwise-stateless module holds. The
+ *          pilot picks it in the boot config menu (the default TONE_START_FT or the
+ *          higher TONE_START_FT_HIGH); app_main loads it from NVS and calls this
+ *          ONCE at boot, before the render task runs. Host tests and the emulator
+ *          never call it, so they evaluate at the compile-time default unchanged.
+ */
+void audio_math_set_tone_start(float ft);
+
+/**
  * @brief Map AGL to the presence-tone frequency (Hz), ascending as AGL falls.
  *
  * @details Active from TONE_START_FT down to the ground. At TONE_START_FT the
