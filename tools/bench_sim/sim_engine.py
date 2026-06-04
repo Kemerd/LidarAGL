@@ -30,8 +30,14 @@ class SimEngine:
         # float reads from the stream thread safe enough for a bench tool).
         self.rate_hz = P.DEFAULT_STREAM_HZ      # ~78 Hz, matches the real sensor
         self.ground_offset_ft = 3.0             # simulated mount height
-        self.sigma_ft = 0.0                     # gaussian range jitter
-        self.dropout_prob = 0.0                 # per-frame lost-signal probability
+        self.sigma_ft = 0.2                     # gaussian range jitter (~6 cm, a
+                                                # realistic SF30/C return on good
+                                                # terrain; the tone EMA + slew should
+                                                # absorb it with no audible warble)
+        self.dropout_prob = 0.01                # per-frame lost-signal probability
+                                                # (~1% -> a drop roughly once a second
+                                                # at the default rate, to exercise the
+                                                # firmware's last-good HOLD)
         self.max_range_ft = 328.0               # sensor max range (SF30/C ~100 m);
                                                 # beyond it the bench sends lost-signal
 

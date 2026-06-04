@@ -205,20 +205,33 @@ class BenchApp(ctk.CTk):
                      justify="left").grid(row=4, column=0, columnspan=3, padx=16,
                                           sticky="w")
 
-        self.sigma_lbl = ctk.CTkLabel(card, text="Jitter σ: 0.0 ft")
+        self.sigma_lbl = ctk.CTkLabel(card, text="Jitter σ: 0.2 ft")
         self.sigma_lbl.grid(row=5, column=0, columnspan=3, padx=16, pady=(10, 0),
                             sticky="w")
         self.sigma_slider = ctk.CTkSlider(card, from_=0, to=5, command=self._on_sigma)
-        self.sigma_slider.set(0)
+        self.sigma_slider.set(0.2)              # realistic default (matches engine)
         self.sigma_slider.grid(row=6, column=0, columnspan=3, padx=16, pady=4,
                                sticky="ew")
 
-        self.drop_lbl = ctk.CTkLabel(card, text="Lost-signal dropouts: 0 %")
+        self.drop_lbl = ctk.CTkLabel(card, text="Lost-signal dropouts: 1 %")
         self.drop_lbl.grid(row=7, column=0, columnspan=3, padx=16, pady=(10, 0),
                            sticky="w")
         self.drop_slider = ctk.CTkSlider(card, from_=0, to=30, command=self._on_drop)
-        self.drop_slider.set(0)
+        self.drop_slider.set(1)                 # realistic default (matches engine)
         self.drop_slider.grid(row=8, column=0, columnspan=3, padx=16,
+                              pady=(4, 4), sticky="ew")
+
+        # Live stream-rate override. The engine re-reads rate_hz every tick, so
+        # dragging this re-paces the frame output immediately (no restart) — handy
+        # for testing whether the raw DATA RATE itself influences any audio artifact.
+        # 78 Hz is the real sensor's active rate; drop it low or push it high to A/B.
+        self.rate_lbl = ctk.CTkLabel(card, text="Stream rate: %d Hz (real sensor)"
+                                     % P.DEFAULT_STREAM_HZ)
+        self.rate_lbl.grid(row=9, column=0, columnspan=3, padx=16, pady=(10, 0),
+                           sticky="w")
+        self.rate_slider = ctk.CTkSlider(card, from_=5, to=200, command=self._on_rate)
+        self.rate_slider.set(P.DEFAULT_STREAM_HZ)
+        self.rate_slider.grid(row=10, column=0, columnspan=3, padx=16,
                               pady=(4, 14), sticky="ew")
 
     def _build_menu_card(self, parent):
@@ -369,6 +382,13 @@ class BenchApp(ctk.CTk):
     def _on_drop(self, value):
         self.engine.dropout_prob = float(value) / 100.0
         self.drop_lbl.configure(text="Lost-signal dropouts: %d %%" % int(value))
+
+    def _on_rate(self, value):
+        # Live re-pace: the stream thread reads engine.rate_hz on its next tick.
+        hz = int(value)
+        self.engine.rate_hz = hz
+        tag = " (real sensor)" if hz == P.DEFAULT_STREAM_HZ else ""
+        self.rate_lbl.configure(text="Stream rate: %d Hz%s" % (hz, tag))
 
     # =========================================================================
     #  Periodic refresh + serial callbacks

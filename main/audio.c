@@ -25,6 +25,7 @@
 #include "audio_math.h"
 #include "config.h"
 #include "shared.h"
+#include "sf30c.h"     /* sf30c_sim_active() — gates the TEMP DEBUG render meter */
 
 #include <math.h>
 #include <string.h>
@@ -33,6 +34,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_pm.h"        /* NO_LIGHT_SLEEP lock — keep the I2S clock alive while playing */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -46,6 +48,14 @@ static const char *TAG = "audio";
 
 static i2s_chan_handle_t s_tx = NULL;
 static bool              s_running = false;
+
+/*  NO_LIGHT_SLEEP power-management lock. The SoC's automatic light-sleep gates the
+ *  I2S bit clock, which freezes the DMA mid-stream and produces a constant train of
+ *  clicks during playback (the config menu is clean only because PM is enabled AFTER
+ *  it). We hold this lock for exactly as long as the I2S channel is enabled, and
+ *  release it whenever the channel is suspended (GROUND/CRUISE) so the box can still
+ *  light-sleep to save power while it is silent. NULL if PM is not built in.        */
+static esp_pm_lock_handle_t s_pm_lock = NULL;
 
 /*  Suspend REQUEST from the logic task. Only the audio task acts on it (it is the
  *  single owner of the I2S channel), so a render write can never race a disable
@@ -300,6 +310,19 @@ void audio_init(const audio_config_t *cfg)
         },
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx, &std_cfg));
+
+    /* Create + take the NO_LIGHT_SLEEP lock BEFORE enabling the channel so the very
+     * first samples already clock out with light-sleep inhibited. If PM isn't built
+     * in, lock_create returns an error and s_pm_lock stays NULL (all uses guard on
+     * it), so the audio path is unchanged on a no-PM build.                         */
+    if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "audio_i2s",
+                           &s_pm_lock) != ESP_OK) {
+        s_pm_lock = NULL;
+    }
+    if (s_pm_lock) {
+        esp_pm_lock_acquire(s_pm_lock);
+    }
+
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx));
     s_running = true;
 
@@ -567,6 +590,16 @@ void audio_task(void *arg)
     /*  Always interleaved stereo (L,R,L,R,...); mono modes write L == R. */
     int16_t frame[AUDIO_FRAME_LEN * AUDIO_CH];
 
+    /* TEMP DEBUG — ~1 Hz render-health meter to root-cause the flight-audio jitter.
+     * Remove this block (and the two tagged spots below) once it's diagnosed:
+     *   peak  = loudest output sample after headroom (>1.0 => backstop is clipping)
+     *   clip  = samples the backstop limiter actually clamped this second
+     *   stall = bounded i2s_channel_write stalls (DMA not draining / timeout)
+     *   part  = SHORT writes — driver accepted < a full frame, so we DROPPED the
+     *           tail of that frame (a genuine discontinuity / click source).        */
+    uint32_t dbg_frames = 0, dbg_clip = 0, dbg_stall = 0, dbg_part = 0;
+    float    dbg_peak = 0.0f;
+
     for (;;) {
         /* Single-owner channel control: apply the logic task's suspend/resume
          * REQUEST here, so THIS task is the only code that ever enables or
@@ -577,6 +610,11 @@ void audio_task(void *arg)
          * cleanly from silence.                                                  */
         if (s_suspend_req && s_running) {
             i2s_channel_disable(s_tx);
+            /* Channel is down: drop the NO_LIGHT_SLEEP lock so the box can actually
+             * light-sleep and save power while it is silent (GROUND/CRUISE).        */
+            if (s_pm_lock) {
+                esp_pm_lock_release(s_pm_lock);
+            }
             s_running    = false;
             s_gain_cur   = 0.0f;   /* ramp the tone back up from silence on resume */
             s_duck_cur   = 1.0f;   /* un-duck so the next descent starts full tone  */
@@ -587,6 +625,10 @@ void audio_task(void *arg)
             s_lpf_r      = 0.0f;
             s_flare_fade = 1.0f;   /* re-arm the flare fade for the next descent    */
         } else if (!s_suspend_req && !s_running) {
+            /* Re-arm the clock guard BEFORE enabling so resume clocks out cleanly. */
+            if (s_pm_lock) {
+                esp_pm_lock_acquire(s_pm_lock);
+            }
             i2s_channel_enable(s_tx);
             s_running = true;
         }
@@ -602,14 +644,24 @@ void audio_task(void *arg)
             }
         }
 
-        /* Snapshot the tone params under the mutex. */
-        float tone_agl    = TONE_START_FT;
-        bool  tone_active = false;
+        /* Snapshot the tone params under the mutex. CRITICAL: the take uses a ZERO
+         * timeout, so it can fail simply because the logic task held the lock for the
+         * microseconds it takes to publish new params. If that happens we must KEEP
+         * THE LAST SNAPSHOT — NOT fall back to "tone off / 100 ft". The old code reset
+         * to those defaults on every missed take, which for one frame cut the tone
+         * gain toward 0 and slammed the smoothed AGL toward its 100 ft floor; a run of
+         * missed takes (more likely when the logic task is busy, e.g. a fast sim
+         * stream) therefore injected gain/pitch flutter that reads as audible jitter.
+         * The snapshot is static so a lost lock is just a held value, never a glitch. */
+        static float s_snap_agl    = TONE_START_FT;
+        static bool  s_snap_active = false;
         if (g_audio_mutex && xSemaphoreTake(g_audio_mutex, 0) == pdTRUE) {
-            tone_agl    = g_audio_params.tone_agl;
-            tone_active = g_audio_params.tone_active;
+            s_snap_agl    = g_audio_params.tone_agl;
+            s_snap_active = g_audio_params.tone_active;
             xSemaphoreGive(g_audio_mutex);
         }
+        float tone_agl    = s_snap_agl;
+        bool  tone_active = s_snap_active;
 
         /* The tone-disabled modes (callouts-only) silence the tone outright. */
         if (!s_cfg.tone_enabled) {
@@ -741,6 +793,15 @@ void audio_task(void *arg)
              * after the limiter + LPF, so it is a true master trim on top of the
              * analog pot and never changes the soft-clip threshold above.        */
             float mg = s_master_gain;
+
+            /* TEMP DEBUG: measure the post-headroom magnitude so we can see whether
+             * the backstop limiter is firing (peak > 1.0) and how often. */
+            float dl = fabsf(left  * mg) * s_headroom;
+            float dr = fabsf(right * mg) * s_headroom;
+            if (dl > dbg_peak) dbg_peak = dl;
+            if (dr > dbg_peak) dbg_peak = dr;
+            if (dl > 1.0f || dr > 1.0f) dbg_clip++;
+
             frame[2 * i]     = f32_to_s16(left  * mg);   /* L (headroom + backstop) */
             frame[2 * i + 1] = f32_to_s16(right * mg);   /* R (headroom + backstop) */
         }
@@ -762,6 +823,7 @@ void audio_task(void *arg)
              * next iteration parks in the suspended branch. Warn ONLY on a
              * genuine stall (e.g. a timeout because the DMA isn't draining).    */
             if (werr != ESP_ERR_INVALID_STATE) {
+                dbg_stall++;   /* TEMP DEBUG: count genuine write stalls this second */
                 static bool s_warned_stall = false;
                 if (!s_warned_stall) {
                     ESP_LOGW(TAG, "i2s write stalled (%s, wrote=%u/%u) — yielding",
@@ -771,6 +833,25 @@ void audio_task(void *arg)
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(5));
+        } else if (wrote < sizeof frame) {
+            /* TEMP DEBUG: a SHORT write — the driver took our data but not all of it,
+             * so the tail of this frame was silently dropped. This path is a prime
+             * suspect for periodic clicks; the current code treats it as success. */
+            dbg_part++;
+        }
+
+        /* TEMP DEBUG: dump the render-health meter ~once per second
+         * (SAMPLE_RATE / AUDIO_FRAME_LEN frames ~= 1 s of audio). Gated on bench-sim
+         * mode ONLY — never logs on a real-sensor/flight boot, so the production
+         * console stays clean and we add no log traffic to the live USB link. */
+        if (sf30c_sim_active() && ++dbg_frames >= (SAMPLE_RATE / AUDIO_FRAME_LEN)) {
+            ESP_LOGI(TAG, "rmeter peak=%.3f clip=%u stall=%u part=%u | "
+                     "agl=%.1f act=%d voice=%d",
+                     (double)dbg_peak, (unsigned)dbg_clip, (unsigned)dbg_stall,
+                     (unsigned)dbg_part, (double)tone_agl, (int)tone_active,
+                     (int)(s_clip_pcm != NULL));
+            dbg_frames = 0; dbg_peak = 0.0f; dbg_clip = 0;
+            dbg_stall  = 0; dbg_part = 0;
         }
     }
 }

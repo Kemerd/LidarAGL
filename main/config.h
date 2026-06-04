@@ -145,7 +145,7 @@
 #define AUDIO_MODE_COUNT         4
 
 #define DEFAULT_AUDIO_MODE       AUDIO_MODE_STEREO_BOTH  /* used after a wipe     */
-#define STEREO_PAN               0.10f   /* equal-power lean, ~90% common/~10% aside */
+#define STEREO_PAN               0.90f   /* equal-power lean, ~90% common/~10% aside */
 
 #define TONE_START_FT     100.0f      /* tone becomes barely audible here        */
 #define TONE_FULL_FT      50.0f       /* tone reaches full presence by here      */
