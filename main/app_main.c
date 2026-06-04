@@ -147,7 +147,7 @@ static size_t capture_ground_fill(float *out, size_t want)
  *
  *  This function does not return — it always ends in esp_restart().
  * ------------------------------------------------------------------------- */
-#define CONFIG_COMMIT_MS    5000   /* idle time with no tap that auto-confirms   */
+#define CONFIG_COMMIT_MS    10000  /* idle time with no tap that auto-confirms   */
 #define CONFIG_POLL_MS      15     /* button poll cadence inside the menu        */
 #define CONFIG_DTAP_MS      400    /* two taps within this window == double-tap  */
 

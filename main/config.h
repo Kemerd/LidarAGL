@@ -145,7 +145,7 @@
 #define AUDIO_MODE_COUNT         4
 
 #define DEFAULT_AUDIO_MODE       AUDIO_MODE_STEREO_BOTH  /* used after a wipe     */
-#define STEREO_PAN               0.15f   /* equal-power lean, ~85% common/~15% aside */
+#define STEREO_PAN               0.10f   /* equal-power lean, ~90% common/~10% aside */
 
 #define TONE_START_FT     100.0f      /* tone becomes barely audible here        */
 #define TONE_FULL_FT      50.0f       /* tone reaches full presence by here      */
@@ -198,6 +198,20 @@
 #define TONE_FULL_DB      -6.0f       /* full presence at/below 50 ft            */
 #define VOICE_DUCK_DB     4.0f        /* duck the tone this much under a callout  */
 #define GAIN_RAMP_MS      40          /* raised-cosine envelope time (>=30–50ms)  */
+
+/*  Global output headroom — reserved AT THE OUTPUT, on top of the pilot's config
+ *  volume offset. The equal-loudness correction (audio_math.c) BOOSTS the tone by
+ *  up to +3.18 dB around 1.3–1.6 kHz (the flare's pitch band) to keep perceived
+ *  loudness flat as the pitch climbs. That is a real gain INCREASE that eats into
+ *  full-scale headroom, and in MONO — where tone + voice sum into one channel at
+ *  full weight instead of being panned apart like stereo — the mix can reach or
+ *  cross 0 dBFS. Rather than rely on the limiter catching it, we simply reserve
+ *  this much fixed headroom on every output sample so the boost can never reach
+ *  full scale in the first place (gain-stage, don't clamp). Sized to just cover the
+ *  eql peak; the absolute level is irrelevant since the analog trim/panel sets
+ *  loudness, so this costs nothing. Applied to flight AND config-menu audio so the
+ *  volume preview plays at the same net level the running box will.               */
+#define OUTPUT_HEADROOM_DB  -3.2f
 
 /* ---- Audio: voice-sidechain duck (a real compressor, keyed off the voice) -- */
 /*  The tone ducks UNDER the voice the way a broadcast "voice over music" ducker

@@ -93,6 +93,12 @@ static float s_voice_env       = 0.0f;            /* tracked voice amplitude    
  *  so the render loop can read it lock-free.                                     */
 static volatile float s_master_gain = 1.0f;
 
+/*  Fixed output headroom as a LINEAR gain (db_to_gain(OUTPUT_HEADROOM_DB)). Resolved
+ *  once at init and multiplied into EVERY output sample — flight render and the
+ *  blocking config-menu playback alike — so the equal-loudness boost can never push
+ *  the mix to full scale (see OUTPUT_HEADROOM_DB in config.h). 1.0 until init runs.  */
+static float s_headroom = 1.0f;
+
 /*  Steady baseline trim applied to the presence tone whenever the active mode
  *  plays callouts (TONE_TRIM_WITH_VOICE_DB). Resolved once at init from
  *  s_cfg.callouts_enabled into a linear gain so the per-sample path is a bare
@@ -165,6 +171,11 @@ static float s_lpf_r    = 0.0f;        /* last LPF output, RIGHT channel        
  *  tone, which appears earlier in the file.                                      */
 static inline float nco_advance(float *phase, float freq_hz);
 
+/*  Forward declaration: the float->s16 output converter (headroom + limiter
+ *  backstop, defined with the render helpers below) is also used by the blocking
+ *  volume-preview tone above it.                                                  */
+static inline int16_t f32_to_s16(float x);
+
 /* ---------------------------------------------------------------------------
  *  Init
  * ------------------------------------------------------------------------- */
@@ -234,6 +245,11 @@ void audio_init(const audio_config_t *cfg)
     s_tone_trim = s_cfg.callouts_enabled ? db_to_gain(TONE_TRIM_WITH_VOICE_DB)
                                          : 1.0f;
 
+    /* Resolve the fixed output headroom once (linear). Multiplied into every output
+     * sample so the equal-loudness boost can never reach full scale — see
+     * OUTPUT_HEADROOM_DB. The hard limiter in f32_to_s16() stays as a backstop. */
+    s_headroom = db_to_gain(OUTPUT_HEADROOM_DB);
+
     /* Flare-fade steps: a full 0..1 swing covers the configured fade time. The
      * out-step is the SLOW 3 s fade under the flare; the in-step is the QUICK
      * restore when the aircraft climbs back through FLARE_FADE_FT.              */
@@ -260,6 +276,13 @@ void audio_init(const audio_config_t *cfg)
      * sample from s_cfg.stereo in the render loop.                            */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO,
                                                             I2S_ROLE_MASTER);
+    /* Auto-clear the DMA TX buffer on underrun. Without this the peripheral keeps
+     * re-clocking whatever stale samples are still in the last DMA descriptor when
+     * we stop feeding it — which is exactly the held "eeee" tone heard after a
+     * blocking config-menu clip ends (the render task isn't up yet to push silence).
+     * With auto_clear the driver substitutes zeros the moment our data runs out, so
+     * a finished clip falls to true silence instead of looping its tail.            */
+    chan_cfg.auto_clear = true;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx, NULL));
 
     i2s_std_config_t std_cfg = {
@@ -360,7 +383,10 @@ void audio_play_clip_blocking(const clip_t *c)
         size_t chunk = n - written_total;
         if (chunk > AUDIO_FRAME_LEN) chunk = AUDIO_FRAME_LEN;
         for (size_t i = 0; i < chunk; ++i) {
-            int16_t s = (int16_t)((float)pcm[written_total + i] * mg);
+            /* Same fixed output headroom as the flight render path so the spoken
+             * config-menu prompts (and the volume preview) play at the exact net
+             * level the running box will use — not 3.2 dB hotter. */
+            int16_t s = (int16_t)((float)pcm[written_total + i] * mg * s_headroom);
             buf[2 * i]     = s;   /* L */
             buf[2 * i + 1] = s;   /* R */
         }
@@ -414,7 +440,9 @@ void audio_play_tone_blocking(float freq_hz, int ms, float level_db)
             }
 
             float s = nco_advance(&phase, freq_hz) * gain * env;
-            int16_t v = (int16_t)(s * 32767.0f);
+            /* Through the shared converter so the preview tone carries the same
+             * output headroom (and limiter backstop) as the flight render path. */
+            int16_t v = f32_to_s16(s);
             buf[2 * i]     = v;   /* L */
             buf[2 * i + 1] = v;   /* R */
         }
@@ -507,6 +535,25 @@ static inline float mix_limit(float x, bool voice_active)
     (void)voice_active;
     return soft_clip(x);
 #endif
+}
+
+/*  Final float -> s16 conversion. Two-stage by design:
+ *    1) Apply the fixed OUTPUT HEADROOM (s_headroom). This is the PRIMARY defence:
+ *       it gain-stages the whole mix down so the equal-loudness boost can never
+ *       reach full scale, so in practice the clamp below never fires. (Why mono
+ *       needed this and stereo didn't: stereo pans tone/voice apart at ~0.92/0.27
+ *       so neither channel gets hot; mono sums them into one channel at full
+ *       weight, so the eql boost there could tip the mix over 0 dBFS.)
+ *    2) HARD limiter as a backstop only. A bare (int16_t) cast of a value past
+ *       +/-32767 WRAPS to the opposite sign — a full-scale discontinuity heard as
+ *       a click. With the headroom in place this should never engage, but it stays
+ *       so a future gain mistake degrades to a tick instead of a wrap.             */
+static inline int16_t f32_to_s16(float x)
+{
+    x *= s_headroom;                      /* primary: reserve headroom (gain-stage) */
+    if (x >  1.0f) x =  1.0f;             /* backstop limiter — should never fire   */
+    if (x < -1.0f) x = -1.0f;
+    return (int16_t)(x * 32767.0f);
 }
 
 /* ---------------------------------------------------------------------------
@@ -694,8 +741,8 @@ void audio_task(void *arg)
              * after the limiter + LPF, so it is a true master trim on top of the
              * analog pot and never changes the soft-clip threshold above.        */
             float mg = s_master_gain;
-            frame[2 * i]     = (int16_t)(left  * mg * 32767.0f);   /* L */
-            frame[2 * i + 1] = (int16_t)(right * mg * 32767.0f);   /* R */
+            frame[2 * i]     = f32_to_s16(left  * mg);   /* L (headroom + backstop) */
+            frame[2 * i + 1] = f32_to_s16(right * mg);   /* R (headroom + backstop) */
         }
 
         /* The blocking write paces the loop to real time (the DMA backpressures).
