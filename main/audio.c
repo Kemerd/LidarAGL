@@ -309,19 +309,35 @@ void audio_init(const audio_config_t *cfg)
             .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
         },
     };
+
+    /* Force a 64·fS bit clock. The PCM5102A's internal PLL (SCK->GND mode) does NOT
+     * support a 32·fS BCK at 16 kHz: datasheet Table 11 lists 16 kHz @ 32·fS as
+     * unsupported and requires 64·fS (1.024 MHz) for the PLL to lock. The default
+     * 16-bit slot gives only 32·fS (16 bits × 2 ch × 16 kHz = 512 kHz), below spec.
+     * Widening the SLOT to 32 bits (data stays 16-bit, padded in the slot LSBs) makes
+     * BCK = 32 × 2 × 16 kHz = 1.024 MHz = 64·fS, squarely inside the PLL's range, so
+     * the DAC's clock recovery is solid instead of marginal.                        */
+    std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx, &std_cfg));
 
     /* Create + take the NO_LIGHT_SLEEP lock BEFORE enabling the channel so the very
      * first samples already clock out with light-sleep inhibited. If PM isn't built
      * in, lock_create returns an error and s_pm_lock stays NULL (all uses guard on
      * it), so the audio path is unchanged on a no-PM build.                         */
-    if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "audio_i2s",
-                           &s_pm_lock) != ESP_OK) {
+    esp_err_t pmerr = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "audio_i2s",
+                                         &s_pm_lock);
+    if (pmerr != ESP_OK) {
         s_pm_lock = NULL;
     }
     if (s_pm_lock) {
         esp_pm_lock_acquire(s_pm_lock);
     }
+    /* TEMP DEBUG: confirm the no-light-sleep guard is actually live. If this says
+     * UNAVAILABLE, PM locks aren't compiled in; if HELD but stalls persist, then
+     * light-sleep is not what's gating the I2S clock and we look elsewhere.        */
+    ESP_LOGW(TAG, "PM no-light-sleep lock: %s (create=%s)",
+             s_pm_lock ? "HELD" : "UNAVAILABLE", esp_err_to_name(pmerr));
 
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx));
     s_running = true;
@@ -614,6 +630,7 @@ void audio_task(void *arg)
              * light-sleep and save power while it is silent (GROUND/CRUISE).        */
             if (s_pm_lock) {
                 esp_pm_lock_release(s_pm_lock);
+                ESP_LOGW(TAG, "PM lock RELEASED (audio suspended)");  /* TEMP DEBUG */
             }
             s_running    = false;
             s_gain_cur   = 0.0f;   /* ramp the tone back up from silence on resume */
@@ -628,6 +645,7 @@ void audio_task(void *arg)
             /* Re-arm the clock guard BEFORE enabling so resume clocks out cleanly. */
             if (s_pm_lock) {
                 esp_pm_lock_acquire(s_pm_lock);
+                ESP_LOGW(TAG, "PM lock ACQUIRED (audio resumed)");  /* TEMP DEBUG */
             }
             i2s_channel_enable(s_tx);
             s_running = true;
@@ -806,38 +824,41 @@ void audio_task(void *arg)
             frame[2 * i + 1] = f32_to_s16(right * mg);   /* R (headroom + backstop) */
         }
 
-        /* The blocking write paces the loop to real time (the DMA backpressures).
-         * We use a BOUNDED timeout and yield on any stall instead of an infinite
-         * wait: this is the highest-priority task on its core, so if the channel
-         * ever can't accept data (a transient, a mid-suspend race, or a DMA that
-         * isn't draining) an unbounded/tight loop here would starve the idle task
-         * and trip the task watchdog. The bounded path can never tight-spin, and
-         * it logs the first stall so the underlying cause is visible.            */
-        size_t wrote = 0;
-        esp_err_t werr = i2s_channel_write(s_tx, frame, sizeof frame, &wrote,
-                                           pdMS_TO_TICKS(100));
-        if (werr != ESP_OK || wrote == 0) {
-            /* ESP_ERR_INVALID_STATE is the EXPECTED, harmless suspend race: the
-             * logic task disabled the channel (light-sleep at GROUND/CRUISE)
-             * between our s_running check and this write. We just yield and the
-             * next iteration parks in the suspended branch. Warn ONLY on a
-             * genuine stall (e.g. a timeout because the DMA isn't draining).    */
-            if (werr != ESP_ERR_INVALID_STATE) {
-                dbg_stall++;   /* TEMP DEBUG: count genuine write stalls this second */
+        /* Push the WHOLE frame into the DMA, ACCUMULATING across partial writes and
+         * RE-trying a transient stall — we never discard generated audio. The old
+         * code wrote once with a bounded timeout and, on any stall/short write, just
+         * moved on: but the per-sample loop above had already ADVANCED the oscillator
+         * phase by a full frame, so a dropped frame is a phase discontinuity = click.
+         * That is the click. The clean blocking config path never discards either —
+         * it waits — so we mirror it here. The i2s write itself blocks (bounded), so
+         * looping on a stall can't tight-spin or starve the idle task; we just keep
+         * offering the remainder until the frame is fully queued or the channel is
+         * being suspended out from under us (then we abandon the tail cleanly).      */
+        size_t off = 0;
+        while (off < sizeof frame) {
+            size_t wrote = 0;
+            esp_err_t werr = i2s_channel_write(s_tx, (const uint8_t *)frame + off,
+                                               sizeof frame - off, &wrote,
+                                               pdMS_TO_TICKS(100));
+            off += wrote;                      /* advance past whatever was accepted  */
+            if (off >= sizeof frame) {
+                break;                         /* whole frame queued — done           */
+            }
+            /* Channel going down (single-owner suspend handled at loop top): stop
+             * pushing this frame rather than block against a disabled channel.       */
+            if (werr == ESP_ERR_INVALID_STATE || s_suspend_req) {
+                break;
+            }
+            if (wrote == 0) {
+                dbg_stall++;   /* TEMP DEBUG: transient stall — we RETRY, never drop  */
                 static bool s_warned_stall = false;
                 if (!s_warned_stall) {
-                    ESP_LOGW(TAG, "i2s write stalled (%s, wrote=%u/%u) — yielding",
-                             esp_err_to_name(werr), (unsigned)wrote,
-                             (unsigned)sizeof frame);
+                    ESP_LOGW(TAG, "i2s write slow (%s) — retrying, not dropping",
+                             esp_err_to_name(werr));
                     s_warned_stall = true;
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(5));
-        } else if (wrote < sizeof frame) {
-            /* TEMP DEBUG: a SHORT write — the driver took our data but not all of it,
-             * so the tail of this frame was silently dropped. This path is a prime
-             * suspect for periodic clicks; the current code treats it as success. */
-            dbg_part++;
+            /* loop: the blocking write paces us; the remainder goes next attempt */
         }
 
         /* TEMP DEBUG: dump the render-health meter ~once per second
