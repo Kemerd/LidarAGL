@@ -183,14 +183,13 @@ static size_t capture_ground_fill(float *out, size_t want)
  *       the profile's gear-check altitudes -> OFF, starting on OFF (the default).
  *    7. LEVEL 6 — "Positive Rate" enable toggle. Skipped in tone-only mode. A
  *       simple ON/OFF, starting OFF (the default).
- *    8. LEVEL 7 — "Sink Rate" vario-blip toggle. ON/OFF, starting OFF. Acts on the
- *       TONE, so it runs in EVERY mode (not gated on callouts).
- *    9. LEVEL 8 — "Climb Rate" vario-blip toggle. ON/OFF, starting OFF. Also a tone
- *       feature, so it runs in every mode.
- *   10. LEVEL 9 — tone-start altitude. Voice "Tone Only" + the altitude number; a
+ *    8. LEVEL 7 — Vario "blip" direction. A 3-way OFF -> Sink -> Climb -> OFF,
+ *       starting OFF. Sink/Climb are mutually exclusive (the active direction blips;
+ *       the other way is a steady tone). Acts on the TONE, so it runs in EVERY mode.
+ *    9. LEVEL 8 — tone-start altitude. Voice "Tone Only" + the altitude number; a
  *       TAP toggles TONE_START_FT (100 ft) <-> TONE_START_FT_HIGH (200 ft), starting
  *       on the default. A tone feature, so it runs in every mode.
- *   11. A chirp marks each confirm. Persist all values and reboot.
+ *   10. A chirp marks each confirm. Persist all values and reboot.
  *
  *  This function does not return — it always ends in esp_restart().
  * ------------------------------------------------------------------------- */
@@ -559,17 +558,17 @@ static void run_config_menu(void)
         ESP_LOGI(TAG, "config: tone-only mode, skipping positive-rate menu");
     }
 
-    /* ---- LEVEL 7: "Sink Rate" vario-blip enable toggle -------------------- */
-    /* When ON the below-100 ft presence tone is chopped into blips that track the
-     * descent rate (faster sink => faster blips). ON/OFF like LEVEL 6, starting OFF.
-     * Unlike the voice-callout levels above, this is NOT gated on callouts_enabled:
-     * the feature acts on the TONE, so it must be reachable in tone-only mode too
-     * (the menu prompts still speak — playback is independent of the chosen mode).  */
+    /* ---- LEVEL 7: Vario "blip" direction (OFF / Sink / Climb) ------------- */
+    /* A single 3-way selector for the varioshore tone-blip. Cycle OFF -> SINK ->
+     * CLIMB -> OFF, starting OFF (the default). OFF = steady tone; SINK = the tone
+     * blips faster the faster you DESCEND (constant when level/climbing); CLIMB =
+     * the inverse (blips on the way up). The two directions are MUTUALLY EXCLUSIVE.
+     * NOT gated on callouts_enabled: it acts on the TONE, so it must be reachable in
+     * tone-only mode too (the spoken prompts still play in any mode). Each tap speaks
+     * the new selection: "off" / "sink rate" / "climb rate".                        */
     {
-        bool sr_on = false;                     /* start OFF (the default) */
+        int vsel = 0;   /* 0 = OFF, 1 = SINK, 2 = CLIMB */
 
-        audio_play_clip_blocking(callout_clip(CO_SINK_RATE));      /* title "sink rate" */
-        vTaskDelay(pdMS_TO_TICKS(120));
         audio_play_clip_blocking(config_clip_piece(CFG_PIECE_OFF)); /* starting OFF */
 
         idle_ms = 0;
@@ -579,46 +578,26 @@ static void run_config_menu(void)
                 break;                          /* confirm this setting */
             }
             if (ev == TAP_SINGLE) {
-                sr_on = !sr_on;
-                ESP_LOGI(TAG, "config: sink-rate -> %s", sr_on ? "ON" : "OFF");
-                audio_play_clip_blocking(config_clip_piece(sr_on ? CFG_PIECE_ON
-                                                                 : CFG_PIECE_OFF));
+                vsel = (vsel + 1) % 3;          /* OFF -> SINK -> CLIMB -> OFF */
+                if (vsel == 1) {
+                    ESP_LOGI(TAG, "config: vario -> SINK");
+                    audio_play_clip_blocking(callout_clip(CO_SINK_RATE));
+                } else if (vsel == 2) {
+                    ESP_LOGI(TAG, "config: vario -> CLIMB");
+                    audio_play_clip_blocking(callout_clip(CO_CLIMB_RATE));
+                } else {
+                    ESP_LOGI(TAG, "config: vario -> OFF");
+                    audio_play_clip_blocking(config_clip_piece(CFG_PIECE_OFF));
+                }
             }
         }
         audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
-        config_save_sink_rate(sr_on);
+        /* Persist as the two mutually-exclusive flags (at most one set). */
+        config_save_sink_rate(vsel == 1);
+        config_save_climb_rate(vsel == 2);
     }
 
-    /* ---- LEVEL 8: "Climb Rate" vario-blip enable toggle ------------------- */
-    /* When ON a CLIMB also drives the blips (otherwise a climb reads as 0 fpm and
-     * the tone stays at the lazy baseline beep). Only meaningful alongside SINK
-     * RATE; ON/OFF like the levels above, starting OFF. Also a TONE feature, so it
-     * is reachable in every mode (not gated on callouts_enabled).                  */
-    {
-        bool cr_on = false;                     /* start OFF (the default) */
-
-        audio_play_clip_blocking(callout_clip(CO_CLIMB_RATE));     /* title "climb rate" */
-        vTaskDelay(pdMS_TO_TICKS(120));
-        audio_play_clip_blocking(config_clip_piece(CFG_PIECE_OFF)); /* starting OFF */
-
-        idle_ms = 0;
-        for (;;) {
-            tap_event_t ev = wait_tap_event(&idle_ms);
-            if (ev == TAP_DOUBLE || ev == TAP_TIMEOUT) {
-                break;                          /* confirm this setting */
-            }
-            if (ev == TAP_SINGLE) {
-                cr_on = !cr_on;
-                ESP_LOGI(TAG, "config: climb-rate -> %s", cr_on ? "ON" : "OFF");
-                audio_play_clip_blocking(config_clip_piece(cr_on ? CFG_PIECE_ON
-                                                                 : CFG_PIECE_OFF));
-            }
-        }
-        audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
-        config_save_climb_rate(cr_on);
-    }
-
-    /* ---- LEVEL 9: tone-start altitude ------------------------------------- */
+    /* ---- LEVEL 8: tone-start altitude ------------------------------------- */
     /* The altitude at which the presence TONE begins its fade-in. Only two choices
      * are offered: the default TONE_START_FT (100 ft) or the higher
      * TONE_START_FT_HIGH (200 ft) for an earlier, gentler swell on a long final. A

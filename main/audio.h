@@ -62,18 +62,18 @@ void audio_init(const audio_config_t *cfg);
 void audio_set_params(float tone_agl, bool tone_active, float vert_fps);
 
 /**
- * @brief Enable/disable the variometer "blip" gate (called once at boot).
+ * @brief Select the variometer "blip" active direction (called once at boot).
  *
- * @param sink_on   When true, the below-100 ft presence tone is chopped into blips
- *                  whose cadence tracks the DESCENT rate (faster sink => faster
- *                  blips). When false the gate stays open and the tone is steady.
- * @param climb_on  When true a CLIMB also drives the blips; when false a climb is
- *                  treated as 0 fpm (the lazy baseline beep). Only meaningful while
- *                  @p sink_on is set, since both share the one blip gate.
+ * @param sink_on   Sink mode: the below-100 ft tone blips faster the faster you
+ *                  DESCEND; level/climbing => a steady constant tone.
+ * @param climb_on  Climb mode (the inverse): blips on the way UP, constant tone when
+ *                  level/sinking.
  *
- * @details Both flags come from NVS at boot (config_load_sink_rate /
- *          config_load_climb_rate). Lock-free single-bool stores, read by the
- *          render loop — same pattern as the tone/voice volume setters.
+ * @details The two are MUTUALLY EXCLUSIVE — the boot menu offers OFF / Sink / Climb,
+ *          so at most one is set; with NEITHER set the gate stays open (steady tone).
+ *          Below the onset rate the tone is constant in every mode (see the VARIO_*
+ *          mapping in config.h). Flags come from NVS at boot (config_load_sink_rate /
+ *          config_load_climb_rate); lock-free bool stores read by the render loop.
  */
 void audio_set_vario_enable(bool sink_on, bool climb_on);
 

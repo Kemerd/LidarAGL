@@ -321,38 +321,37 @@
 #define FLARE_FADE_IN_MS    100       /* silent->full quick restore on re-cross  */
 
 /* ---- Variometer "blip" cadence (sink/climb-rate feature) ----------------- */
-/*  A glider-vario behaviour folded into the presence tone: when the SINK RATE
- *  config toggle is ON, the below-100 ft tone is CHOPPED into blips whose cadence
- *  tracks the aircraft's vertical speed — faster sink => faster, tighter blips —
- *  so the pilot hears the rate of descent on short final without looking at
- *  anything. When SINK RATE is OFF the gate is held at 1.0 and the tone is the
- *  steady sound it has always been. The CLIMB RATE toggle additionally lets a
- *  climb drive the blips; with it OFF a climb is treated as 0 fpm (lazy baseline
- *  beep). Both default OFF (see NVS_KEY_SINKRATE / NVS_KEY_CLIMBRATE).
+/*  A varioshore-style glider behaviour folded into the presence tone. The boot
+ *  menu picks ONE active direction (mutually exclusive, see audio_set_vario_enable):
+ *    - SINK mode : the below-100 ft tone blips faster the faster you SINK; level or
+ *                  climbing => a steady CONSTANT tone.
+ *    - CLIMB mode: the inverse — blips on the way UP, constant when level/sinking.
+ *    - OFF       : steady tone always (the default; the gate is held open).
  *
- *  The mapping (see audio.c blip gate + the emulator mirror) — cadence is a pure
- *  function of the vertical RATE (no derivative term):
- *    rate_fpm   = climb_on ? max(sink_fpm, climb_fpm) : sink_fpm
- *    t          = clamp(rate_fpm / VARIO_REF_FPM, 0, 1)
- *    silence_ms = VARIO_SIL_BASE_MS + t*(VARIO_SIL_MIN_MS - VARIO_SIL_BASE_MS)
- *    beep_ms    = clamp(VARIO_BEEP_FACTOR*silence_ms,
- *                       VARIO_BEEP_MIN_MS, VARIO_BEEP_MAX_MS)
- *  The SILENCE length is the sink-rate knob (long when level, short when sinking
- *  fast => faster blips); the BEEP is simply a fraction of it, so the whole cadence
- *  scales together. Tune all of these on the bench / in the emulator.
+ *  The cadence is modelled on the open-source BlueFlyVario, whose blip rate is
+ *  PROPORTIONAL to vertical speed (bpm ~= 200 x m/s): it starts beeping at the 0.2 m/s
+ *  onset and the period bottoms out at ~0.1 s (~600 bpm) by ~3 m/s, with its
+ *  speedMultiplier just stretching WHERE that cap lands. We take that curve, FLIP it to
+ *  descent, and STRETCH it ~2x so the 600 bpm cap lands at 1000 fpm (instead of
+ *  BlueFly's ~590) -- gentler for a landing aid than a thermal vario. The pitch is NOT
+ *  touched here: it stays purely a function of ALTITUDE (agl_to_pitch_hz). Per blip:
+ *      if rate_fpm < VARIO_ONSET_FPM  -> CONSTANT tone (no chopping)
+ *      bpm        = min(VARIO_BPM_MAX, rate_fpm * VARIO_BPM_MAX / VARIO_FULL_FPM)
+ *      period_ms  = 60000 / bpm
+ *      silence_ms = period_ms / (1 + VARIO_BEEP_FACTOR)   (beep = the rest)
+ *  rate_fpm is the magnitude in the active direction only (the other way reads 0 =>
+ *  constant tone). Onset 40 fpm == BlueFly's 0.2 m/s; the 1000 fpm / 600 bpm cap is the
+ *  stretched top end. Retune by moving those three numbers.
  *
  *  The current beep/silence ALWAYS plays out at its committed length — durations are
- *  only recomputed at a phase boundary, never mid-blip. To stop the cadence LURCHING
- *  when the rate suddenly shifts (one lazy blip then an abrupt buzz), the rate that
- *  feeds the mapping is first run through a one-pole follower (VARIO_RATE_SMOOTH_MS):
- *  a sudden change eases in over a few blips instead of snapping in one. Set it to a
- *  small value for a snappy/literal response, larger for a smoother glide.          */
-#define VARIO_REF_FPM         800.0f  /* rate that maps to the fastest blips      */
-#define VARIO_SIL_BASE_MS     240.0f  /* silence at 0 fpm (baseline beep)         */
-#define VARIO_SIL_MIN_MS      40.0f   /* silence at/above the reference rate      */
-#define VARIO_BEEP_FACTOR     0.5f    /* beep length = this * the silence length  */
-#define VARIO_BEEP_MIN_MS     24.0f   /* beep length floor                        */
-#define VARIO_BEEP_MAX_MS     400.0f  /* beep length ceiling                      */
+ *  recomputed only at a phase boundary, never mid-blip. To stop the cadence LURCHING
+ *  when the rate suddenly shifts, the rate that feeds the mapping is first run through
+ *  a one-pole follower (VARIO_RATE_SMOOTH_MS) so a sudden change eases in over a few
+ *  blips instead of snapping in one. Smaller = snappier, larger = a smoother glide.   */
+#define VARIO_ONSET_FPM       40.0f   /* below this: CONSTANT tone (BlueFly 0.2 m/s)*/
+#define VARIO_FULL_FPM        1000.0f /* rate at which the cadence reaches its cap  */
+#define VARIO_BPM_MAX         600.0f  /* cap blip rate (beats/min) at VARIO_FULL_FPM*/
+#define VARIO_BEEP_FACTOR     0.5f    /* beep:silence ratio within each period    */
 #define VARIO_EDGE_MS         4.0f    /* raised-cosine-ish gate ramp (anti-click) */
 #define VARIO_RATE_SMOOTH_MS  450.0f  /* one-pole time const that eases cadence    */
                                       /* changes when the rate suddenly shifts     */

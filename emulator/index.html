@@ -375,15 +375,18 @@
             <button class="btn secondary" id="cruiseBtn">Jump to cruise</button>
           </div>
 
-          <!-- Variometer "blip" toggles (firmware LEVEL 7/8). With Sink Rate on the
-               below-100 ft tone is chopped into blips that track the descent rate;
-               Climb Rate additionally lets a climb drive them. Mirrors the device. -->
+          <!-- Variometer "blip" direction (firmware LEVEL 7). One mutually-exclusive
+               choice: Off (steady tone), Sink (blips faster the faster you descend,
+               constant when level/climbing), or Climb (the inverse). Mirrors device. -->
           <div class="vario-toggles" style="margin-top:10px; display:flex; gap:16px;">
             <label class="vario-toggle">
-              <input type="checkbox" id="sinkRateChk"> Sink rate blip
+              <input type="radio" name="varioMode" id="varioOff" value="off" checked> Off
             </label>
             <label class="vario-toggle">
-              <input type="checkbox" id="climbRateChk"> Climb rate blip
+              <input type="radio" name="varioMode" id="varioSink" value="sink"> Sink rate
+            </label>
+            <label class="vario-toggle">
+              <input type="radio" name="varioMode" id="varioClimb" value="climb"> Climb rate
             </label>
           </div>
 

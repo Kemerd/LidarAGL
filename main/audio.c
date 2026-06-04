@@ -131,19 +131,12 @@ static float s_flare_fade      = 1.0f;            /* current flare-fade level   
 
 /* ---- Variometer "blip" gate (sink/climb-rate feature) -------------------- */
 
-/*  Feature enables, set once at boot from NVS via audio_set_vario_enable(). When
- *  s_vario_sink_on is false the gate is held fully OPEN (1.0) and the tone is the
- *  steady sound it has always been — the whole blip path is bypassed. s_vario_
- *  climb_on additionally lets a CLIMB drive the blips (otherwise a climb reads as
- *  0 fpm). Atomic single-bool stores, read lock-free by the render loop.          */
+/*  Active-direction selector, set once at boot from NVS via audio_set_vario_enable().
+ *  At most ONE is set: sink-mode blips on the way down, climb-mode blips on the way
+ *  up, and with NEITHER set the gate is held fully OPEN (1.0) so the tone is byte-for-
+ *  byte the steady sound it has always been. Atomic bool stores, read lock-free.     */
 static volatile bool  s_vario_sink_on  = false;
 static volatile bool  s_vario_climb_on = false;
-
-/*  The live vertical rate + acceleration the logic task publishes (ft/s, +up),
- *  snapshotted from g_audio_params each frame. They drive the beep/silence
- *  durations recomputed at every phase flip.                                      */
-static volatile float s_vario_vfps = 0.0f;
-static volatile float s_vario_vacc = 0.0f;
 
 /*  Gate phase state. The gate is a slow square wave with asymmetric, rate-driven
  *  half-periods: s_blip_in_beep says which half we're in, s_blip_timer counts the
@@ -804,50 +797,46 @@ static inline float duck_step(float *env, float voice)
     return duck;
 }
 
-/*  Vario blip — turn the live vertical rate into the beep / silence half-period
- *  lengths (in SAMPLES). The SILENCE is the sink-rate knob: a long gap when level
- *  (VARIO_SIL_BASE_MS), shrinking toward VARIO_SIL_MIN_MS at the reference rate, so
- *  faster sink => faster, tighter blips. The BEEP is simply a fraction of the
- *  silence (VARIO_BEEP_FACTOR), so the whole cadence scales together — no derivative
- *  term. See the VARIO_* block in config.h for the full mapping + tuning rationale.  */
-static void blip_durations(float vfps, int *beep_samples, int *silence_samples)
+/*  Vario blip — map a vertical-rate MAGNITUDE (fpm, in the active direction) to a blip
+ *  rate in beats/min, BlueFlyVario-style: PROPORTIONAL to the rate (bpm rises linearly
+ *  from the onset) and capped at VARIO_BPM_MAX once the rate reaches VARIO_FULL_FPM.
+ *  Below VARIO_ONSET_FPM it returns 0 to mean "CONSTANT tone" (no chopping).           */
+static float vario_bpm(float rate_fpm)
 {
-    /* Work in fpm (how the pilot thinks). vfps is +up, so a descent is negative.    */
-    float v_fpm     = vfps * 60.0f;
-    float sink_fpm  = (v_fpm < 0.0f) ? -v_fpm : 0.0f;
-    float climb_fpm = (v_fpm > 0.0f) ?  v_fpm : 0.0f;
+    if (rate_fpm < VARIO_ONSET_FPM) {
+        return 0.0f;                              /* onset: hold a CONSTANT tone */
+    }
+    float bpm = rate_fpm * (VARIO_BPM_MAX / VARIO_FULL_FPM);   /* proportional */
+    if (bpm > VARIO_BPM_MAX) bpm = VARIO_BPM_MAX;              /* cap at the top */
+    return bpm;
+}
 
-    /* Sink always drives the cadence; a climb only counts when the pilot enabled the
-     * climb-rate toggle (otherwise a climb reads as 0 fpm => the baseline beep).     */
-    float rate_fpm = s_vario_climb_on ? fmaxf(sink_fpm, climb_fpm) : sink_fpm;
-
-    /* Normalise 0..reference -> 0..1 and ramp the SILENCE from base down to min.     */
-    float t = rate_fpm / VARIO_REF_FPM;
-    if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
-    float silence_ms = VARIO_SIL_BASE_MS + t * (VARIO_SIL_MIN_MS - VARIO_SIL_BASE_MS);
-
-    /* Beep is a fixed fraction of the silence (clamped), so faster sink shrinks both. */
-    float beep_ms = VARIO_BEEP_FACTOR * silence_ms;
-    if (beep_ms < VARIO_BEEP_MIN_MS) beep_ms = VARIO_BEEP_MIN_MS;
-    if (beep_ms > VARIO_BEEP_MAX_MS) beep_ms = VARIO_BEEP_MAX_MS;
-
+/*  Split a blip PERIOD (ms) into beep + silence half-periods in SAMPLES, holding the
+ *  VARIO_BEEP_FACTOR beep:silence ratio (period = silence + beep = silence*(1+f)).    */
+static void blip_split(float period_ms, int *beep_samples, int *silence_samples)
+{
+    float silence_ms = period_ms / (1.0f + VARIO_BEEP_FACTOR);
+    float beep_ms    = period_ms - silence_ms;
     *beep_samples    = (int)(beep_ms    * (float)SAMPLE_RATE / 1000.0f);
     *silence_samples = (int)(silence_ms * (float)SAMPLE_RATE / 1000.0f);
     if (*beep_samples    < 1) *beep_samples    = 1;
     if (*silence_samples < 1) *silence_samples = 1;
 }
 
-/*  Advance the blip gate one sample and return its multiplier [0,1]. When the
- *  sink-rate feature is OFF the gate is held fully OPEN, so the tone is byte-for-byte
- *  the steady sound it has always been. Durations are recomputed only at a phase
- *  flip (timer expiry) from the latest published rate, so a changing sink retimes
- *  from the very next blip; the per-sample cost is a compare + the edge slew.        */
+/*  Advance the blip gate one sample and return its multiplier [0,1].
+ *
+ *  OFF (neither direction selected) holds the gate fully OPEN, so the tone is byte-
+ *  for-byte the steady sound it has always been. Otherwise the ACTIVE direction's
+ *  rate magnitude (sink in sink-mode, climb in climb-mode; the other way reads 0)
+ *  drives the cadence: below onset the tone is CONSTANT (gate eased open); above it
+ *  the tone is chopped into blips whose rate follows vario_bpm(). The published rate
+ *  is first eased through the VARIO_RATE_SMOOTH_MS follower so a sudden shift glides
+ *  in; durations are recomputed only at a phase boundary, so each beep/silence always
+ *  plays out at its committed length.                                                 */
 static inline float blip_advance_gate(float vfps)
 {
-    if (!s_vario_sink_on) {
-        /* Feature off: hold open and prime the phase so the first blip after an
-         * enable would open on a BEEP (next flip turns s_blip_in_beep true). Keep the
+    if (!s_vario_sink_on && !s_vario_climb_on) {
+        /* OFF: hold open, prime the phase (next flip opens on a BEEP), and keep the
          * follower seeded at the live rate so a later enable starts on-cadence.      */
         s_blip_gate     = 1.0f;
         s_blip_in_beep  = false;
@@ -856,15 +845,29 @@ static inline float blip_advance_gate(float vfps)
         return 1.0f;
     }
 
-    /* Ease the cadence rate toward the live rate so a sudden shift glides in over a
-     * few blips (~VARIO_RATE_SMOOTH_MS) instead of snapping the very next phase.      */
+    /* Ease the cadence rate toward the live rate (VARIO_RATE_SMOOTH_MS follower). */
     s_blip_rate_fps += s_blip_rate_a * (vfps - s_blip_rate_fps);
 
-    /* Durations are recomputed ONLY here, at a phase boundary — so the current beep/
-     * silence always plays out at its committed length before the cadence changes.   */
+    /* Rate magnitude in the ACTIVE direction only. Sink-mode takes precedence if a
+     * legacy config somehow has both set; the inactive direction reads 0 => constant.*/
+    float v_fpm = s_blip_rate_fps * 60.0f;
+    float rate_fpm = s_vario_sink_on ? ((v_fpm < 0.0f) ? -v_fpm : 0.0f)
+                                     : ((v_fpm > 0.0f) ?  v_fpm : 0.0f);
+
+    float bpm = vario_bpm(rate_fpm);
+    if (bpm <= 0.0f) {
+        /* Below onset (or going the inactive way): CONSTANT tone. Ease the gate open
+         * and re-prime the phase so blipping restarts cleanly on a beep.             */
+        s_blip_in_beep = false;
+        s_blip_timer   = 0;
+        s_blip_gate    = slew_limit(s_blip_gate, 1.0f, s_blip_edge_step);
+        return s_blip_gate;
+    }
+
+    /* Recompute the split ONLY at a phase boundary, so the current half plays out. */
     if (s_blip_timer <= 0) {
         int beep_n, sil_n;
-        blip_durations(s_blip_rate_fps, &beep_n, &sil_n);
+        blip_split(60000.0f / bpm, &beep_n, &sil_n);
         s_blip_in_beep = !s_blip_in_beep;                 /* flip into the next half */
         s_blip_timer   = s_blip_in_beep ? beep_n : sil_n;
     }
