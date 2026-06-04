@@ -215,14 +215,14 @@ identify the unit, it **falls back to SF30/C** (`DEFAULT_SENSOR_MODEL` in `confi
 | | **SF30/C** (default) | **SF30/D** |
 |---|---|---|
 | Usable range | ~100 m / **328 ft** | ~200 m / **656 ft** |
-| Callout ladder (ft AGL) | **200**, 100, 50, 40, 30, 20, 10 | **500, 400, 300**, 200, 100, 50, 40, 30, 20, 10 |
-| Low-power cruise cutover | **250 ft** | **500 ft** |
+| Callout ladder (ft AGL) | **300**, 200, 100, 50, 40, 30, 20, 10 | **600, 500, 400, 300**, 200, 100, 50, 40, 30, 20, 10 |
+| Low-power cruise cutover | **318 ft** | **605 ft** |
 
-**Why the SF30/C ladder starts at 200, not 300:** the SF30/C tops out near 328 ft, so a
-300 ft callout would sit inside the sensor's noisy upper margin and be too erroneous.
-Starting at 200 gives the sensor headroom to breathe and keeps every spoken number
-trustworthy. The SF30/D, with twice the range, adds the **500 / 400 / 300** callouts on
-top of the same flare-band set.
+**Why the SF30/C ladder tops at 300, not 328:** the SF30/C tops out near 328 ft, so a
+callout right at the ceiling would sit inside the sensor's noisy upper margin and be too
+erroneous. Topping the ladder at 300 gives the sensor headroom to breathe and keeps every
+spoken number trustworthy. The SF30/D, with twice the range, adds the **600 / 500 / 400**
+high-altitude callouts on top of the same set.
 
 Callout ladders, cruise altitude, and max range live in
 [`main/sensor_profile.c`](main/sensor_profile.c); everything else (pins, dB levels,
@@ -241,7 +241,9 @@ until you change it again.
 | Setting | Default | Notes |
 |---|---|---|
 | **Audio mode** | **Stereo, Callouts & Tone** | `DEFAULT_AUDIO_MODE` in `config.h` |
-| **Callout start altitude** | **Profile top** — 200 ft (SF30/C) / 500 ft (SF30/D) | the highest number that speaks |
+| **Callout start altitude** | **Profile top** — 300 ft (SF30/C) / 600 ft (SF30/D) | the highest number that speaks |
+| **Tone volume** | **0 dB** (no change) | trim on the presence tone, ±6 dB |
+| **Voice volume** | **0 dB** (no cut) | cut-only trim on the callouts, 0…−6 dB |
 | **Check-gear altitude** | **OFF** | descent "check gear" reminder; off until you set it |
 | **Positive rate** | **OFF** | takeoff climb callout; off until you enable it |
 | Ground reference | learned at every boot | not a menu item — see [Ground reference](#ground-reference-no-manual-calibration) |
@@ -255,9 +257,10 @@ a hold-at-boot is also your clean-slate / re-install reset.
 > Do this **on the ground**, on the install surface, so the ground reference
 > re-learns fresh when it reboots.
 
-### The two-level menu
+### The config menu
 The button has two gestures: a **single tap** to cycle, a **double-tap** to
-confirm (or just **wait ~5 s** to confirm the current choice).
+confirm (or just **wait ~5 s** to confirm the current choice). You walk the levels
+in order; each confirm advances to the next.
 
 **Level 1 — Audio mode.** Each option is spoken as you tap to it:
 
@@ -276,21 +279,30 @@ altitude"* then the current value. Tap to step **down** the ladder; it's the
 **highest number that will speak** — everything above it is silenced (the tone is
 unaffected):
 
-- **SF30/C:** 200 → 100 → 50 → 40 → 30 → 20 → 10 (wraps back to 200)
-- **SF30/D:** 500 → 400 → 300 → 200 → 100 → 50 → 40 → 30 → 20 → 10
+- **SF30/C:** 300 → 200 → 100 → 50 → 40 → 30 → 20 → 10 (wraps back to 300)
+- **SF30/D:** 600 → 500 → 400 → 300 → 200 → 100 → 50 → 40 → 30 → 20 → 10
 
-Double-tap (or wait) to confirm → **chirp**, then the unit **reboots** into normal
-operation with your settings.
+Double-tap (or wait) to confirm → **chirp**.
 
 > **Example:** pick *Stereo, Callouts & Tone*, then set start altitude to **100** on
 > an SF30/C → you'll hear "one hundred, fifty, forty…" down to ten, but never
 > "two hundred", with the stereo presence tone the whole way down.
 
-After the start-altitude there are the two **volume-adjustment** levels (tone, then
-voice), then the two optional callouts below. *All of these are skipped automatically
-if you picked **Tone Only*** — there are no spoken callouts to attach them to.
+**Level 3 — Tone volume.** Always runs (the tone sounds in every mode). You'll hear
+*"Volume Adjustment · Tone Only"*, then each tap steps the tone trim and **previews it
+live** as a short "mini-flare" (the real presence tone sweeping 20→10 ft with the "20"
+and "10" callouts ducking it). It cuts **or** boosts in 2 dB steps and wraps around:
+`0 → −2 → −4 → −6 → +6 → +4 → +2 → 0 …`. Double-tap (or wait) to confirm → **chirp**.
 
-**"Check Gear" altitude.** *Off by default.* You'll hear *"check gear"* then the
+**Level 4 — Voice volume.** *Skipped in Tone Only* (no callouts to trim). You'll hear
+*"Volume Adjustment · Callouts Only"*; each tap previews the same mini-flare with the
+voice at the chosen level. Cut-only, in 2 dB steps, wrapping back to no-cut:
+`0 → −2 → −4 → −6 → 0 …`. Double-tap (or wait) to confirm → **chirp**.
+
+The last two levels are **optional callouts**, both **off by default** and both
+*skipped in Tone Only* (they are spoken callouts).
+
+**Level 5 — "Check Gear" altitude.** *Off by default.* You'll hear *"check gear"* then the
 current value. Tap to cycle **OFF → highest → … → lowest → OFF**; double-tap (or wait)
 to confirm. When set, the box speaks the altitude number **then "check gear"** as you
 descend through it — e.g. *"two hundred … check gear"* — and the reminder always
@@ -300,7 +312,7 @@ call):
 - **SF30/C:** OFF → 200 → 100
 - **SF30/D:** OFF → 500 → 400 → 300 → 200 → 100
 
-**"Positive Rate" callout.** *Off by default.* A takeoff "positive rate of climb"
+**Level 6 — "Positive Rate" callout.** *Off by default.* A takeoff "positive rate of climb"
 reminder. You'll hear *"positive rate"* then the current setting; tap to toggle
 **ON / OFF**, double-tap (or wait) to confirm. When ON, the box says *"positive rate"*
 once after each takeoff (and touch-and-go) — but only after a **confirmed** climb: it
