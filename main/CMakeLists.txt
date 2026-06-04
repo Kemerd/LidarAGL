@@ -59,4 +59,17 @@ idf_component_register(
         esp_timer        # microsecond timing for dt / poll cadence
     EMBED_FILES
         ${CLIP_FILES}
+
+    #  WHOLE_ARCHIVE — force every object in libmain.a into the final link.
+    #
+    #  The clips are declared in callouts.c with __attribute__((weak)) so an
+    #  absent clip degrades gracefully (NULL) instead of failing the link. But a
+    #  *weak* undefined reference does NOT make the linker pull the matching
+    #  member (the generated <clip>.pcm.S.obj) out of a static library. Without
+    #  this flag every embedded clip is therefore left out of the image and the
+    #  firmware boots completely SILENT. Whole-archiving main force-includes the
+    #  embedded clip objects; the weak refs in callouts.c then bind to real data,
+    #  while clips that truly weren't globbed still resolve to NULL. main is the
+    #  application component, so force-linking all of its objects is free.
+    WHOLE_ARCHIVE
 )
