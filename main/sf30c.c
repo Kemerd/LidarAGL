@@ -371,6 +371,14 @@ void sensor_task(void *arg)
         if (period == 0) {
             period = POLL_MS_ARMED;
         }
+        /* Bench sim streams continuously at ~78 Hz, so we must drain the USB RX
+         * briskly even in states whose normal poll is slow (GROUND is 750 ms) —
+         * otherwise the RX ring overflows between reads and we drop frames,
+         * including one-shot control frames (e.g. reboot-to-config). Flight is
+         * unaffected: this only caps the period while sim mode is active.        */
+        if (s_sim_mode && period > SIM_POLL_MS) {
+            period = SIM_POLL_MS;
+        }
         vTaskDelay(pdMS_TO_TICKS(period));
     }
 }

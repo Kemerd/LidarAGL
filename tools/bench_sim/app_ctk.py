@@ -155,10 +155,12 @@ class BenchApp(ctk.CTk):
                       command=self.serial.pulse_reset).grid(row=0, column=2,
                                                             padx=4, sticky="ew")
 
-        ctk.CTkLabel(card, text="Click Enter Sim: the board reboots (RTS) and the "
-                     "bench rides the reconnect to catch its sim window — watch "
-                     "for the green dot. If RTS reset doesn't work on your board, "
-                     "tap the physical EN/reset button after clicking.",
+        ctk.CTkLabel(card, text="Enter Sim: the board reboots (RTS) and the bench "
+                     "rides the reconnect to catch its sim window — watch for the "
+                     "green dot (tap the physical EN button if RTS reset doesn't "
+                     "work on your board). Enter Config: must be in sim FIRST — it "
+                     "software-reboots the box into the config menu (then drive it "
+                     "with Next/Confirm below).",
                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=520,
                      justify="left").grid(row=3, column=0, columnspan=3, padx=16,
                                           pady=(0, 14), sticky="w")
@@ -322,9 +324,13 @@ class BenchApp(ctk.CTk):
         self._set_status("attaching…", WARN)
 
     def _enter_config(self):
-        self.serial.pulse_reset()
-        self.ctrl.start_attach(P.OP_ENTER_CONFIG)
-        self._set_status("attaching (config)…", WARN)
+        # While in sim the chip's RTS reset is suppressed, so trigger a SOFTWARE
+        # reboot into the config menu (OP_ENTER_CONFIG → device sets a reboot-to-
+        # config flag and restarts), then re-attach with HELLO so it comes back
+        # into sim and the menu runs. Enter Sim FIRST if you're not attached yet.
+        self.ctrl.enter_config()
+        self.ctrl.start_attach(P.OP_HELLO)
+        self._set_status("rebooting to config…", WARN)
 
     def _on_slider(self, value):
         if self._slider_guard:
@@ -382,11 +388,20 @@ class BenchApp(ctk.CTk):
                 break
             self._append_log(line)
             if "BENCH SIM MODE" in line:
+                # Sim (re)entered. We deliberately KEEP the HELLO heartbeat
+                # running so any later reboot (e.g. after a config commit) is
+                # caught straight back into sim with no user action.
                 self.sim_active = True
-                self.ctrl.stop_attach()
                 self._set_status("SIM ACTIVE", GOOD)
                 self.sim_state_lbl.configure(text="sim mode active",
                                              text_color=GOOD)
+            elif "config committed" in line:
+                self.sim_active = False
+                self._set_status("config saved — re-entering sim…", WARN)
+            elif "waiting for" in line or "connection lost" in line:
+                if self.sim_active:
+                    self.sim_active = False
+                    self._set_status("re-attaching…", WARN)
             drained += 1
 
         # Update the AGL read-out; reflect a running ILS on the tape.

@@ -33,6 +33,18 @@ class BenchController:
         """Ask a running sim-mode device to restart (ignored if not in sim)."""
         self._send(P.OP_REBOOT)
 
+    def enter_config(self):
+        """Ask an in-sim device to SOFTWARE-reboot into the boot config menu.
+
+        Sent a few times since it only takes effect while the device is already
+        in sim mode (draining USB). The caller should then attach with HELLO so
+        the device is caught back into sim and the menu runs.
+        """
+        frame = codec.build_bench_ctrl(P.OP_ENTER_CONFIG)
+        for _ in range(3):
+            self.serial.send(frame)
+            time.sleep(0.02)
+
     def menu_next(self):
         """Config menu: cycle the current selection (single tap)."""
         self._send(P.OP_MENU_NEXT)

@@ -42,6 +42,7 @@
 #include "esp_timer.h"
 #include "esp_pm.h"
 #include "esp_system.h"   /* esp_restart() — config menu reboot */
+#include "esp_attr.h"     /* RTC_NOINIT_ATTR — survives a software reboot         */
 #include "driver/usb_serial_jtag.h"  /* bench HIL: read the sim stream from USB  */
 #include "lwnx.h"                     /* bench HIL: parse bench-control frames    */
 
@@ -68,6 +69,16 @@ static float s_start_alt_ft = 0.0f;   /* 0 == uncapped until boot sets it       
 /*  Bench HIL: set during the boot attach probe when the connected bench tool
  *  asked to open the config menu this boot. Runtime-only (never persisted).      */
 static volatile bool s_sim_want_config = false;
+
+/*  Bench HIL: a "reboot into the config menu" request that survives the SOFTWARE
+ *  reboot esp_restart() performs (RTC memory keeps its value across a restart,
+ *  but NOT across a power cycle — so it can never strand a real unit in config).
+ *  We need this because while the USB-Serial-JTAG driver is installed in sim mode
+ *  the chip's RTS hardware-reset is suppressed, so the bench can't reboot us with
+ *  RTS; instead OP_ENTER_CONFIG sets this flag and we reboot in software. Checked
+ *  once at boot, then cleared.                                                    */
+#define SIM_CFG_BOOT_MAGIC  0x43464721u   /* 'CFG!' */
+RTC_NOINIT_ATTR static uint32_t s_sim_cfg_boot_flag;
 
 /* ---- LWNX update-rate code per poll profile ------------------------------ */
 /*  The binary update-rate code (cmd 76). We keep the sensor at a brisk rate in
@@ -167,6 +178,15 @@ static void bench_ctrl_handler(uint8_t op, const uint8_t *arg, size_t n)
         case OP_REBOOT:
             ESP_LOGW(TAG, "sim: reboot requested by bench");
             vTaskDelay(pdMS_TO_TICKS(50));   /* let the log + DMA flush */
+            esp_restart();                   /* does not return */
+            break;
+        case OP_ENTER_CONFIG:
+            /* Software reboot into the config menu (RTS reset is suppressed while
+             * the USB driver is installed, so we can't rely on a hardware reset).
+             * The RTC flag carries the intent across the restart.                */
+            ESP_LOGW(TAG, "sim: reboot-to-config requested by bench");
+            s_sim_cfg_boot_flag = SIM_CFG_BOOT_MAGIC;
+            vTaskDelay(pdMS_TO_TICKS(50));
             esp_restart();                   /* does not return */
             break;
         case OP_MENU_NEXT:    s_sim_tap = TAP_SINGLE; break;
@@ -566,6 +586,14 @@ void app_main(void)
     if (bench_attach_detected()) {
         sf30c_set_bench_ctrl_cb(bench_ctrl_handler);
         sf30c_sim_enable();
+    }
+
+    /* A bench "reboot into config" (OP_ENTER_CONFIG) lands here: the RTC flag
+     * survived the software restart, so open the config menu this boot. Cleared
+     * immediately so a later plain reboot doesn't re-enter the menu.            */
+    if (sf30c_sim_active() && s_sim_cfg_boot_flag == SIM_CFG_BOOT_MAGIC) {
+        s_sim_cfg_boot_flag = 0;
+        s_sim_want_config   = true;
     }
 
     /* Resolve the stored audio configuration (mono/stereo + which streams play).

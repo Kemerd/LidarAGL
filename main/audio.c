@@ -47,6 +47,12 @@ static const char *TAG = "audio";
 static i2s_chan_handle_t s_tx = NULL;
 static bool              s_running = false;
 
+/*  Suspend REQUEST from the logic task. Only the audio task acts on it (it is the
+ *  single owner of the I2S channel), so a render write can never race a disable
+ *  done on another core — which is what produced the harmless but noisy
+ *  "channel not enabled" driver errors. See audio_suspend() / audio_task().      */
+static volatile bool     s_suspend_req = false;
+
 /*  Resolved runtime behaviour (channel layout + which streams are live). Set by
  *  audio_init() from the boot config; read in the render loop. Defaults are
  *  harmless until init runs.                                                    */
@@ -431,32 +437,16 @@ void audio_play_chirp(void)
 
 void audio_suspend(void)
 {
-    if (s_running && s_tx) {
-        i2s_channel_disable(s_tx);
-        s_running = false;
-        /* Reset the tone gain so it ramps cleanly back from silence on resume. */
-        s_gain_cur = 0.0f;
-        s_duck_cur = 1.0f;     /* un-duck so the next descent starts at full tone   */
-        s_voice_env = 0.0f;    /* drain the sidechain follower (no stale duck)       */
-        s_phase    = 0.0f;
-        s_phase2   = 0.0f;     /* keep the 2nd harmonic in step with the fundamental */
-        /* Drain the mix LPF so a resumed landing starts from silence, not from a
-         * stale filter level left over from the previous descent.                */
-        s_lpf_l    = 0.0f;
-        s_lpf_r    = 0.0f;
-        /* Re-arm the flare fade: suspend only happens in GROUND/CRUISE (well
-         * above FLARE_FADE_FT), so the next active descent must start with the
-         * tone fully present, not stuck faded-out from a previous landing.      */
-        s_flare_fade = 1.0f;
-    }
+    /* REQUEST only. The audio task (the single owner of the I2S channel) does the
+     * actual i2s_channel_disable at the top of its loop, so a render write can
+     * never race a disable performed here from another core (that race produced
+     * the harmless but noisy "channel not enabled" driver errors).             */
+    s_suspend_req = true;
 }
 
 void audio_resume(void)
 {
-    if (!s_running && s_tx) {
-        i2s_channel_enable(s_tx);
-        s_running = true;
-    }
+    s_suspend_req = false;
 }
 
 /* ---------------------------------------------------------------------------
@@ -531,6 +521,29 @@ void audio_task(void *arg)
     int16_t frame[AUDIO_FRAME_LEN * AUDIO_CH];
 
     for (;;) {
+        /* Single-owner channel control: apply the logic task's suspend/resume
+         * REQUEST here, so THIS task is the only code that ever enables or
+         * disables the I2S channel. That removes the cross-core race that briefly
+         * let a render write hit a just-disabled channel (the harmless but noisy
+         * "channel not enabled" errors and the resume-time write timeouts). On
+         * suspend we also reset the tone envelopes so a later descent ramps
+         * cleanly from silence.                                                  */
+        if (s_suspend_req && s_running) {
+            i2s_channel_disable(s_tx);
+            s_running    = false;
+            s_gain_cur   = 0.0f;   /* ramp the tone back up from silence on resume */
+            s_duck_cur   = 1.0f;   /* un-duck so the next descent starts full tone  */
+            s_voice_env  = 0.0f;   /* drain the sidechain follower (no stale duck)  */
+            s_phase      = 0.0f;
+            s_phase2     = 0.0f;   /* keep the 2nd harmonic in step                 */
+            s_lpf_l      = 0.0f;   /* drain the mix LPF so resume starts at silence */
+            s_lpf_r      = 0.0f;
+            s_flare_fade = 1.0f;   /* re-arm the flare fade for the next descent    */
+        } else if (!s_suspend_req && !s_running) {
+            i2s_channel_enable(s_tx);
+            s_running = true;
+        }
+
         /* Pick up a queued callout (non-blocking) and start it if idle. When the
          * active mode has callouts disabled (tone-only) we still DRAIN the queue
          * so requests can't pile up, but we never start the clip.              */

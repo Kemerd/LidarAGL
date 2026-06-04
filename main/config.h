@@ -331,6 +331,11 @@
  *  delayed and the console is left exactly as it was.                           */
 #define SIM_USJ_RX_BUF        1024   /* USJ driver RX ring (>= one frame @ ~78 Hz) */
 #define SIM_USJ_TX_BUF        256    /* unused by us, but the driver requires > 0  */
+#define SIM_POLL_MS           20     /* sim: drain USB RX at LEAST this often, no
+                                      * matter the (slow, e.g. 750 ms GROUND) state
+                                      * poll cadence — otherwise the RX ring fills
+                                      * between reads and drops frames, including a
+                                      * one-shot control frame like reboot-to-config */
 #define SIM_ATTACH_GRACE_MS   800    /* fast-bail a normal boot when no USB host    */
 #define SIM_ATTACH_WINDOW_MS  4000   /* max wait for a hello while a host IS present*/
 /*  Why 800/4000: entering sim requires a reboot, and resetting a native-USB chip
