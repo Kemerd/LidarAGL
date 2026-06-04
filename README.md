@@ -1,6 +1,8 @@
 # LidarAGL — open source, by [Novabox.Works](https://novabox.works/)
 
-**Advisory AGL height-callout + flare-tone box for experimental aircraft.**
+**Configurable advisory AGL box for experimental aircraft — spoken height callouts,
+an ascending flare tone, a variometer sink/climb cue, gear & positive-rate reminders,
+all set from one cockpit button.**
 
 An ESP32-S3 reads slant range from a belly-mounted **LightWare SF30/C** (default) or
 **SF30/D** micro-lidar, converts it to height above ground (AGL) in feet, and drives
@@ -13,6 +15,23 @@ your aircraft audio panel through a line-level DAC with two simultaneous streams
    over 100→50 ft (a gentle fade-in so it doesn't appear jarringly); from 50 ft to the
    ground the *perceived* loudness is held constant — urgency is carried by the rising
    pitch, never by getting louder.
+
+**And it's a full system, not a two-trick beeper. No app, no laptop, no settings to
+flash** — hold the cockpit button at power-on and tap through:
+
+- **Audio mode** — stereo or mono; callouts + tone, callouts only, or tone only.
+- **Callout start altitude** — cap the highest number that speaks.
+- **Independent tone & voice volume trims** — previewed live by ear, ±6 dB.
+- **"Check gear" reminder** — speaks an altitude *then "check gear"* on the way down.
+- **"Positive rate" callout** — a *confirmed*-climb "positive rate" after every takeoff.
+- **Vario blip** — chops the tone into blips that track your **sink (or climb) rate**,
+  variometer-style, modelled on a real instrument.
+- **Tone start altitude** — where the presence tone fades in (100 or 200 ft).
+
+Every extra is **off by default**, stored in NVS, and kept across power cycles. On top of
+that the box **auto-detects** the SF30/C or /D, **learns its own ground reference** at
+every boot (zero calibration), and **recovers from an in-flight reboot** instead of waking
+up thinking it's parked. See [Configuring the unit](#configuring-the-unit).
 
 Designed around a Glasair III (fast experimental single, ~95 mph over the fence,
 short flare window). WiFi/Bluetooth are **off by design** — no EMI into the avionics.
