@@ -20,6 +20,7 @@ flash_esp32_default.txt
 
 # Editor / OS cruft
 .vscode/
+.claude/
 *.swp
 .DS_Store
 
@@ -29,3 +30,4 @@ flash_esp32_default.txt
 # so a fresh clone builds and the voice masters are preserved.
 /SampleLibrary-master
 diag.txt
+vid_script.md
