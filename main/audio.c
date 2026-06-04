@@ -32,6 +32,7 @@
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -684,8 +685,32 @@ void audio_task(void *arg)
             frame[2 * i + 1] = (int16_t)(right * mg * 32767.0f);   /* R */
         }
 
-        /* Blocking write paces the loop to real time (the DMA backpressures). */
+        /* The blocking write paces the loop to real time (the DMA backpressures).
+         * We use a BOUNDED timeout and yield on any stall instead of an infinite
+         * wait: this is the highest-priority task on its core, so if the channel
+         * ever can't accept data (a transient, a mid-suspend race, or a DMA that
+         * isn't draining) an unbounded/tight loop here would starve the idle task
+         * and trip the task watchdog. The bounded path can never tight-spin, and
+         * it logs the first stall so the underlying cause is visible.            */
         size_t wrote = 0;
-        i2s_channel_write(s_tx, frame, sizeof frame, &wrote, portMAX_DELAY);
+        esp_err_t werr = i2s_channel_write(s_tx, frame, sizeof frame, &wrote,
+                                           pdMS_TO_TICKS(100));
+        if (werr != ESP_OK || wrote == 0) {
+            /* ESP_ERR_INVALID_STATE is the EXPECTED, harmless suspend race: the
+             * logic task disabled the channel (light-sleep at GROUND/CRUISE)
+             * between our s_running check and this write. We just yield and the
+             * next iteration parks in the suspended branch. Warn ONLY on a
+             * genuine stall (e.g. a timeout because the DMA isn't draining).    */
+            if (werr != ESP_ERR_INVALID_STATE) {
+                static bool s_warned_stall = false;
+                if (!s_warned_stall) {
+                    ESP_LOGW(TAG, "i2s write stalled (%s, wrote=%u/%u) — yielding",
+                             esp_err_to_name(werr), (unsigned)wrote,
+                             (unsigned)sizeof frame);
+                    s_warned_stall = true;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
     }
 }

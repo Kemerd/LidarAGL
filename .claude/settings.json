@@ -16,7 +16,8 @@
       "PowerShell(. 'C:\\\\Espressif\\\\tools\\\\Microsoft.v6.0.1.PowerShell_profile.ps1' | Out-Null; $env:IDF_TOOLS_PATH = 'C:\\\\Espressif\\\\tools'; $env:IDF_PYTHON_ENV_PATH = 'C:\\\\Espressif\\\\tools\\\\python\\\\v6.0.1\\\\venv'; idf.py size 2>&1 | Select-Object -Last 25)",
       "Read(//c/esp/v6.0.1/esp-idf/components/esp_driver_usb_serial_jtag/**)",
       "Read(//c/esp/v6.0.1/esp-idf/components/hal/**)",
-      "PowerShell(python l:\\\\Dev\\\\LidarAGL\\\\tools\\\\bench_sim\\\\test_codec.py)"
+      "PowerShell(python l:\\\\Dev\\\\LidarAGL\\\\tools\\\\bench_sim\\\\test_codec.py)",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\(r'l:\\\\Dev\\\\LidarAGL\\\\tools\\\\bench_sim\\\\app_ctk.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\(r'l:\\\\Dev\\\\LidarAGL\\\\tools\\\\bench_sim\\\\serial_worker.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
     ]
   }
 }

@@ -358,8 +358,8 @@
 #define LOGIC_TASK_PRIO   5
 #define AUDIO_TASK_PRIO   7           /* audio is the most timing-critical       */
 #define SENSOR_TASK_CORE  0
-#define LOGIC_TASK_CORE   1
-#define AUDIO_TASK_CORE   1
+#define LOGIC_TASK_CORE   0           /* with sensor; audio gets core 1 to itself */
+#define AUDIO_TASK_CORE   1           /* real-time render alone on its own core    */
 
 /* ---- Power management frequency envelope -------------------------------- */
 #define PM_MAX_FREQ_MHZ   240
