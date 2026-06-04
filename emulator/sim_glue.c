@@ -289,9 +289,37 @@ float sim_tone_gain(float agl_ft)
 EMSCRIPTEN_KEEPALIVE
 float sim_arm_ft(void) { return ARM_FT; }
 
-/** @brief AGL (ft) at which the presence tone begins to fade in. */
+/** @brief AGL (ft) at which the presence tone begins to fade in (the live, pilot-
+ *         chosen value — default TONE_START_FT or the higher TONE_START_FT_HIGH). */
 EMSCRIPTEN_KEEPALIVE
-float sim_tone_start_ft(void) { return TONE_START_FT; }
+float sim_tone_start_ft(void) { return s_tone_start_ft; }
+
+/** @brief The alternate (earlier/higher) tone-start option the menu offers (200 ft). */
+EMSCRIPTEN_KEEPALIVE
+float sim_tone_start_high_ft(void) { return TONE_START_FT_HIGH; }
+
+/**
+ * @brief Set the pilot's tone-start altitude — the sim analogue of app_main applying
+ *        config_load_tone_start() at boot (LEVEL 8 of run_config_menu).
+ *
+ * @details Threads the chosen altitude into BOTH firmware paths exactly as the box:
+ *            1) the audio math fade-in schedule (audio_math_set_tone_start), so the
+ *               pitch + dB anchor on it, and
+ *            2) the state machine's tone gate (g_ctx.tone_start_ft), so the tone is
+ *               allowed to sound from this height down.
+ *          Also caches it for sim_tone_start_ft() so the readout + tape band track it.
+ *          Must be called AFTER sim_init() each time, since sm_init() re-seeds the
+ *          gate to the compile-time default (the JS side re-applies after every init).
+ *
+ * @param ft  Tone-start altitude in feet (TONE_START_FT or TONE_START_FT_HIGH).
+ */
+EMSCRIPTEN_KEEPALIVE
+void sim_set_tone_start(float ft)
+{
+    s_tone_start_ft     = ft;
+    g_ctx.tone_start_ft = ft;
+    audio_math_set_tone_start(ft);
+}
 
 /** @brief AGL (ft) at/below which the tone reaches full presence. */
 EMSCRIPTEN_KEEPALIVE

@@ -264,6 +264,42 @@
 
     .sheet-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
+    /* ---- Segmented control (iOS-style pill selector) ---------------------- */
+    /*  A single-row mutually-exclusive picker — the touch-friendly analogue of the
+        firmware's "tap to cycle" levels (positive-rate ON/OFF, vario OFF/Sink/Climb,
+        tone-start 100/200). One option is selected at a time; the accent fill slides
+        to the active segment. Wraps gracefully on narrow screens.                  */
+    .seg-row { display: grid; gap: 8px; margin-bottom: 20px; }
+    .seg-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .seg-head .seg-val { font-size: 13px; font-weight: 600; color: var(--accent); }
+    .seg {
+      display: flex; gap: 4px; padding: 4px;
+      background: var(--surface-2); border: 1px solid var(--hairline);
+      border-radius: 12px;
+    }
+    .seg-opt {
+      flex: 1 1 0; min-width: 0; text-align: center;
+      padding: 9px 8px; border-radius: 9px;
+      font-size: 13.5px; font-weight: 600; color: var(--text-dim);
+      cursor: pointer; user-select: none; white-space: nowrap;
+      transition: background .18s ease, color .18s ease, transform .08s ease;
+    }
+    .seg-opt:hover { color: var(--text); }
+    .seg-opt:active { transform: scale(.97); }
+    .seg-opt.sel { background: var(--accent); color: #fff; box-shadow: 0 1px 4px rgba(10,132,255,.4); }
+    .seg-hint { color: var(--text-dim); font-size: 11.5px; line-height: 1.45; }
+    .seg-row.disabled { opacity: .45; pointer-events: none; }
+
+    /* ---- ILS hand-fly error control (in the controls panel) --------------- */
+    /*  Mirrors the bench sim's hand-flying error: how sloppily the scripted ILS is
+        flown (0 % = perfectly on the needle, up to 25 % = wandering + over-correcting).
+        Sits with the approach controls; takes effect on the next/running approach.   */
+    .ils-err { display: grid; gap: 8px; margin-top: 10px; }
+    .ils-err .err-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .ils-err .err-head .k { color: var(--text-dim); font-size: 13px; }
+    .ils-err .err-head .err-val { font-size: 14px; font-weight: 700; color: var(--accent); }
+    .ils-err input[type=range] { width: 100%; accent-color: var(--accent); }
+
     /* ---- Manual config menu (single-button re-enactment) ----------------- */
     /*  Shares the sheet's frosted look + spring entrance with #configBackdrop.  */
     #manualBackdrop {
@@ -370,6 +406,17 @@
             Fly approach · 85 kt ILS
           </button>
 
+          <!-- Hand-fly error: how sloppily the scripted ILS is flown, mirroring the
+               bench sim's under-damped "needle-chase" model. 0 % = dead on the needle,
+               higher = wander + over-correction + partial level-offs. Default 7 %. -->
+          <div class="ils-err">
+            <div class="err-head">
+              <span class="k">Hand-fly error</span>
+              <span class="err-val" id="ilsErrVal">7%</span>
+            </div>
+            <input type="range" id="ilsErrRange" min="0" max="25" step="1" value="7" />
+          </div>
+
           <div class="btn-row">
             <button class="btn secondary" id="resetBtn">Reset to ground</button>
             <button class="btn secondary" id="cruiseBtn">Jump to cruise</button>
@@ -467,6 +514,69 @@
         <p class="cap-hint">
           Trim on the spoken callouts only — cut only (0&nbsp;dB to −6&nbsp;dB).
           Drag to audition each level.
+        </p>
+      </div>
+
+      <!-- "Check Gear" altitude (LEVEL 5 of the firmware menu). At the chosen descent
+           altitude the box speaks the number then "check gear". OFF by default; the
+           list is the active profile's gear-check options. Skipped in tone-only mode. -->
+      <div class="cap-row" id="gearRow">
+        <div class="cap-head">
+          <span class="config-group-label" style="margin:0;">Check gear altitude</span>
+          <span class="cap-val" id="gearVal">—</span>
+        </div>
+        <input type="range" id="gearRange" min="0" max="0" step="1" value="0" />
+        <p class="cap-hint">
+          Speaks “…&nbsp;check gear” after the number at this height. Off by default.
+        </p>
+      </div>
+
+      <!-- "Positive rate" climb callout (LEVEL 6). A simple ON/OFF; fires once on a
+           confirmed sustained climb after a touch-and-go. Skipped in tone-only mode. -->
+      <div class="seg-row" id="posRateRow">
+        <div class="seg-head">
+          <span class="config-group-label" style="margin:0;">Positive rate callout</span>
+        </div>
+        <div class="seg" id="posRateSeg">
+          <div class="seg-opt" data-val="0">Off</div>
+          <div class="seg-opt" data-val="1">On</div>
+        </div>
+        <p class="seg-hint">
+          Speaks “positive rate” on a confirmed climb after lift-off (like “positive
+          rate, gear up”).
+        </p>
+      </div>
+
+      <!-- Variometer "blip" direction (LEVEL 7). One mutually-exclusive choice; acts on
+           the TONE so it runs in every audio mode. Mirrors the standalone vario toggle. -->
+      <div class="seg-row" id="varioRow">
+        <div class="seg-head">
+          <span class="config-group-label" style="margin:0;">Variometer blip</span>
+        </div>
+        <div class="seg" id="varioSeg">
+          <div class="seg-opt" data-val="off">Off</div>
+          <div class="seg-opt" data-val="sink">Sink rate</div>
+          <div class="seg-opt" data-val="climb">Climb rate</div>
+        </div>
+        <p class="seg-hint">
+          Chops the presence tone into blips by vertical speed — faster the faster you
+          sink (or climb). Steady tone when off.
+        </p>
+      </div>
+
+      <!-- Tone-start altitude (LEVEL 8). Where the presence tone begins its fade-in:
+           the default 100 ft or a higher 200 ft for an earlier swell. A tone feature,
+           so it runs in every mode. -->
+      <div class="seg-row" id="toneStartRow">
+        <div class="seg-head">
+          <span class="config-group-label" style="margin:0;">Tone start altitude</span>
+        </div>
+        <div class="seg" id="toneStartSeg">
+          <div class="seg-opt" data-val="100">100 ft</div>
+          <div class="seg-opt" data-val="200">200 ft</div>
+        </div>
+        <p class="seg-hint">
+          Higher starts the swell earlier on a long final. Pitch + fade-in anchor here.
         </p>
       </div>
 
