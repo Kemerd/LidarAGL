@@ -58,12 +58,12 @@
 
     /* ---- App shell ------------------------------------------------------ */
     .wrap {
-      max-width: 1040px;
+      max-width: 1760px;
       margin: 0 auto;
-      padding: clamp(16px, 4vw, 40px);
+      padding: clamp(12px, 2vw, 28px);
       display: flex;
       flex-direction: column;
-      gap: clamp(16px, 3vw, 28px);
+      gap: clamp(12px, 1.8vw, 20px);
       min-height: 100%;
     }
 
@@ -73,17 +73,39 @@
       font-weight: 700; letter-spacing: -0.02em; margin: 0;
     }
     header .sub { color: var(--text-dim); font-size: 14px; font-weight: 500; }
+    /* One-paragraph product blurb so a visitor landing cold knows what this is. */
+    header .blurb {
+      flex-basis: 100%;
+      margin: 2px 0 0;
+      color: var(--text-dim);
+      font-size: 13px; line-height: 1.5;
+      max-width: 920px;
+    }
 
-    /* The main split: tape canvas on the left, readouts/controls on the right.
-       On narrow screens this stacks vertically.                              */
+    /* The cockpit split: profile + config on the LEFT rail, the altitude tape on
+       the CENTER stage, live telemetry on the RIGHT rail. Sized so a 16:9 desktop
+       fits with ZERO page scroll — the rails scroll internally if they must.
+       Narrow screens stack vertically (tape first) and scroll normally.        */
     .stage {
       display: grid;
-      grid-template-columns: minmax(280px, 1fr) minmax(260px, 360px);
-      gap: clamp(16px, 3vw, 28px);
+      grid-template-columns: 1fr;
+      gap: clamp(12px, 1.8vw, 20px);
       align-items: stretch;
     }
-    @media (max-width: 720px) {
-      .stage { grid-template-columns: 1fr; }
+    @media (min-width: 980px) {
+      html, body { overflow: hidden; }   /* the demo IS the page — no scroll   */
+      .wrap { height: 100vh; height: 100dvh; }
+      .stage {
+        flex: 1; min-height: 0;          /* fill the rest of the viewport      */
+        grid-template-columns: minmax(250px, 330px) minmax(340px, 1fr) minmax(250px, 330px);
+      }
+      .side { overflow-y: auto; min-height: 0; scrollbar-width: thin; }
+      /* Extra specificity: the base .tape-panel rule (min-height: 420px) is
+         declared later in the sheet and would win a plain-selector tie.      */
+      .stage .tape-panel { min-height: 0; }  /* let the grid row set the height */
+    }
+    @media (max-width: 979.98px) {
+      .tape-panel { order: -1; }         /* tape leads the stacked phone view  */
     }
 
     .panel {
@@ -367,6 +389,12 @@
     <header>
       <h1>LidarAGL Emulator</h1>
       <span class="sub">real firmware logic · running in WebAssembly</span>
+      <p class="blurb">
+        A live demo of the LidarAGL altitude-callout unit. This is the same C
+        firmware that ships on the hardware — compiled to WebAssembly and flown in
+        your browser. Drag the aircraft or fly the scripted ILS approach, and every
+        callout, tone, and state change you hear is the real product deciding.
+      </p>
     </header>
 
     <!-- Autoplay gate: the browser won't let us make sound until the user
@@ -377,46 +405,14 @@
     </div>
 
     <div class="stage" id="stage">
-      <!-- Left: the altitude tape canvas. -->
-      <div class="panel tape-panel">
-        <canvas id="tape"></canvas>
-      </div>
-
-      <!-- Right: live readouts + controls. -->
-      <div class="side">
-        <div class="panel card">
-          <h2>Telemetry</h2>
-          <div class="rows">
-            <div class="row">
-              <span class="k">State</span>
-              <span class="state-pill" id="statePill">
-                <span class="dot" id="stateDot"></span><span id="stateName">—</span>
-              </span>
-            </div>
-            <div class="row"><span class="k">AGL</span><span class="v" id="aglVal">— ft</span></div>
-            <div class="row"><span class="k">Vertical trend</span><span class="v" id="trendVal">—</span></div>
-            <div class="row"><span class="k">Vario blip</span><span class="v" id="varioVal">off</span></div>
-            <div class="row"><span class="k">Tone</span><span class="v" id="toneVal">off</span></div>
-            <div class="row"><span class="k">Tone pitch</span><span class="v" id="hzVal">— Hz</span></div>
-            <div class="row"><span class="k">Tone level</span><span class="v" id="dbVal">— dB</span></div>
-            <div class="row"><span class="k">Equal-loudness</span><span class="v" id="eqlVal">— dB</span></div>
-            <div class="row"><span class="k">Poll period</span><span class="v" id="pollVal">— ms</span></div>
-            <div class="row"><span class="k">Last callout</span><span class="v" id="calloutVal">—</span></div>
-            <div class="row"><span class="k">Audio mode</span><span class="v" id="modeVal">—</span></div>
-            <div class="row"><span class="k">Callout cap</span><span class="v" id="capValTelem">—</span></div>
-            <div class="row"><span class="k">Volume</span><span class="v" id="volValTelem">—</span></div>
-            <div class="row"><span class="k">Check gear</span><span class="v" id="gearValTelem">—</span></div>
-            <div class="row"><span class="k">Positive rate</span><span class="v" id="posRateValTelem">—</span></div>
-            <div class="row"><span class="k">Tone start</span><span class="v" id="toneStartValTelem">—</span></div>
-          </div>
-        </div>
-
+      <!-- Left rail: sensor profile + configuration controls. -->
+      <div class="side side-left">
         <div class="panel controls">
           <label class="field">
             Sensor profile
             <select id="profileSel">
-              <option value="0">SF30/C — callouts 200…10</option>
-              <option value="1">SF30/D — callouts 500…10</option>
+              <option value="0">SF30/C — callouts 300…10</option>
+              <option value="1">SF30/D — callouts 600…10</option>
             </select>
           </label>
 
@@ -446,13 +442,14 @@
 
           <!-- Variometer "blip" direction (firmware LEVEL 7). One mutually-exclusive
                choice: Off (steady tone), Sink (blips faster the faster you descend,
-               constant when level/climbing), or Climb (the inverse). Mirrors device. -->
+               constant when level/climbing), or Climb (the inverse). The demo opens
+               with Sink on so a first approach shows the cadence off the bat. -->
           <div class="vario-toggles" style="margin-top:10px; display:flex; gap:16px;">
             <label class="vario-toggle">
-              <input type="radio" name="varioMode" id="varioOff" value="off" checked> Off
+              <input type="radio" name="varioMode" id="varioOff" value="off"> Off
             </label>
             <label class="vario-toggle">
-              <input type="radio" name="varioMode" id="varioSink" value="sink"> Sink rate
+              <input type="radio" name="varioMode" id="varioSink" value="sink" checked> Sink rate
             </label>
             <label class="vario-toggle">
               <input type="radio" name="varioMode" id="varioClimb" value="climb"> Climb rate
@@ -481,6 +478,42 @@
             and flare — sit back and listen to the cadence.
           </p>
         </div>
+      </div>
+
+      <!-- Center stage: the altitude tape canvas. -->
+      <div class="panel tape-panel">
+        <canvas id="tape"></canvas>
+      </div>
+
+      <!-- Right rail: live readouts. -->
+      <div class="side side-right">
+        <div class="panel card">
+          <h2>Telemetry</h2>
+          <div class="rows">
+            <div class="row">
+              <span class="k">State</span>
+              <span class="state-pill" id="statePill">
+                <span class="dot" id="stateDot"></span><span id="stateName">—</span>
+              </span>
+            </div>
+            <div class="row"><span class="k">AGL</span><span class="v" id="aglVal">— ft</span></div>
+            <div class="row"><span class="k">Vertical trend</span><span class="v" id="trendVal">—</span></div>
+            <div class="row"><span class="k">Vario blip</span><span class="v" id="varioVal">off</span></div>
+            <div class="row"><span class="k">Tone</span><span class="v" id="toneVal">off</span></div>
+            <div class="row"><span class="k">Tone pitch</span><span class="v" id="hzVal">— Hz</span></div>
+            <div class="row"><span class="k">Tone level</span><span class="v" id="dbVal">— dB</span></div>
+            <div class="row"><span class="k">Equal-loudness</span><span class="v" id="eqlVal">— dB</span></div>
+            <div class="row"><span class="k">Poll period</span><span class="v" id="pollVal">— ms</span></div>
+            <div class="row"><span class="k">Last callout</span><span class="v" id="calloutVal">—</span></div>
+            <div class="row"><span class="k">Audio mode</span><span class="v" id="modeVal">—</span></div>
+            <div class="row"><span class="k">Callout cap</span><span class="v" id="capValTelem">—</span></div>
+            <div class="row"><span class="k">Volume</span><span class="v" id="volValTelem">—</span></div>
+            <div class="row"><span class="k">Check gear</span><span class="v" id="gearValTelem">—</span></div>
+            <div class="row"><span class="k">Positive rate</span><span class="v" id="posRateValTelem">—</span></div>
+            <div class="row"><span class="k">Tone start</span><span class="v" id="toneStartValTelem">—</span></div>
+          </div>
+        </div>
+
       </div>
     </div>
   </div>
@@ -637,7 +670,9 @@
 
   <div class="loading" id="loading">Loading firmware…</div>
 
-  <!-- The whole app. Loads the Emscripten module and drives it. -->
-  <script type="module" src="./sim.js"></script>
+  <!-- The whole app. Loads the Emscripten module and drives it. The ?v= query
+       busts browser heuristic caching (no-Cache-Control hosts keep stale module
+       scripts for days otherwise) — bump it together with ASSET_VER in sim.js. -->
+  <script type="module" src="./sim.js?v=3"></script>
 </body>
 </html>

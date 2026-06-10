@@ -62,6 +62,24 @@ python -m http.server 8000
 Open <http://localhost:8000/emulator/index.html>, click **Start audio** (or just
 start dragging), and fly.
 
+## Package for the web (product demo)
+
+`package_demo.ps1` bundles the emulator into a self-contained static site:
+`emulator/package/` (plus `lidaragl-demo.zip`), with the WAV voice masters
+copied in and `sim.js`'s audio path retargeted to the bundle. Upload the folder
+contents to any static host — all paths are relative, so it works at any URL
+depth. It must be served over http(s) (WASM won't load from `file://`).
+
+```powershell
+cd L:\Dev\LidarAGL\emulator
+./package_demo.ps1          # add -NoZip to skip the zip
+```
+
+The demo opens with the showcase features already on — sink-rate blips, the
+200 ft gear-check and the positive-rate callout — so a first visit hears the
+full product without touching the config menu. (The hardware ships with those
+OFF; the in-sim config menu can switch them off to match.)
+
 ## What to try
 
 The fastest demo: hit **Fly approach · 85 kt ILS**. It auto-flies a scripted,
@@ -76,15 +94,15 @@ To hand-fly it instead: with **SF30/C** selected, drag the aircraft from the
 ground up past the dashed **ARM** line to cruise, then back down:
 
 - **Silent climb-out** — no callouts on the way up.
-- **Descent ladder** — on the way down you hear `200, 100, 50, 40, 30, 20, 10`,
-  each once, in order.
+- **Descent ladder** — on the way down you hear `300, 200, 100, 50, 40, 30, 20,
+  10`, each once, in order.
 - **Presence tone** — silent above 100 ft; below it the tone fades in and its
   **pitch rises** toward the ground (600 → 1400 Hz), louder by 50 ft. A small 2nd
   harmonic + a mix-bus low-pass warm the tone so it cues rather than grates.
 - **Hysteresis** — jitter around 50 ft after it fires and it won't re-fire; you
   must climb ~20 ft above it to re-arm (go-around).
-- **Profile switch** — pick **SF30/D** and the tape gains 500/400/300 ticks, the
-  cruise line jumps to 500, and a high descent fires those extra callouts. The
+- **Profile switch** — pick **SF30/D** and the tape gains 600/500/400 ticks, the
+  cruise line jumps up, and a high descent fires those extra callouts. The
   SF30/C never does — proof the real per-profile C table is in charge.
 - **Config menu** — **Calibrate** opens the instant sheet: audio mode, the
   start-altitude cap, and the **Volume adjustment** trim (0 dB → −6 dB) that lowers
@@ -117,6 +135,12 @@ Every number you hear and every state you see comes from the compiled
   to the ESP-IDF build (`main/CMakeLists.txt` uses an explicit source list).
 - The manual config menu speaks its prompts from the WAV masters in
   `assets/original_audio/`. Two pieces (`mono`, `config_mode`) currently exist
-  only as `.pcm`, with no `.wav` master — those words are silently skipped (the
-  same graceful handling the firmware applies to an unembedded clip). Add
-  `mono.wav` / `config_mode.wav` masters to have them spoken in the sim too.
+  only as `.pcm`, with no `.wav` master — they are left out of sim.js's
+  `CONFIG_PIECE_WAV` map (probing for them would 404 on every load) and their
+  words are silently skipped, the same graceful handling the firmware applies to
+  an unembedded clip. To have them spoken in the sim too, add `mono.wav` /
+  `config_mode.wav` masters and re-list both in `CONFIG_PIECE_WAV`.
+- The demo cache-busts itself with a `?v=` query on `sim.js`, the
+  `dist/lidar_sim.js` import, and the `.wasm` fetch. When shipping a changed
+  build, bump the version in all three spots (one in `index.html`, two in
+  `sim.js` — they're cross-referenced in comments).

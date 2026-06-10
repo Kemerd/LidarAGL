@@ -15,15 +15,26 @@
  * tone value comes from the compiled C via the sim_* exports.
  */
 
-import createLidarSim from './dist/lidar_sim.js';
+// The ?v= query busts browser heuristic caching: hosts that send no Cache-Control
+// (python -m http.server, plenty of static hosts) let the browser keep module
+// scripts "fresh" for days, so a plain reload pins visitors to a stale build.
+// Bump the version HERE, in ASSET_VER below (the .wasm fetch), and on the sim.js
+// <script> tag in index.html together whenever the build changes.
+import createLidarSim from './dist/lidar_sim.js?v=3';
 
 /* =============================================================================
  *  Constants
  * ===========================================================================*/
 
 // Where the real callout recordings live, relative to index.html. We serve from
-// the repo root so ../assets reaches the firmware's audio masters.
+// the repo root so ../assets reaches the firmware's audio masters. NOTE: the
+// standalone-site packager (package_demo.ps1) rewrites this literal to './audio'
+// so the deployed demo is fully self-contained — keep it on one line.
 const AUDIO_BASE = '../assets/original_audio';
+
+// Asset version for the .wasm cache-buster (see the import note above). Keep it
+// in lockstep with the ?v= literals on the dist import and the index.html tag.
+const ASSET_VER = '3';
 
 // Human-readable names for the sm_state_t enum (must match the C order:
 // ST_GROUND=0, ST_CLIMB=1, ST_ARMED=2, ST_CRUISE=3, ST_DESCENT=4).
@@ -44,13 +55,14 @@ const ALL_CALLOUT_FT = [600, 500, 400, 300, 200, 100, 50, 40, 30, 20, 10];
 
 // Spoken config-menu prompt pieces, mirroring the firmware's config_clip_piece
 // set (see callouts.c). Keyed by the same names the firmware uses; the value is
-// the WAV filename in original_audio/. A piece with no WAV master yet (mono,
-// config_mode are only .pcm) is simply skipped when spoken — exactly the
-// graceful "absent clip" handling the firmware does for unembedded clips.
+// the WAV filename in original_audio/. Two pieces (mono, config_mode) exist only
+// as firmware .pcm with no WAV master, so they are deliberately NOT listed —
+// probing for them would 404 on every load. schedulePieceAt() already tolerates
+// an absent piece (it just adds no gap, the firmware's graceful "unembedded
+// clip" handling), so recording a master and re-listing it here is all it takes
+// to have it spoken.
 const CONFIG_PIECE_WAV = {
-  config_mode:        'config_mode.wav',          // (no master yet -> skipped)
   chirp:              'chirp.wav',
-  mono:               'mono.wav',                  // (no master yet -> skipped)
   stereo:             'stereo.wav',
   callouts_and_tone:  'callouts_and_tone.wav',
   callouts_only:      'callouts_only.wav',
@@ -113,11 +125,12 @@ const FLARE_START_FT   = 20.0;   // height AGL where the flare begins
 const FLARE_TOUCHDOWN_SINK = 1.5; // residual sink at the wheels (ft/s, gentle)
 const FLARE_TAU        = 1.6;    // exponential time-constant of the flare (s)
 
-// Where the scripted approach begins, in feet AGL. A fixed default start height so
-// the run opens high, breaks into DESCENT through the ladder, and ends on the
-// ground. 342 ft sits just above the SF30/C cruise band (305 ft), so that profile
-// still opens in CRUISE; on the longer-range SF30/D it opens armed-and-descending.
-const APPROACH_START_FT = 342.0;
+// Where the scripted approach begins, in feet AGL, per profile (indexed like
+// profileIdx: 0 = SF30/C, 1 = SF30/D). Each start sits just above its profile's
+// cruise band so the run opens in CRUISE, breaks into DESCENT, and walks the
+// FULL ladder to the ground: 342 ft clears the SF30/C's 305 ft cruise; 610 ft
+// clears the SF30/D's 605 ft cruise and puts its whole 600…10 ladder in play.
+const APPROACH_START_FT = [342.0, 610.0];
 
 // A brief hold once the wheels are down before the run auto-clears, so the final
 // "10" callout and the flare-fade tail can finish playing.
@@ -168,15 +181,18 @@ let modeTone    = true;     // resolved api.modeTone(audioMode)
 let toneVolDb   = 0;
 let voiceVolDb  = 0;
 
-// Optional callouts + tone-start (firmware config-menu LEVELs 5, 6, 8). All default
-// to the firmware defaults (gear-check OFF, positive-rate OFF, tone-start 100 ft) so
-// an un-configured sim behaves exactly as the box does fresh out of the menu.
+// Optional callouts + tone-start (firmware config-menu LEVELs 5, 6, 8). The DEMO
+// opens with the showcase features already on — gear-check at 200 ft and the
+// positive-rate call enabled — so a first-time visitor hears the full product on
+// their first approach without touching the config menu. (The box itself ships
+// with both OFF; the menu here can switch them off to match.) Tone-start keeps
+// the firmware's 100 ft default.
 //   gearCheckFt : 0 == OFF, else the descent altitude that appends "check gear".
 //   posRateOn   : speak "positive rate" on a confirmed post-liftoff climb.
 //   toneStartFt : where the presence tone begins its fade-in (100 or 200 ft); fed
 //                 into the SM tone gate + the audio schedule via api.setToneStart().
-let gearCheckFt = 0;
-let posRateOn   = false;
+let gearCheckFt = 200;
+let posRateOn   = true;
 let toneStartFt = 100;     // overwritten with api.toneStartFt() once the module is up
 
 // --- ILS hand-fly error (mirrors tools/bench_sim/altitude_model.py) ----------
@@ -230,7 +246,7 @@ let activeVoice = null;   // { env, startTime, durSamples } of the playing callo
 // wave with asymmetric, rate-driven half-periods: blipInBeep says which half we
 // are in and blipNextFlip is the audioCtx time of the next flip. With sink off the
 // gate is held open (1.0) so the tone is the steady sound it has always been.
-let sinkRateOn  = false;  // LEVEL 7 sink mode: blips track descent (mutually excl.)
+let sinkRateOn  = true;   // LEVEL 7 sink mode: blips track descent (demo default ON)
 let climbRateOn = false;  // LEVEL 7 climb mode: blips track climb (the inverse)
 let blipInBeep  = false;  // current half (false => next flip opens on a beep)
 let blipNextFlip = 0;     // audioCtx time of the next beep<->silence flip
@@ -249,7 +265,11 @@ let dragging = false;
 
 async function main() {
   // 1. Instantiate the WASM module. createLidarSim() returns a Promise<Module>.
-  M = await createLidarSim();
+  //    locateFile retargets the loader's own lidar_sim.wasm fetch so the binary
+  //    carries the same cache-busting version as the module scripts.
+  M = await createLidarSim({
+    locateFile: (path, prefix) => `${prefix}${path}?v=${ASSET_VER}`,
+  });
 
   // 2. Wrap the flat ABI. cwrap(name, returnType, [argTypes]) gives a plain fn.
   const num = 'number';
@@ -416,14 +436,15 @@ function readConfig() {
   // Keep the target within the new range.
   targetAgl = clamp(targetAgl, 0, topFt);
 
-  // Resolve the start-altitude cap against THIS profile's ladder, mirroring the
-  // firmware's config_load_start_alt(top-callout) default. If the cap is still
-  // unset (Infinity) OR sits above the new ladder's ceiling, snap it to the top
-  // callout (= "no suppression"); a valid lower pick made in the menu survives a
-  // profile switch as long as it's still on the ladder.
+  // Resolve the start-altitude cap against THIS profile's ladder. Infinity is the
+  // "no cap" sentinel (the un-configured default) and must STAY Infinity across a
+  // profile switch — snapping it to the old ladder's top would silently suppress
+  // the new profile's higher callouts (e.g. the SF30/C's 300 ft "cap" muting the
+  // SF30/D's 600/500/400 after a switch). Only an explicit below-top menu pick is
+  // ever finite, and one that no longer fits this ladder falls back to "no cap".
   const top = cfg.callouts[0];
-  if (!isFinite(startAltFt) || startAltFt > top) {
-    startAltFt = top;
+  if (isFinite(startAltFt) && startAltFt > top) {
+    startAltFt = Infinity;
   }
 }
 
@@ -970,7 +991,10 @@ function scheduleCalloutAt(ft, when) {
  */
 function commitConfigMenu() {
   applyAudioMode(pendingMode);
-  startAltFt = pendingCapFt;
+  // A pick at the ladder top means "no suppression": store the Infinity sentinel,
+  // not the height, so it stays "all callouts" if the pilot later switches to a
+  // profile with a taller ladder (a finite top would cap the new high callouts).
+  startAltFt = pendingCapFt >= cfg.callouts[0] ? Infinity : pendingCapFt;
   applyToneVolume(pendingToneVolDb);    // independent tone + voice offsets
   applyVoiceVolume(pendingVoiceVolDb);
 
@@ -1260,7 +1284,10 @@ function commitManualMenu() {
   applyAudioMode(manMode);
   const calloutsOn = api.modeCallouts(manMode) === 1;
   const asc = [...cfg.callouts].sort((a, b) => a - b);
-  startAltFt = calloutsOn ? asc[manCapIdx] : cfg.callouts[0];
+  // Top-of-ladder == "no suppression" -> the Infinity sentinel (see
+  // commitConfigMenu); a tone-only mode has no voice to cap at all.
+  startAltFt = (calloutsOn && asc[manCapIdx] < cfg.callouts[0])
+             ? asc[manCapIdx] : Infinity;
   applyToneVolume(manToneVolDb);
   applyVoiceVolume(manVoiceVolDb);
   // Optional features: gear-check + positive-rate are voice callouts -> OFF in a
@@ -1356,8 +1383,8 @@ function renderManual() {
 function startApproach() {
   unlockAudio();                          // first-class user gesture: enable sound
 
-  // Begin at the fixed default ILS start height and sink down the ladder from there.
-  const startFt = APPROACH_START_FT;
+  // Begin at the active profile's ILS start height and sink down its ladder.
+  const startFt = APPROACH_START_FT[profileIdx] ?? APPROACH_START_FT[0];
 
   targetAgl  = startFt;
   displayAgl = startFt;                   // snap the glyph; the run glides from here
@@ -2057,19 +2084,40 @@ function resizeCanvas() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
 }
 
+/* ---- Tape scale: compressed-log altitude mapping ---------------------------
+ * The tape is NOT linear: a log1p warp stretches the low altitudes — where all
+ * the action lives (the 50/40/30/20/10 ladder, the tone swell, the flare) —
+ * and compresses the cruise heights, so the 100->0 ft band gets more pixels
+ * than 300->100 ft. log1p (rather than a bare log) keeps the curve finite and
+ * well-behaved through 0 ft. TAPE_LOG_K is the knee in feet: altitudes below
+ * it spread out, altitudes well above it squeeze together; smaller = more
+ * low-end stretch. Both directions of the mapping share it, so dragging stays
+ * exactly inverse to drawing.
+ */
+const TAPE_LOG_K = 60;
+
+// Altitude (ft) -> normalised tape position (0 at ground .. 1 at topFt).
+function ftToU(ft) {
+  const c = clamp(ft, 0, topFt);
+  return Math.log1p(c / TAPE_LOG_K) / Math.log1p(topFt / TAPE_LOG_K);
+}
+// Inverse: normalised tape position -> altitude (ft), for dragging.
+function uToFt(u) {
+  return TAPE_LOG_K * Math.expm1(clamp(u, 0, 1) * Math.log1p(topFt / TAPE_LOG_K));
+}
+
 // Map an altitude (ft) to a Y pixel on the tape (0 ft at bottom, topFt at top).
 function ftToY(ft, h) {
   const pad = 24;                          // top/bottom breathing room
   const usable = h - pad * 2;
-  const t = clamp(ft / topFt, 0, 1);       // 0..1 up the tape
-  return pad + (1 - t) * usable;
+  return pad + (1 - ftToU(ft)) * usable;
 }
 // Inverse: a Y pixel back to altitude (for dragging).
 function yToFt(y, h) {
   const pad = 24;
   const usable = h - pad * 2;
   const t = clamp((y - pad) / usable, 0, 1);
-  return (1 - t) * topFt;
+  return uToFt(1 - t);
 }
 
 function draw(st, toneAgl, toneOn) {
