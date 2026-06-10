@@ -1,5 +1,6 @@
 # LidarAGL — open source, by [Novabox.Works](https://novabox.works/)
 ![3D Printed Design](banner.jpg)
+![Banner](16_9_photo.png)
 
 STL files releasing soon.
 
