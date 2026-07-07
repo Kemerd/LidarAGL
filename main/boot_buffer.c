@@ -563,6 +563,71 @@ void config_wipe_tone_start(void)
     ESP_LOGW(TAG, "tone-start altitude wiped (will use default)");
 }
 
+/* ---- Demo AGL gain (DEMO_MODE builds only; see config.h) ------------------ */
+#if DEMO_MODE
+
+float config_load_demo_gain(void)
+{
+    /* Stored as a u16. This key inverts the usual absent-means-off contract:
+     * an ABSENT key returns DEMO_GAIN_DEFAULT (a freshly flashed / wiped demo
+     * unit must demo out of the box), while an explicitly stored 0 is the user's
+     * OFF choice from the menu. Values outside the sane 2..1000 band (mirroring
+     * the bench attach-frame clamp) read as corrupt and yield the default.      */
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return DEMO_GAIN_DEFAULT;
+    }
+    uint16_t v = 0;
+    esp_err_t err = nvs_get_u16(h, NVS_KEY_DEMOGAIN, &v);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return DEMO_GAIN_DEFAULT;   /* absent / unreadable -> demo-ready default */
+    }
+    if (v == 0) {
+        return 0.0f;                /* explicit OFF chosen in the config menu    */
+    }
+    float g = (float)v;
+    if (g < 2.0f || g > 1000.0f) {
+        return DEMO_GAIN_DEFAULT;   /* corrupt / absurd -> back to the default   */
+    }
+    return g;
+}
+
+void config_save_demo_gain(float gain)
+{
+    if (gain < 0.0f) {
+        gain = 0.0f;
+    }
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed; demo gain not persisted");
+        return;
+    }
+    /* Round to the nearest integer gain; the menu only offers whole multipliers
+     * (or 0 for OFF).                                                            */
+    uint16_t v = (uint16_t)(gain + 0.5f);
+    if (nvs_set_u16(h, NVS_KEY_DEMOGAIN, v) == ESP_OK) {
+        nvs_commit(h);
+        ESP_LOGI(TAG, "demo gain saved: x%u%s", v, v == 0 ? " (OFF)" : "");
+    } else {
+        ESP_LOGE(TAG, "nvs_set_u16 failed; demo gain not persisted");
+    }
+    nvs_close(h);
+}
+
+void config_wipe_demo_gain(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, NVS_KEY_DEMOGAIN);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "demo gain wiped (will use x%.0f default)", (double)DEMO_GAIN_DEFAULT);
+}
+
+#endif /* DEMO_MODE */
+
 /* ---- Load / commit ------------------------------------------------------- */
 
 size_t boot_buffer_load(boot_entry_t *out, size_t cap)

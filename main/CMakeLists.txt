@@ -74,3 +74,22 @@ idf_component_register(
     #  application component, so force-linking all of its objects is free.
     WHOLE_ARCHIVE
 )
+
+# -----------------------------------------------------------------------------
+#  DEMO_MODE — the show-floor pulley-rig build (see the DEMO_MODE section of
+#  config.h for the full story). Opt in per build directory with:
+#
+#      idf.py -DDEMO_MODE=1 build
+#
+#  The -D lands in the CMake cache, so the choice is STICKY for that build dir:
+#  later plain `idf.py build` runs stay demo until -DDEMO_MODE=0 (or fullclean)
+#  switches back. Flight builds — where the cache variable is absent/0 — compile
+#  every demo branch out, so non-demo units spend zero flash on the feature.
+#
+#  Skipped during the early requirement-harvest pass (cmake -P script mode):
+#  COMPONENT_LIB does not exist yet there, and only the real configure matters.
+# -----------------------------------------------------------------------------
+if(NOT CMAKE_SCRIPT_MODE_FILE AND DEMO_MODE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE DEMO_MODE=1)
+    message(STATUS "LidarAGL: DEMO_MODE build — scaled-AGL show firmware")
+endif()

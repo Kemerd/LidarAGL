@@ -530,6 +530,67 @@
                                      /* (the host altitude tape tracks THIS line)     */
 #define BENCH_DEBUG_LOG_MS   750     /* slower verbose raw/ground/agl breakdown line  */
 
+/* ---- DEMO-MODE build (show-floor pulley rig; compile-time opt-in) --------- */
+/*  A standalone show-floor variant of the bench real-sensor mode above: the
+ *  REAL LiDAR stays on UART1 and the post-ground AGL is multiplied up, but with
+ *  NO laptop / USB attach handshake — the scaling arms itself at every boot from
+ *  a gain saved in NVS. Built for demoing the box on a physical pulley rig: a
+ *  couple of feet of target travel sweeps the entire callout ladder, tone swell,
+ *  flare fade and all, exactly as the real decode chain would fly it.
+ *
+ *  The whole feature is fenced by DEMO_MODE so ordinary flight firmware carries
+ *  NONE of it — no extra menu level, no NVS helpers, no scaling branch; zero
+ *  flash cost on a non-demo unit. Build a demo image with:
+ *
+ *      idf.py -DDEMO_MODE=1 build     (the CMake cache remembers the flag, so
+ *      idf.py -DDEMO_MODE=0 build      later plain builds stay demo; set =0 or
+ *                                      fullclean to return to flight firmware)
+ *
+ *  The multiplier is RUNTIME-configurable on the unit itself: LEVEL 9 of the
+ *  boot config menu (present only in demo builds) cycles x50 / x100 / x200 /
+ *  x400 / OFF — every gain is speakable with the existing number clips, and the
+ *  level announces itself with a DOUBLE chirp since no "demo" voice clip exists.
+ *  The choice persists in NVS; OFF (stored 0) makes the demo image behave
+ *  exactly like flight firmware. Each real foot above the learned ground reads
+ *  as <gain> feet of AGL, so at the x200 default 2 ft of pulley travel == 400 ft
+ *  of demo altitude. A fresh/wiped demo unit boots straight into the default —
+ *  no menu visit required before the show.                                      */
+#ifndef DEMO_MODE
+#define DEMO_MODE            0       /* compiled OUT unless the build defines it */
+#endif
+#define DEMO_GAIN_DEFAULT    200.0f  /* fresh demo unit: 2 ft real == 400 ft demo */
+#define NVS_KEY_DEMOGAIN     "demogain"  /* u16: demo AGL gain (0 == OFF)         */
+
+/*  Demo "parked" watchdog band, in REAL feet. The state machine's own 30 s
+ *  ground-dwell disarm evaluates its parked test on the SCALED AGL, where its
+ *  2 ft stillness band shrinks to millimetres of real travel at demo gains —
+ *  below the SF30's 1 cm quantization, so it can never hold and the box would
+ *  stay armed (and blip the tone on noise) forever between demo runs. The demo
+ *  build therefore runs its OWN parked detector in honest real feet: once the
+ *  target has rested within this band of the learned ground for GROUND_RESET_MS
+ *  (the same 30 s as flight), the state machine is disarmed exactly as a
+ *  taxi-back would — silent until the next hoist climbs back through ARM_FT.   */
+#define DEMO_PARKED_BAND_FT  0.25f   /* within ~3 in of ground == "target at rest" */
+
+/*  Demo boot ground-fill "farthest cluster" guard, in REAL feet. On the show
+ *  rig the fill samples are EMA-flat and bit-identical, so robust_mean's MAD
+ *  collapses to 0 and its outlier rejection degrades to keep-everything — a
+ *  hand or body crossing the beam during the ~1 s fill would then be AVERAGED
+ *  into the ground reference at full weight and poison the whole session (demo
+ *  boots deliberately never persist or re-load ground, see app_main). But an
+ *  intrusion can only ever sit NEARER than the surface the rig ranges against,
+ *  so the demo fill keeps ONLY samples within this band of the FARTHEST valid
+ *  reading: the true resting surface survives, the intrusion is discarded.     */
+#define DEMO_GROUND_CLUSTER_FT 0.30f /* fill samples within this of the farthest  */
+
+/*  Minimum parked-cluster samples before the watchdog may RE-ANCHOR the ground
+ *  (the disarm itself is not gated). At the logic task's ~20 ms demo tick this
+ *  is ~1 s of agreeing readings. Guards a knife-edge: if a beam intrusion ends
+ *  within a tick or two of the 30 s latch, the farthest-cluster mean has just
+ *  restarted mid-EMA-ramp and would re-anchor off a handful of transitional
+ *  samples; too-small clusters instead keep the previous (known-good) ground.  */
+#define DEMO_REANCHOR_MIN_N  50u     /* ~1 s of cluster samples to move ground    */
+
 /* ---- FreeRTOS task stacks (BYTES in ESP-IDF) & priorities ---------------- */
 #define SENSOR_TASK_STACK 3072
 #define LOGIC_TASK_STACK  4096

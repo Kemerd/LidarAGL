@@ -279,6 +279,36 @@ void config_save_tone_start(float ft);
 void config_wipe_tone_start(void);
 
 /**
+ * @brief Load the saved demo AGL gain from NVS (DEMO_MODE builds only).
+ *
+ * @details The show-floor pulley-rig multiplier: each real foot above the
+ *          learned ground reads as this many feet of AGL. Stored as a u16.
+ *          Unlike the OFF-by-default keys above, an ABSENT key here falls back
+ *          to DEMO_GAIN_DEFAULT — a fresh demo flash must be demo-ready with no
+ *          menu visit — while an explicitly stored 0 means the user chose OFF
+ *          in the menu. Nonsense values (outside 2..1000) also yield the default
+ *          so a corrupt entry can never produce an absurd sweep.
+ *
+ * @return The gain (>= 2), 0.0f for OFF, or DEMO_GAIN_DEFAULT when absent.
+ *
+ * @note   Compiled only when DEMO_MODE is set; flight builds carry no demo code.
+ */
+float config_load_demo_gain(void);
+
+/**
+ * @brief Persist the chosen demo AGL gain to NVS (DEMO_MODE builds only).
+ * @param gain  The multiplier, or 0 to disable (OFF). Stored as a u16 (rounded).
+ */
+void config_save_demo_gain(float gain);
+
+/**
+ * @brief Erase the saved demo gain (next load returns DEMO_GAIN_DEFAULT).
+ *
+ * @note   Compiled only when DEMO_MODE is set, like the load/save pair above.
+ */
+void config_wipe_demo_gain(void);
+
+/**
  * @brief Load the stored ground readings.
  * @param out  Destination array (capacity @p cap).
  * @param cap  Capacity in entries.

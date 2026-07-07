@@ -100,7 +100,8 @@ static volatile bool s_sim_want_bench_real = false;
 
 /*  True once bench real-sensor scaled debug mode is armed for this boot. Read by
  *  the logic task to multiply the AGL by s_bench_scale_gain and emit the throttled
- *  raw-reading line. Never set on a normal/flight boot.                           */
+ *  raw-reading line. Never set on a normal/flight boot. DEMO_MODE builds also arm
+ *  it (standalone, from the NVS demo gain) — see the demo block in app_main().    */
 static bool s_bench_scale = false;
 
 /*  The actual AGL scale used in bench real-sensor mode. Seeded with the compile-
@@ -108,6 +109,14 @@ static bool s_bench_scale = false;
  *  appending a little-endian float to the OP_BENCH_REAL attach frame (parsed in
  *  bench_attach_detected). Lets the dev dial the sweep without a reflash.         */
 static float s_bench_scale_gain = BENCH_SCALE_GAIN;
+
+#if DEMO_MODE
+/*  True when THIS boot's AGL scaling was armed by the saved DEMO gain rather than
+ *  a USB bench attach. Gates the demo-only ground handling on top of the shared
+ *  s_bench_scale machinery: the real-feet parked watchdog in the logic task and
+ *  the self-calibrating, never-persisted ground reference (see app_main).        */
+static bool s_demo_scale = false;
+#endif
 
 /*  Bench HIL: a "reboot into the config menu" request that survives the SOFTWARE
  *  reboot esp_restart() performs (RTC memory keeps its value across a restart,
@@ -354,6 +363,11 @@ static void run_config_menu(void)
     config_wipe_sink_rate();
     config_wipe_climb_rate();
     config_wipe_tone_start();
+#if DEMO_MODE
+    /* The wiped demo gain reloads as DEMO_GAIN_DEFAULT (not OFF) so a wiped demo
+     * unit stays demo-ready even if the user bails out of the menu before LEVEL 9. */
+    config_wipe_demo_gain();
+#endif
 
     /* Start the menu at 0 dB on BOTH offsets (no change) so the prompts/previews
      * play un-trimmed until the pilot chooses levels in LEVELs 3 & 4 below.       */
@@ -640,6 +654,60 @@ static void run_config_menu(void)
         config_save_tone_start(ts_opts[ts_sel]);
     }
 
+#if DEMO_MODE
+    /* ---- LEVEL 9 (DEMO builds only): demo AGL multiplier ------------------- */
+    /* The show-floor pulley-rig gain: each real foot above the learned ground is
+     * flown as this many feet of AGL, so a couple of feet of target travel sweeps
+     * the whole callout ladder (see the DEMO_MODE section of config.h). The cycle
+     * is x50 -> x100 -> x200 -> x400 -> OFF -> x50..., starting on the
+     * DEMO_GAIN_DEFAULT (x200 == "2 ft real = 400 ft demo"); OFF (stored 0) makes
+     * the demo image behave exactly like flight firmware. There is no dedicated
+     * "demo" voice clip, so the level announces itself with a DOUBLE chirp — no
+     * other level opens that way — followed by the current selection: a gain is
+     * spoken with the existing number clips ("two hundred"), OFF with "off".      */
+    {
+        const float  dg_opts[] = { 50.0f, 100.0f, 200.0f, 400.0f, 0.0f };
+        const size_t n_dg      = sizeof(dg_opts) / sizeof(dg_opts[0]);
+
+        /* Start on whichever entry matches the compile-time default (falls back
+         * to the first entry if the default is ever tuned off-list).             */
+        size_t dg_sel = 0;
+        for (size_t i = 0; i < n_dg; ++i) {
+            if (fabsf(dg_opts[i] - DEMO_GAIN_DEFAULT) < 0.5f) {
+                dg_sel = i;
+                break;
+            }
+        }
+
+        /* Level signature: double chirp, then speak the starting selection. */
+        audio_play_clip_blocking(config_clip_chirp());
+        vTaskDelay(pdMS_TO_TICKS(120));
+        audio_play_clip_blocking(config_clip_chirp());
+        vTaskDelay(pdMS_TO_TICKS(120));
+        audio_play_clip_blocking(callout_clip(callout_id_for_ft(dg_opts[dg_sel])));
+
+        idle_ms = 0;
+        for (;;) {
+            tap_event_t ev = wait_tap_event(&idle_ms);
+            if (ev == TAP_DOUBLE || ev == TAP_TIMEOUT) {
+                break;                          /* confirm this gain (or OFF)     */
+            }
+            if (ev == TAP_SINGLE) {
+                dg_sel = (dg_sel + 1) % n_dg;   /* cycle gains, then OFF, wrap    */
+                if (dg_opts[dg_sel] <= 0.0f) {
+                    ESP_LOGI(TAG, "config: demo gain -> OFF");
+                    audio_play_clip_blocking(config_clip_piece(CFG_PIECE_OFF));
+                } else {
+                    ESP_LOGI(TAG, "config: demo gain -> x%.0f", (double)dg_opts[dg_sel]);
+                    audio_play_clip_blocking(callout_clip(callout_id_for_ft(dg_opts[dg_sel])));
+                }
+            }
+        }
+        audio_play_clip_blocking(config_clip_chirp());   /* confirm chirp */
+        config_save_demo_gain(dg_opts[dg_sel]);
+    }
+#endif /* DEMO_MODE */
+
     ESP_LOGW(TAG, "config committed (mode %d); rebooting", selected_mode);
     vTaskDelay(pdMS_TO_TICKS(50));   /* let the log + DMA flush */
     esp_restart();                   /* does not return */
@@ -700,12 +768,89 @@ static void logic_task(void *arg)
             agl = 0.0f;
         }
 
+#if DEMO_MODE
+        /* Demo parked watchdog — evaluated on REAL feet, BEFORE the scaling.
+         * The sm's own ground-dwell disarm tests "parked" on the scaled AGL,
+         * where its 2 ft stillness band is millimetres of real travel — below
+         * the sensor's 1 cm quantization, so it can never hold and the box
+         * would stay armed (tone blipping on noise) forever between demo runs.
+         * Instead: once the target has rested within DEMO_PARKED_BAND_FT of the
+         * learned ground for the same GROUND_RESET_MS as flight, re-seed the
+         * state machine into a fresh, disarmed GROUND — silence until the next
+         * hoist climbs back through ARM_FT and re-arms it naturally.             */
+        if (s_demo_scale) {
+            /* Dwell accounting + a running mean of the parked readings. All five
+             * statics are private to the logic task (its sole writer).           */
+            static float    s_demo_parked_ms = 0.0f;
+            static float    s_park_sum_ft    = 0.0f;
+            static uint32_t s_park_n         = 0u;
+            static float    s_park_far_ft    = 0.0f;   /* farthest range this rest */
+            static bool     s_park_latched   = false;  /* one-shot per rest        */
+            if (agl <= DEMO_PARKED_BAND_FT) {
+                s_demo_parked_ms += dt_s * 1000.0f;
+                if (!s_park_latched) {
+                    /* Farthest-cluster the mean, mirroring the boot fill guard: a
+                     * beam intrusion (a hand under the rig) can only read NEARER
+                     * than the rest surface, yet its clamped agl of 0 still tests
+                     * as parked — so unguarded it would be averaged in and drag
+                     * the re-anchored ground down, possibly past the parked band
+                     * (stranding the box armed until a power cycle). Track the
+                     * farthest reading of this rest and average ONLY the samples
+                     * clustered at it; a genuinely farther cluster (the hand
+                     * leaves, or the rig itself settled lower) restarts the mean. */
+                    if (s.range_ft > s_park_far_ft + DEMO_GROUND_CLUSTER_FT) {
+                        s_park_sum_ft = 0.0f;       /* farther cluster found:      */
+                        s_park_n      = 0u;         /* restart the mean on it      */
+                    }
+                    if (s.range_ft > s_park_far_ft) {
+                        s_park_far_ft = s.range_ft;
+                    }
+                    if (s.range_ft >= s_park_far_ft - DEMO_GROUND_CLUSTER_FT) {
+                        s_park_sum_ft += s.range_ft;
+                        s_park_n      += 1u;
+                    }
+                    if (s_demo_parked_ms >= (float)GROUND_RESET_MS) {
+                        s_park_latched = true;
+                        /* RE-ANCHOR the ground to this rest's cluster mean, so
+                         * gradual DOWNWARD/in-band rig drift (rope stretch, a
+                         * settling frame) is absorbed at every rest instead of
+                         * accumulating past the parked band — which would strand
+                         * the box armed all day. (An upward rest shift beyond the
+                         * band can't be seen from inside it; a power cycle's boot
+                         * self-calibration covers that case.) The minimum-cluster
+                         * gate keeps a transitional sliver of samples — e.g. an
+                         * intrusion ending right at the 30 s boundary — from
+                         * moving the ground; the previous reference is kept.      */
+                        if (s_park_n >= DEMO_REANCHOR_MIN_N) {
+                            s_ground_ref_ft = s_park_sum_ft / (float)s_park_n;
+                        }
+                        if (sm.armed) {
+                            sm_init(&sm, ST_GROUND);
+                            sm.tone_start_ft = s_tone_start_ft; /* pilot override */
+                            ESP_LOGI(TAG, "demo: parked %us -> disarmed + ground "
+                                          "re-anchored at %.2f ft (hoist to re-arm)",
+                                     (unsigned)(GROUND_RESET_MS / 1000u),
+                                     (double)s_ground_ref_ft);
+                        }
+                    }
+                }
+            } else {
+                s_demo_parked_ms = 0.0f;            /* any lift resets the dwell   */
+                s_park_sum_ft    = 0.0f;
+                s_park_n         = 0u;
+                s_park_far_ft    = 0.0f;
+                s_park_latched   = false;
+            }
+        }
+#endif
+
         /* Bench real-sensor debug: a close bench target only swings a few feet,
          * so multiply the (real-feet) AGL up to flight altitudes — one foot above
          * the learned ground becomes s_bench_scale_gain feet, so a few feet of hand
          * travel sweeps the whole 0..400 ft callout band. The raw sensor reading
          * is logged (throttled) so the dev can confirm the LiDAR is streaming.
-         * Armed only for an OP_BENCH_REAL boot; a flight build never enters here. */
+         * Armed by an OP_BENCH_REAL boot or, in DEMO_MODE builds, by the saved
+         * NVS demo gain (see app_main); a flight build never enters here.        */
         if (s_bench_scale) {
             float scaled = agl * s_bench_scale_gain;
             /* Fast, compact value line — the host altitude tape parses THIS, so it
@@ -1012,12 +1157,91 @@ void app_main(void)
     ESP_LOGI(TAG, "volume offsets: tone %+.0f dB, voice %.0f dB",
              tone_vol_db, voice_vol_db);
 
+#if DEMO_MODE
+    /* 4b. DEMO build: arm the scaled-AGL show mode from the saved demo gain.
+     * This is the standalone show-floor cousin of the USB bench real-sensor mode:
+     * it reuses the exact same s_bench_scale machinery the logic task already
+     * applies (AGL x gain, capped poll cadence, no light-sleep, liveness logs) —
+     * just armed from NVS on every boot instead of a bench attach frame. The
+     * scaling multiplies AGL AFTER the ground reference is subtracted, so the
+     * ground-fill and the airborne decision keep working in honest feet.
+     *
+     * Two bench workflows must keep working on a demo image, so the demo gain
+     * yields to BOTH: an OP_BENCH_REAL attach already armed the scaling with the
+     * gain the tool asked for (it wins for that session), and a plain sim attach
+     * (OP_HELLO) streams fabricated altitudes that are ALREADY flight-scale feet
+     * — stacking the demo gain on top would multiply a simulated 300 ft approach
+     * to 60,000 ft, so sim boots must never arm it. Gain 0 means OFF was chosen
+     * in LEVEL 9: the demo image flies like a stock build.
+     *
+     * When the gain DOES arm, the box announces it: the LEVEL 9 double-chirp
+     * signature followed by the spoken gain ("two hundred"). That makes a demo
+     * image unmistakable at power-on — a flight box boots silent, so a unit
+     * accidentally flashed with demo firmware reveals itself before it ever
+     * reaches an aircraft, and the show crew hears "demo ready" at the booth.    */
+    if (!s_bench_scale && !sf30c_sim_active()) {
+        float demo_gain = config_load_demo_gain();
+        if (demo_gain >= 2.0f) {
+            s_bench_scale      = true;
+            s_bench_scale_gain = demo_gain;
+            s_demo_scale       = true;
+            ESP_LOGW(TAG, "DEMO MODE: real LiDAR, AGL scaled x%.0f "
+                          "(2 ft real = %.0f ft demo); retune in config-menu LEVEL 9",
+                     (double)demo_gain, (double)(2.0f * demo_gain));
+            /* Audible demo signature (blocking, so it finishes before tasks run). */
+            audio_play_clip_blocking(config_clip_chirp());
+            vTaskDelay(pdMS_TO_TICKS(120));
+            audio_play_clip_blocking(config_clip_chirp());
+            vTaskDelay(pdMS_TO_TICKS(120));
+            audio_play_clip_blocking(callout_clip(callout_id_for_ft(demo_gain)));
+        } else {
+            ESP_LOGI(TAG, "DEMO build: demo gain OFF — behaving like flight firmware");
+        }
+    }
+#endif
+
     /* 5. Ground-fill + current reading -> reconstruct ground reference. */
     float ground_reads[BOOT_BUFFER_N];
     size_t n_fill = capture_ground_fill(ground_reads, BOOT_BUFFER_N);
 
     boot_entry_t stored[BOOT_BUFFER_N];
     size_t n_stored = boot_buffer_load(stored, BOOT_BUFFER_N);
+
+#if DEMO_MODE
+    /* Demo boots SELF-CALIBRATE: wherever the pulley target rests at power-on IS
+     * the show's ground. Feed THIS boot's fresh fill through the same robust
+     * resolve in place of the persisted buffer, so no earlier session (a home
+     * bench, a power-off with the target hoisted) can hand the show a stale
+     * reference — and a boot that DOES catch the target hoisted is fully cured
+     * by a plain power cycle at rest, because nothing is ever persisted (the
+     * commit below is skipped too). Flight/OFF boots use the stored buffer.
+     *
+     * The fill is first reduced to its FARTHEST cluster (see the
+     * DEMO_GROUND_CLUSTER_FT rationale in config.h): on the rig the samples are
+     * flat enough that robust_mean's MAD hits 0 and stops rejecting outliers,
+     * and a hand crossing the beam during the fill can only read NEARER than
+     * the true surface — so keeping the far cluster discards the intrusion.     */
+    if (s_demo_scale) {
+        /* Farthest plausible (junk-capped) reading in the fill. */
+        float floor_ft = -1.0f;
+        for (size_t i = 0; i < n_fill; ++i) {
+            if (ground_reads[i] <= MAX_VALID_FT && ground_reads[i] > floor_ft) {
+                floor_ft = ground_reads[i];
+            }
+        }
+        /* Keep only the samples clustered at that farthest surface. */
+        size_t kept = 0;
+        for (size_t i = 0; i < n_fill; ++i) {
+            if (ground_reads[i] <= MAX_VALID_FT &&
+                ground_reads[i] >= floor_ft - DEMO_GROUND_CLUSTER_FT) {
+                stored[kept].range_ft = ground_reads[i];
+                stored[kept].marker   = 0;   /* fresh, never-persisted entries   */
+                ++kept;
+            }
+        }
+        n_stored = kept;   /* 0 == all junk -> resolve falls back as usual       */
+    }
+#endif
 
     float current_ft = 0.0f;
     bool  cur_valid  = false;
@@ -1052,7 +1276,17 @@ void app_main(void)
      *    Only refresh the stored ground when we're actually on the ground —
      *    an in-flight reboot must NOT overwrite the learned ground with an
      *    airborne reading.                                                     */
-    if (!br.airborne && n_fill > 0) {
+    bool persist_ground = !br.airborne && n_fill > 0;
+#if DEMO_MODE
+    /* Demo boots never write the ground buffer (runtime-only, like sim mode):
+     * the rig's 2 ft of travel sits inside GROUND_DEV_FT, so a reboot with the
+     * target hoisted would otherwise be misread as "on ground" and persist a
+     * poisoned reference that silently kills every later demo run.              */
+    if (s_demo_scale) {
+        persist_ground = false;
+    }
+#endif
+    if (persist_ground) {
         boot_buffer_commit(ground_reads, n_fill, (uint32_t)(esp_timer_get_time() / 1000));
     }
 
