@@ -39,6 +39,7 @@ idf_component_register(
         "lwnx.c"
         "sf30c.c"
         "robust.c"
+        "range_filter.c"
         "boot_buffer.c"
         "state_machine.c"
         "audio_math.c"

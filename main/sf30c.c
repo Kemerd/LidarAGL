@@ -10,6 +10,7 @@
 #include "sf30c.h"
 #include "config.h"
 #include "lwnx.h"
+#include "range_filter.h"
 #include "shared.h"
 
 #include <string.h>
@@ -19,21 +20,30 @@
 #include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
-#include "esp_timer.h"   /* bench raw-byte dump throttle */
+#include "esp_timer.h"   /* bench raw-byte dump throttle + filter dt           */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 static const char *TAG = "sf30c";
 
 /* ---- Module state -------------------------------------------------------- */
 
-/*  EMA-smoothed range in feet for the state/voice path. Seeded on first sample. */
-static float  s_range_ema_ft = 0.0f;
-static bool   s_have_ema      = false;
+/*  The robust range pipeline (median-of-drain -> Hampel gate -> re-acquire ->
+ *  time-corrected EMA; see range_filter.c). It replaces the old bare EMA +
+ *  hold-last-good pair, both of which live inside it now.                      */
+static range_filter_t   s_rf;
 
-/*  Last good range, held across lost-signal samples so we never publish junk.  */
-static float  s_last_good_ft  = 0.0f;
-static bool   s_have_good     = false;
+/*  Carried pairing state of the legacy 2-byte decoder (pure, range_filter.c).  */
+static sf30_ascii_ctx_t s_ascii;
+
+/*  UART event queue: the RX hardware flags framing/parity errors and FIFO
+ *  overflows on the exact garbled bytes a DFS glitch or light-sleep wake edge
+ *  produces — we listen so a corrupt drain can be DISCARDED instead of parsed. */
+static QueueHandle_t    s_uart_evq = NULL;
+
+/*  Wall-clock stamp of the previous rf_finalize(), for the filter's dt.        */
+static int64_t          s_last_fin_us = 0;
 
 /*  Monotonic sample sequence for the consumer's dt sanity. */
 static uint32_t s_seq = 0;
@@ -59,6 +69,11 @@ void sf30c_enable_raw_debug(void)
 
 void sf30c_init(void)
 {
+    /* The robust range pipeline is used by BOTH the real-sensor and sim paths;
+     * seed its ceiling gate with the default profile until autodetect runs.    */
+    rf_init(&s_rf, SF30C_PROFILE.max_range_ft);
+    sf30_ascii_reset(&s_ascii);
+
     /* Bench sim mode: there is no real sensor on UART1 — the read path pulls
      * simulated frames from the USB-Serial-JTAG instead. Skip the UART bring-up
      * entirely (sf30c_sim_enable() already reset the parser).                   */
@@ -73,12 +88,22 @@ void sf30c_init(void)
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
         .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,        /* v5 idiom */
+        /* XTAL, NOT the (default) APB clock. The APB clock is scaled 80->40 MHz
+         * by DFS whenever no PM lock is held — which is exactly the on-ground
+         * states, since the audio path releases its lock there — and a halved
+         * source clock turns the whole 460800-baud stream into framing-error
+         * garbage (the "CE-heavy ~328 ft" failure class this file has met
+         * before). The 40 MHz XTAL is immune to DFS, so RX stays clean at any
+         * CPU frequency. See the ESP-IDF power-management docs.                 */
+        .source_clk = UART_SCLK_XTAL,
     };
 
+    /* Install WITH an event queue: framing/parity/overflow errors are detected
+     * by the RX hardware on the exact bytes a light-sleep wake edge corrupts,
+     * and the read path uses those events to discard the poisoned drain.       */
     ESP_ERROR_CHECK(uart_driver_install(SF30C_UART_NUM,
                                         SF30C_UART_RX_BUF, SF30C_UART_TX_BUF,
-                                        0, NULL, 0));
+                                        16, &s_uart_evq, 0));
     ESP_ERROR_CHECK(uart_param_config(SF30C_UART_NUM, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(SF30C_UART_NUM,
                                  PIN_SF30C_TX, PIN_SF30C_RX,
@@ -86,7 +111,7 @@ void sf30c_init(void)
 
     lwnx_parser_reset(&s_parser);
 
-    ESP_LOGI(TAG, "UART%d up @ %d 8N1 (RX=%d TX=%d), mode=%s",
+    ESP_LOGI(TAG, "UART%d up @ %d 8N1 XTAL-clocked (RX=%d TX=%d), mode=%s",
              SF30C_UART_NUM, SF30C_BAUD, PIN_SF30C_RX, PIN_SF30C_TX,
              (SF30C_MODE == SF30C_BINARY) ? "BINARY" : "ASCII");
 }
@@ -136,6 +161,10 @@ void sf30c_sim_enable(void)
         ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
     }
     lwnx_parser_reset(&s_parser);
+    /* Fresh filter state for the simulated stream (sim_enable can run before
+     * sf30c_init on a bench boot, so it must be self-sufficient).              */
+    rf_init(&s_rf, SF30C_PROFILE.max_range_ft);
+    sf30_ascii_reset(&s_ascii);
     s_sim_mode = true;
     ESP_LOGW(TAG, "BENCH SIM MODE: reading the LWNX distance stream from USB-Serial-JTAG");
 }
@@ -152,56 +181,69 @@ void sf30c_sim_read_drain(void)
     }
 }
 
-/* ---- Helpers ------------------------------------------------------------- */
-
-/*  cm -> ft, the SINGLE place this conversion happens. */
-static inline float cm_to_ft(float cm)
+/* ---- UART hardware error sweep -------------------------------------------- */
+/*  Drain the driver's event queue and report whether the hardware flagged any
+ *  framing/parity error or FIFO/ring overflow since the last poll. Those flags
+ *  fire on precisely the corruption a light-sleep wake edge (or any glitch)
+ *  produces — bytes that LOOK like data but aren't. On any hit the caller
+ *  throws the whole drain away rather than parsing poisoned bytes.             */
+static bool uart_errors_pending(void)
 {
-    return cm * CM_TO_FT;
-}
-
-/*  Apply the light EMA used by the state/voice path and record last-good. */
-static void accept_range_ft(float ft)
-{
-    if (!s_have_ema) {
-        s_range_ema_ft = ft;
-        s_have_ema     = true;
-    } else {
-        s_range_ema_ft += RANGE_EMA_ALPHA * (ft - s_range_ema_ft);
-    }
-    s_last_good_ft = s_range_ema_ft;
-    s_have_good    = true;
-}
-
-/* ---- ASCII path: high-bit-flagged 2-byte pairs --------------------------- */
-/*  The legacy SF30 stream sends distance as pairs: the first byte has bit 7
- *  set and carries the upper 7 bits; the second byte (bit 7 clear) carries the
- *  lower 7 bits. distance_cm = (high << 7) | low. 16000 cm == lost signal.     */
-static bool s_ascii_have_high = false;
-static uint8_t s_ascii_high   = 0;
-
-static bool ascii_feed(uint8_t b, float *out_cm, bool *out_valid)
-{
-    if (b & 0x80) {
-        s_ascii_high      = (uint8_t)(b & 0x7F);
-        s_ascii_have_high = true;
+    bool hit = false;
+    if (s_uart_evq == NULL) {
         return false;
     }
-    if (!s_ascii_have_high) {
-        return false;                       /* low byte with no preceding high */
+    uart_event_t ev;
+    while (xQueueReceive(s_uart_evq, &ev, 0) == pdTRUE) {
+        switch (ev.type) {
+            case UART_FRAME_ERR:
+            case UART_PARITY_ERR:
+            case UART_FIFO_OVF:
+            case UART_BUFFER_FULL:
+                hit = true;
+                break;
+            default:
+                break;                     /* UART_DATA etc — not our business  */
+        }
     }
-    s_ascii_have_high = false;
-    int dist_cm = ((int)s_ascii_high << 7) | (int)(b & 0x7F);
-
-    *out_valid = (dist_cm != SF30_LOST_SIGNAL_CM);
-    *out_cm    = (float)dist_cm;
-    return true;
+    return hit;
 }
 
-/* ---- Drain + parse the freshest sample ----------------------------------- */
+/* ---- Drain + parse into the robust filter --------------------------------- */
 
 bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
 {
+    /* Keep the filter's ceiling gate synced to the autodetected sensor (the
+     * profile is resolved once at boot; this is a cheap idempotent refresh).    */
+    if (g_profile != NULL) {
+        rf_set_max_range(&s_rf, g_profile->max_range_ft);
+    }
+
+    /* Elapsed wall-clock since the previous finalize — drives the filter's
+     * physical slew allowance and its time-corrected EMA bandwidth.             */
+    int64_t now_us = esp_timer_get_time();
+    float dt_s = (s_last_fin_us > 0)
+                 ? (float)(now_us - s_last_fin_us) / 1e6f
+                 : 0.02f;
+    s_last_fin_us = now_us;
+
+    /* Hardware flagged corrupt bytes since the last poll (real sensor only):
+     * flush everything, resync the pair decoder, and hold last-good — parsing
+     * a drain the UART itself called garbage is how phantom callouts happen.    */
+    if (!s_sim_mode && uart_errors_pending()) {
+        static int64_t s_err_log_us = 0;
+        if (now_us - s_err_log_us >= 5 * 1000 * 1000) {   /* throttle ~5 s */
+            s_err_log_us = now_us;
+            ESP_LOGW(TAG, "UART errors flagged; discarding drain (sleep wake / noise)");
+        }
+        uart_flush_input(SF30C_UART_NUM);
+        sf30_ascii_reset(&s_ascii);
+        rf_drain_abort(&s_rf);
+        bool have = rf_finalize(&s_rf, dt_s, range_ft_out, valid);
+        *valid = false;                    /* nothing fresh survived this poll  */
+        return have;
+    }
+
     uint8_t rx[256];
     /* Non-blocking drain of whatever is buffered. In bench sim mode the bytes
      * come from the USB-Serial-JTAG (the simulated sensor) instead of UART1.    */
@@ -233,10 +275,11 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
         }
     }
 
-    bool got_sample = false;
-    bool last_valid = true;
-    float last_cm   = 0.0f;
-
+    /* EVERY decoded sample of the drain is pushed into the robust filter —
+     * the old code kept only the LAST pair, which let a single trailing
+     * garbage pair outvote ~57 good samples at the GROUND cadence. Validity
+     * (lost-signal band, negatives, beyond-ceiling junk) is judged inside
+     * rf_push_cm(); the median vote + Hampel gate happen at rf_finalize().     */
     for (int i = 0; i < n; ++i) {
         /* SIM mode always carries the LWNX framed stream from the bench tool —
          * regardless of the real-sensor parse mode below — so decode it as LWNX
@@ -248,9 +291,7 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
                     int16_t cm = 0;
                     /* firstReturnFiltered is the int16 at payload offset 6. */
                     if (lwnx_read_i16(f.payload, f.plen, 6, &cm)) {
-                        last_cm    = (float)cm;
-                        last_valid = (cm != (int16_t)SF30_LOST_SIGNAL_CM) && (cm >= 0);
-                        got_sample = true;
+                        rf_push_cm(&s_rf, (float)cm);
                     }
                 } else if (f.cmd == LWNX_CMD_BENCH_CTRL) {
                     sim_dispatch_frame(&f);
@@ -268,36 +309,25 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
             if (f.cmd == LWNX_CMD_DISTANCE_DATA) {
                 int16_t cm = 0;
                 if (lwnx_read_i16(f.payload, f.plen, 6, &cm)) {
-                    last_cm    = (float)cm;
-                    last_valid = (cm != (int16_t)SF30_LOST_SIGNAL_CM) && (cm >= 0);
-                    got_sample = true;
+                    rf_push_cm(&s_rf, (float)cm);
                 }
             } else if (f.cmd == LWNX_CMD_BENCH_CTRL) {
                 sim_dispatch_frame(&f);
             }
         }
 #else /* SF30C_ASCII — legacy 2-byte high/low pairs */
-        float cm; bool v;
-        if (ascii_feed(rx[i], &cm, &v)) {
-            last_cm    = cm;
-            last_valid = v;
-            got_sample = true;
+        int cm;
+        if (sf30_ascii_feed(&s_ascii, rx[i], &cm)) {
+            rf_push_cm(&s_rf, (float)cm);
         }
 #endif
     }
 
-    if (got_sample && last_valid) {
-        accept_range_ft(cm_to_ft(last_cm));
-    }
-
-    /* Report the freshest good range; hold last-good across a lost return so we
-     * never feed the state machine a garbage number.                          */
-    if (s_have_good) {
-        *range_ft_out = s_last_good_ft;
-        *valid        = got_sample ? last_valid : false;
-        return true;
-    }
-    return false;
+    /* Close the drain: the samples vote, the Hampel gate judges the winner,
+     * and the published value is either the fresh smoothed range or the held
+     * last-good (empty drain / majority-lost drain / rejected outlier). The
+     * *valid contract is unchanged: false whenever nothing fresh landed.        */
+    return rf_finalize(&s_rf, dt_s, range_ft_out, valid);
 }
 
 /* ---- Binary helpers: send a command, await a specific reply -------------- */

@@ -11,6 +11,7 @@
 #include "config.h"
 
 #include <math.h>
+#include <string.h>
 
 /* ---------------------------------------------------------------------------
  *  Trend smoothing factor. We low-pass the instantaneous vertical rate so a
@@ -28,6 +29,10 @@ void sm_init(sm_ctx_t *c, sm_state_t initial)
     c->armed_mask = 0u;
     c->have_prev  = false;
     c->ground_ms  = 0.0f;   /* fresh ground-dwell timer */
+
+    /* Fresh arming-persistence dwells: nothing is part-way to arming. */
+    c->arm_ms = 0.0f;
+    memset(c->rearm_ms, 0, sizeof c->rearm_ms);
 
     /*  Positive-rate detector. We pre-arm only when seeded on the ground; a
      *  flying seed (in-flight reboot) starts DISARMED so a reboot mid-climb can
@@ -132,23 +137,46 @@ static poll_profile_t poll_for_state(sm_state_t s)
 
 /* ---------------------------------------------------------------------------
  *  Re-arm callouts whose height the aircraft has climbed back above by at least
- *  REARM_MARGIN_FT. This is the hysteresis that (a) prevents machine-gunning a
- *  callout while hovering near its threshold and (b) re-enables callouts for a
- *  go-around. Only meaningful once we are 'armed' (past ARM_FT at least once).
+ *  REARM_MARGIN_FT — and HELD there for REARM_SUSTAIN_MS. This is the hysteresis
+ *  that (a) prevents machine-gunning a callout while hovering near its threshold
+ *  and (b) re-enables callouts for a go-around. Only meaningful once we are
+ *  'armed' (past ARM_FT at least once).
+ *
+ *  Why a dwell and not the old instant re-arm: a garbage range spike used to
+ *  re-arm every callout below its own peak DURING the spike, and the spike's
+ *  smoothed decay back to ground then fired them all — the phantom
+ *  "50 40 30 20 10" heard on the taxiway. A real go-around climbs through a
+ *  re-arm band in a sustained way (>=400 ms above height+margin is a few feet
+ *  of climb), while a spike's peak spends at most a poll or two there.
  * ------------------------------------------------------------------------- */
-static void rearm_above(sm_ctx_t *c, float agl_ft, const sensor_profile_t *p)
+static void rearm_above(sm_ctx_t *c, float agl_ft, float dt_s,
+                        const sensor_profile_t *p)
 {
-    for (size_t i = 0; i < p->n_callouts; ++i) {
+    size_t n = p->n_callouts;
+    if (n > SM_MAX_CALLOUTS) {
+        n = SM_MAX_CALLOUTS;    /* defensive: profiles are far smaller */
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if ((c->armed_mask & (1u << i)) != 0u) {
+            c->rearm_ms[i] = 0.0f;         /* already armed: nothing to accrue  */
+            continue;
+        }
         if (agl_ft > p->callouts[i] + REARM_MARGIN_FT) {
-            c->armed_mask |= (1u << i);
+            c->rearm_ms[i] += dt_s * 1000.0f;
+            if (c->rearm_ms[i] >= (float)REARM_SUSTAIN_MS) {
+                c->armed_mask |= (1u << i);
+                c->rearm_ms[i] = 0.0f;
+            }
+        } else {
+            c->rearm_ms[i] = 0.0f;         /* dropped out of the band: restart  */
         }
     }
 }
 
 /* ---------------------------------------------------------------------------
- *  On a downward crossing, find the HIGHEST armed callout that the aircraft has
- *  now descended THROUGH, fire it once, and disarm it. Returns the callout
- *  index fired, or -1 if none.
+ *  On a downward crossing, fire the LOWEST armed callout the aircraft has now
+ *  descended through, and disarm EVERY callout that was crossed. Returns the
+ *  callout index fired, or -1 if none.
  *
  *  A callout fires only on a genuine DOWNWARD CROSSING: the previous AGL was
  *  strictly above the threshold and the current AGL is at/below it. Requiring
@@ -157,25 +185,31 @@ static void rearm_above(sm_ctx_t *c, float agl_ft, const sensor_profile_t *p)
  *  every number above the current altitude. We only want a callout when the
  *  aircraft actually passes down through that height.
  *
- *  We test highest-first and fire at most one per tick. Because descent is
- *  monotonic between ticks and ticks are fast (POLL_MS_DESCENT), this gives the
- *  correct "200 ... 100 ... 50 ..." sequence; if two thresholds are crossed in
- *  one tick (very steep descent / slow tick) the higher one fires this tick and
- *  the lower remains armed for the next tick — a late number is never skipped.
+ *  In a normal descent one tick crosses at most one threshold, so this is the
+ *  familiar "200 ... 100 ... 50 ..." ladder. When one step DOES cross several
+ *  (a genuine terrain drop under final, or a re-acquired level after the range
+ *  filter held out an obstruction) we speak the LOWEST — the number closest to
+ *  where the aircraft actually IS. The old code fired the highest, which is
+ *  precisely the stalest information, and then silently skipped the rest (its
+ *  own comment claimed otherwise): the skipped numbers could never edge-fire
+ *  afterwards because prev_agl was already below them. Every crossed callout
+ *  is disarmed either way — it was genuinely passed — and all of them re-arm
+ *  through the normal go-around hysteresis.
  * ------------------------------------------------------------------------- */
 static int fire_descent_callout(sm_ctx_t *c, float prev_agl, float agl_ft,
                                 const sensor_profile_t *p)
 {
+    int fired = -1;
     for (size_t i = 0; i < p->n_callouts; ++i) {
         bool armed = (c->armed_mask & (1u << i)) != 0u;
         bool crossed_down = (prev_agl > p->callouts[i]) &&
                             (agl_ft   <= p->callouts[i]);
         if (armed && crossed_down) {
-            c->armed_mask &= ~(1u << i);   /* one-shot: disarm after firing */
-            return (int)i;
-        }
+            c->armed_mask &= ~(1u << i);   /* one-shot: disarm every crossed   */
+            fired = (int)i;                /* ladders are descending, so the   */
+        }                                  /* LAST hit is the LOWEST height    */
     }
-    return -1;
+    return fired;
 }
 
 void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
@@ -197,8 +231,17 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
 
     /* --- Arming: the silent climb-out ------------------------------------- */
     /*  Until the aircraft has climbed through ARM_FT for the first time, NO
-     *  callout may fire. Crossing ARM_FT latches 'armed' and arms the WHOLE
-     *  ladder — every callout, not just the ones already below us.
+     *  callout may fire. HOLDING above ARM_FT for ARM_DWELL_MS latches 'armed'
+     *  and arms the WHOLE ladder — every callout, not just those below us.
+     *
+     *  Why a dwell instead of the old single-sample latch: one unfiltered range
+     *  spike above 100 ft used to arm the entire ladder instantly, and its
+     *  smoothed decay back to ground then walked the ladder downward — the
+     *  phantom "50 40 30 20 10" a taxiing aircraft once spoke. A real climb-out
+     *  spends the whole climb above ARM_FT, so the dwell costs nothing (the
+     *  callouts are silent on the way up regardless); a spike lasts a poll or
+     *  two and can never accrue it. Same sustained-confirmation philosophy as
+     *  the positive-rate detector below.
      *
      *  Why arm the higher ones too? A callout only ever FIRES on a genuine
      *  DOWNWARD crossing (see fire_descent_callout), so arming a number we're
@@ -211,10 +254,18 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
      *  spoke. Arming the full ladder fixes that while keeping the climb silent
      *  (firing still needs the downward crossing) and the one-shot/go-around
      *  hysteresis intact (rearm_above still gates RE-arming after a fire).        */
-    if (!c->armed && agl_ft > ARM_FT) {
-        c->armed = true;
-        for (size_t i = 0; i < p->n_callouts; ++i) {
-            c->armed_mask |= (1u << i);
+    if (!c->armed) {
+        if (agl_ft > ARM_FT) {
+            c->arm_ms += dt_s * 1000.0f;
+            if (c->arm_ms >= (float)ARM_DWELL_MS) {
+                c->armed  = true;
+                c->arm_ms = 0.0f;
+                for (size_t i = 0; i < p->n_callouts; ++i) {
+                    c->armed_mask |= (1u << i);
+                }
+            }
+        } else {
+            c->arm_ms = 0.0f;   /* dipped back below the gate: start over */
         }
     }
 
@@ -225,7 +276,7 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
         /* Pre-arm life: GROUND when low & not climbing, CLIMB while rising. */
         if (agl_ft <= ARM_FT && (is_climbing(trend))) {
             next = ST_CLIMB;
-        } else if (agl_ft <= 2.0f && !is_climbing(trend)) {
+        } else if (agl_ft <= GROUND_BAND_FT && !is_climbing(trend)) {
             next = ST_GROUND;
         } else {
             /* Hold current pre-arm state (GROUND or CLIMB). */
@@ -245,7 +296,7 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
         }
 
         /* Re-arm callouts we've climbed safely back above (go-around support). */
-        rearm_above(c, agl_ft, p);
+        rearm_above(c, agl_ft, dt_s, p);
 
         /* Fire on a genuine downward crossing. We need a valid previous sample
          * (had_prev) so the very first tick after a boot — which seeds every
@@ -259,22 +310,30 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
     c->state = next;
 
     /* --- Ground-dwell disarm (taxi-back / parked reset) ------------------- */
-    /*  Accumulate continuous time spent SETTLED ON THE GROUND. Note we can't key
-     *  this off ST_GROUND: once 'armed', the machine only ever picks CRUISE /
+    /*  Accumulate continuous time spent ON THE GROUND. Note we can't key this
+     *  off ST_GROUND: once 'armed', the machine only ever picks CRUISE /
      *  DESCENT / ARMED, so a landed-but-armed box sits in ST_ARMED, never returns
-     *  to ST_GROUND. So we detect "parked" directly from the motion — at/below the
-     *  ground band (a hair above 0) and not descending or climbing. The instant we
-     *  leave that (a bounce, a climb, a go-around) the timer resets, so a quick
-     *  return to flight keeps the callouts/tone armed. Once we've simply sat parked
-     *  past GROUND_RESET_MS we DISARM as if freshly rebooted onto the ground: clear
-     *  the arm latch and every armed bit, so the next takeoff is silent until the
-     *  aircraft climbs back through ARM_FT and re-arms naturally.                  */
-    bool parked = (agl_ft <= 2.0f) && !is_descending(trend) && !is_climbing(trend);
+     *  to ST_GROUND. Instead: at/below the ground band counts as parked, full stop.
+     *
+     *  The test used to ALSO require a level trend — and that made the disarm
+     *  unreachable in practice: with the trend computed from centimetre-level
+     *  range steps, ordinary taxi jitter (oleo bounce, pavement seams, even the
+     *  sensor's own quantisation) tripped the dead-band and zeroed the timer
+     *  every few polls, so a landed box stayed armed from touchdown to shutdown.
+     *  An aircraft that has been at/below GROUND_BAND_FT for 30 continuous
+     *  seconds is on the ground by any definition; a touch-and-go leaves the
+     *  band within seconds and keeps its arming, exactly as before. Once parked
+     *  past GROUND_RESET_MS we DISARM as if freshly rebooted onto the ground:
+     *  clear the arm latch, every armed bit, and the arming dwells, so the next
+     *  takeoff is silent until a sustained climb through ARM_FT re-arms.          */
+    bool parked = (agl_ft <= GROUND_BAND_FT);
     if (parked) {
         c->ground_ms += dt_s * 1000.0f;
         if (c->armed && c->ground_ms >= (float)GROUND_RESET_MS) {
             c->armed      = false;
             c->armed_mask = 0u;
+            c->arm_ms     = 0.0f;
+            memset(c->rearm_ms, 0, sizeof c->rearm_ms);
             next          = ST_GROUND;   /* reflect the disarmed, parked reset */
             c->state      = next;
         }

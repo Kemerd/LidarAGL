@@ -65,6 +65,18 @@ static bool has_hit(const float *hits, int n, float v)
     return false;
 }
 
+/* Hold AGL steady for 'ticks' steps (dwell accrual for arm/re-arm timers). */
+static void hold_agl(sm_ctx_t *c, const sensor_profile_t *p, float agl, int ticks)
+{
+    sm_out_t out;
+    for (int i = 0; i < ticks; ++i) {
+        sm_step(c, agl, DT, p, &out);
+    }
+}
+
+/* Ticks needed to satisfy a millisecond dwell at DT, plus margin. */
+#define DWELL_TICKS(ms) ((int)((float)(ms) / (DT * 1000.0f)) + 10)
+
 /* ------------------------------------------------------------------------- */
 /*  Test bodies, parametrised by profile.                                    */
 /* ------------------------------------------------------------------------- */
@@ -139,11 +151,12 @@ static void test_high_callouts_profile_specific(void)
 
     /* SF30/C: climb above 300 + REARM_MARGIN so the new top number arms, then
      * descend. It must fire 300 (top) and 200, but never 400/500/600 — those are
-     * SF30/D-only and not in the SF30/C ladder. */
+     * SF30/D-only and not in the SF30/C ladder. 380 ft gives the climb enough
+     * time above ARM_FT to satisfy ARM_DWELL_MS with margin at this ramp rate. */
     sm_ctx_t cc;
     sm_init(&cc, ST_GROUND);
-    ramp(&cc, &SF30C_PROFILE, 0.0f, 340.0f, +4.0f, scratch, 16);
-    int nc = ramp(&cc, &SF30C_PROFILE, 340.0f, 0.0f, -2.0f, hits, 16);
+    ramp(&cc, &SF30C_PROFILE, 0.0f, 380.0f, +4.0f, scratch, 16);
+    int nc = ramp(&cc, &SF30C_PROFILE, 380.0f, 0.0f, -2.0f, hits, 16);
     ASSERT_TRUE(has_hit(hits, nc, 300.0f),  "[SF30/C] top callout is 300 ft");
     ASSERT_TRUE(has_hit(hits, nc, 200.0f),  "[SF30/C] fires 200 ft");
     ASSERT_TRUE(!has_hit(hits, nc, 400.0f), "[SF30/C] never fires 400 ft");
@@ -187,9 +200,13 @@ static void test_goaround_rearm(const sensor_profile_t *p)
     ramp(&c, p, 0.0f, p->callouts[0] + 40.0f, +2.0f, scratch, 16);
     ramp(&c, p, p->callouts[0] + 40.0f, 45.0f, -2.0f, scratch, 16);
 
-    /* Go around: climb well above 50 + REARM_MARGIN, then descend again. */
+    /* Go around: climb well above 50 + REARM_MARGIN and HOLD there (a real
+     * go-around spends seconds above the band; re-arming now requires the
+     * sustained REARM_SUSTAIN_MS dwell, not a single grazing sample), then
+     * descend again.                                                          */
     float hits[16];
     ramp(&c, p, 45.0f, 50.0f + REARM_MARGIN_FT + 15.0f, +2.0f, scratch, 16);
+    hold_agl(&c, p, 50.0f + REARM_MARGIN_FT + 15.0f, DWELL_TICKS(REARM_SUSTAIN_MS));
     int n = ramp(&c, p, 50.0f + REARM_MARGIN_FT + 15.0f, 5.0f, -2.0f, hits, 16);
 
     snprintf(msg, sizeof msg, "[%s] go-around re-fires 50 ft", p->name);
@@ -202,10 +219,12 @@ static void test_cruise_gating(const sensor_profile_t *p)
     sm_ctx_t c;
     sm_init(&c, ST_GROUND);
 
-    /* Climb to just above cruise_ft; state must be CRUISE. */
+    /* Climb to just above cruise_ft; state must be CRUISE. The +2 ft/tick rate
+     * keeps the climb above ARM_FT long enough to satisfy the ARM_DWELL_MS
+     * arming persistence (CRUISE is an armed-life state).                     */
     sm_out_t out;
     float scratch[16];
-    ramp(&c, p, 0.0f, p->cruise_ft + 10.0f, +4.0f, scratch, 16);
+    ramp(&c, p, 0.0f, p->cruise_ft + 10.0f, +2.0f, scratch, 16);
     sm_step(&c, p->cruise_ft + 5.0f, DT, p, &out);
     snprintf(msg, sizeof msg, "[%s] >= cruise_ft -> CRUISE", p->name);
     ASSERT_TRUE(out.state == ST_CRUISE, msg);
@@ -347,17 +366,171 @@ static void test_ground_dwell_disarm(const sensor_profile_t *p)
         /* Touch down only briefly — a handful of ground ticks, far under the
          * timeout — then go around. The arm must survive, so the 50 ft callout
          * re-fires on the next descent without needing a full re-climb logic
-         * beyond the normal go-around re-arm.                                    */
+         * beyond the normal go-around re-arm. We HOLD at the circuit top so the
+         * TOP callout's re-arm band (only 20 ft of headroom) accrues its
+         * REARM_SUSTAIN_MS dwell — the test's 80 ft/s climb rate blasts through
+         * that band in ~250 ms, which no real aircraft does.                    */
         sm_out_t out;
         for (int i = 0; i < 5; ++i) {       /* ~125 ms on the ground */
             sm_step(&c, 0.0f, DT, p, &out);
         }
         float hits[16];
         ramp(&c, p, 0.0f, top, +2.0f, scratch, 16);
+        hold_agl(&c, p, top, DWELL_TICKS(REARM_SUSTAIN_MS));
         int n = ramp(&c, p, top, 0.0f, -2.0f, hits, 16);
         snprintf(msg, sizeof msg, "[%s] brief touch-and-go keeps callouts armed", p->name);
         ASSERT_TRUE(n == (int)p->n_callouts, msg);
     }
+}
+
+/* ---------------------------------------------------------------------------
+ *  Arming persistence: a single sample above ARM_FT must NOT arm; a sustained
+ *  hold must. This is the state-machine half of the taxi-incident fix.
+ * ------------------------------------------------------------------------- */
+static void test_arm_requires_dwell(const sensor_profile_t *p)
+{
+    char msg[96];
+    sm_ctx_t c;
+    sm_init(&c, ST_GROUND);
+
+    /* Settle on the ground, then ONE tick at 150 ft (a spike the range filter
+     * hypothetically missed) followed by ground again: must stay disarmed.     */
+    hold_agl(&c, p, 0.0f, 10);
+    hold_agl(&c, p, 150.0f, 1);
+    hold_agl(&c, p, 0.0f, 10);
+    snprintf(msg, sizeof msg, "[%s] one sample above ARM_FT does not arm", p->name);
+    ASSERT_TRUE(!c.armed, msg);
+
+    /* A sustained hold above ARM_FT (a real climb-out) arms normally. */
+    hold_agl(&c, p, 150.0f, DWELL_TICKS(ARM_DWELL_MS));
+    snprintf(msg, sizeof msg, "[%s] sustained hold above ARM_FT arms", p->name);
+    ASSERT_TRUE(c.armed, msg);
+}
+
+/* ---------------------------------------------------------------------------
+ *  THE TAXI INCIDENT, state-machine layer: a spike-then-decay AGL trajectory
+ *  (the shape one accepted garbage sample used to give the smoothed range)
+ *  must produce ZERO callouts — in both the disarmed taxi-out configuration
+ *  and the still-armed taxi-in configuration that actually spoke
+ *  "50 40 30 20 10" on the flight line.
+ * ------------------------------------------------------------------------- */
+static void test_spike_decay_regression(const sensor_profile_t *p)
+{
+    char msg[96];
+
+    /* The old EMA's x0.7-per-poll decay shapes, as flown by the incident. */
+    static const float DECAY_TAXI_OUT[] = {   /* one 400 ft raw spike        */
+        119.0f, 83.0f, 58.0f, 41.0f, 29.0f, 20.0f, 14.0f, 10.0f,
+        7.0f, 5.0f, 3.0f, 2.0f, 1.0f, 0.0f
+    };
+    static const float DECAY_TAXI_IN[] = {    /* one ~300 ft raw spike       */
+        89.0f, 62.0f, 43.0f, 30.0f, 21.0f, 15.0f, 10.5f, 7.4f,
+        5.2f, 3.6f, 2.5f, 1.8f, 1.2f, 0.0f
+    };
+
+    /* --- Variant 1: taxi-out, DISARMED. The spike must not arm anything. --- */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_GROUND);
+        hold_agl(&c, p, 0.0f, 10);
+
+        sm_out_t out;
+        int fires = 0;
+        for (size_t i = 0; i < sizeof DECAY_TAXI_OUT / sizeof DECAY_TAXI_OUT[0]; ++i) {
+            sm_step(&c, DECAY_TAXI_OUT[i], DT, p, &out);
+            if (out.fired_callout >= 0) {
+                ++fires;
+            }
+        }
+        snprintf(msg, sizeof msg, "[%s] taxi-out spike decay: silent", p->name);
+        ASSERT_TRUE(fires == 0, msg);
+        snprintf(msg, sizeof msg, "[%s] taxi-out spike decay: never arms", p->name);
+        ASSERT_TRUE(!c.armed, msg);
+    }
+
+    /* --- Variant 2: taxi-in, STILL ARMED post-landing (empty one-shot mask —
+     *     every callout fired during the real landing). The spike's own peak
+     *     used to instantly re-arm {50,40,30,20,10} via rearm_above and the
+     *     decay spoke them all; the sustain dwell must now block that.         */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_GROUND);
+        c.armed      = true;   /* the arm latch survives the landing           */
+        c.armed_mask = 0u;     /* ...but every one-shot has already fired      */
+        hold_agl(&c, p, 0.0f, 10);
+
+        sm_out_t out;
+        int fires = 0;
+        for (size_t i = 0; i < sizeof DECAY_TAXI_IN / sizeof DECAY_TAXI_IN[0]; ++i) {
+            sm_step(&c, DECAY_TAXI_IN[i], DT, p, &out);
+            if (out.fired_callout >= 0) {
+                ++fires;
+            }
+        }
+        snprintf(msg, sizeof msg,
+                 "[%s] taxi-in spike decay: the incident's 50..10 stays silent", p->name);
+        ASSERT_TRUE(fires == 0, msg);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ *  Parked disarm under realistic taxi jitter: the old parked test required a
+ *  level trend, and centimetre-level jitter reset the 30 s timer forever — a
+ *  landed box stayed armed from touchdown to shutdown. Being at/below the
+ *  ground band IS parked now, jitter or not.
+ * ------------------------------------------------------------------------- */
+static void test_parked_jitter_disarm(const sensor_profile_t *p)
+{
+    char msg[96];
+    sm_ctx_t c;
+    sm_init(&c, ST_GROUND);
+
+    /* Fly a circuit so the box lands armed. */
+    float scratch[16];
+    float top = p->callouts[0] + REARM_MARGIN_FT + 20.0f;
+    ramp(&c, p, 0.0f, top, +2.0f, scratch, 16);
+    ramp(&c, p, top, 0.0f, -2.0f, scratch, 16);
+    ASSERT_TRUE(c.armed, "landed still armed (precondition)");
+
+    /* Taxi back with bumpy sub-2 ft jitter for the full timeout window. */
+    sm_out_t out;
+    int park_ticks = (int)(GROUND_RESET_MS / (DT * 1000.0f)) + 40;
+    for (int i = 0; i < park_ticks; ++i) {
+        float agl = 0.3f + 0.5f * (float)(i % 3);   /* 0.3 / 0.8 / 1.3 ft bumps */
+        sm_step(&c, agl, DT, p, &out);
+    }
+    snprintf(msg, sizeof msg, "[%s] bumpy taxi still reaches the 30 s disarm", p->name);
+    ASSERT_TRUE(!c.armed && out.state == ST_GROUND, msg);
+}
+
+/* ---------------------------------------------------------------------------
+ *  Multi-threshold crossings: when one step descends through several callout
+ *  heights (terrain drop / filter re-acquire), the LOWEST — the number nearest
+ *  the aircraft's actual height — is spoken, and every crossed one-shot is
+ *  spent. The old code spoke the highest (stalest) number and silently skipped
+ *  the rest.
+ * ------------------------------------------------------------------------- */
+static void test_multi_threshold_lowest(const sensor_profile_t *p)
+{
+    char msg[96];
+    sm_ctx_t c;
+    sm_init(&c, ST_GROUND);
+
+    /* Arm and descend normally to 60 ft. */
+    float scratch[16];
+    float top = p->callouts[0] + REARM_MARGIN_FT + 20.0f;
+    ramp(&c, p, 0.0f, top, +2.0f, scratch, 16);
+    ramp(&c, p, top, 60.0f, -2.0f, scratch, 16);
+
+    /* One step 60 -> 22 crosses 50/40/30: speak 30 (nearest), spend all three. */
+    float h = step_height(&c, 22.0f, p);
+    snprintf(msg, sizeof msg, "[%s] step across 50/40/30 speaks 30", p->name);
+    ASSERT_NEAR(h, 30.0f, 0.01f, msg);
+
+    /* Next step 22 -> 8 crosses 20/10: speak 10. */
+    h = step_height(&c, 8.0f, p);
+    snprintf(msg, sizeof msg, "[%s] step across 20/10 speaks 10", p->name);
+    ASSERT_NEAR(h, 10.0f, 0.01f, msg);
 }
 
 /* ---------------------------------------------------------------------------
@@ -523,6 +696,10 @@ int main(void)
         test_initial_state(p);
         test_trend_deadband(p);
         test_ground_dwell_disarm(p);
+        test_arm_requires_dwell(p);
+        test_spike_decay_regression(p);
+        test_parked_jitter_disarm(p);
+        test_multi_threshold_lowest(p);
         test_positive_rate(p);
         test_vertical_rate(p);
     }

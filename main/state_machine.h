@@ -45,6 +45,10 @@ typedef enum {
     POLL_DESCENT
 } poll_profile_t;
 
+/** Upper bound on callouts any profile may define (SF30/D uses 11). Sizes the
+ *  per-callout re-arm dwell array below; armed_mask itself allows 32.          */
+#define SM_MAX_CALLOUTS 16
+
 /**
  * @brief Carried state between sm_step() calls.
  *
@@ -61,6 +65,15 @@ typedef struct {
     bool       have_prev;    /**< False until the first step seeds prev_agl.   */
     float      ground_ms;    /**< Continuous time held in GROUND (ms); disarms */
                              /**< at GROUND_RESET_MS, resets on leaving ground.*/
+
+    /*  Arming persistence (anti-spike). A single sample above a threshold no
+     *  longer latches anything: the height must HOLD. arm_ms accrues continuous
+     *  time with AGL above ARM_FT toward the ARM_DWELL_MS latch; rearm_ms[i]
+     *  accrues continuous time above callouts[i]+REARM_MARGIN_FT toward
+     *  REARM_SUSTAIN_MS for the per-callout go-around re-arm. Both zero the
+     *  instant the height condition breaks, so a one-poll glitch can never arm. */
+    float      arm_ms;                     /**< Dwell toward the ARM_FT latch.  */
+    float      rearm_ms[SM_MAX_CALLOUTS];  /**< Per-callout re-arm dwell.       */
 
     /*  "Positive rate" (climb) callout detector — see sm_step() and config.h.  */
     bool       posrate_armed;  /**< Armed once settled in the flare region.     */

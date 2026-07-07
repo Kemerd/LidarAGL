@@ -21,9 +21,9 @@ SRC     := ../main
 
 # Pure modules under test (must never include esp_*/driver/freertos).
 PURE := $(SRC)/robust.c $(SRC)/sensor_profile.c $(SRC)/state_machine.c \
-        $(SRC)/audio_math.c $(SRC)/lwnx.c
+        $(SRC)/audio_math.c $(SRC)/lwnx.c $(SRC)/range_filter.c
 
-TESTS := run_robust run_state_machine run_audio_math run_lwnx
+TESTS := run_robust run_state_machine run_audio_math run_lwnx run_range_filter
 
 .PHONY: all clean
 all: $(TESTS)
@@ -41,6 +41,9 @@ run_audio_math:    test_audio_math.c    $(PURE)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 run_lwnx:          test_lwnx.c          $(PURE)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+run_range_filter:  test_range_filter.c  $(PURE)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 clean:

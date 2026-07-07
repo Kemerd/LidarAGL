@@ -28,6 +28,7 @@
 #include "sensor_profile.h"
 #include "sf30c.h"
 #include "boot_buffer.h"
+#include "robust.h"          /* boot-reading sanity: robust_estimate/robust_mean */
 #include "state_machine.h"
 #include "audio.h"
 #include "callouts.h"
@@ -734,6 +735,19 @@ static void logic_task(void *arg)
     int64_t last_us = esp_timer_get_time();
     bool sleep_allowed_prev = false;
 
+    /*  Per-sample decision pacing. The state machine now steps ONCE PER FRESH
+     *  SENSOR SAMPLE with the dt that actually elapsed between samples, instead
+     *  of every 20 ms with a sample-and-hold input. The old scheme attributed a
+     *  whole poll's range change to a single 20 ms tick, inflating the
+     *  instantaneous vertical rate up to 37x — which made the trend dead-band
+     *  meaningless and (before its own fix) let centimetre jitter reset the
+     *  taxi-back disarm timer forever. SAMPLE_STALE_MS forces a decision on the
+     *  held value if the sensor goes silent, so dwell timers keep accruing.      */
+    uint32_t last_seq     = 0;
+    bool     have_seq     = false;
+    float    pending_dt_s = 0.0f;
+    uint32_t last_tick_ms = 20;
+
     for (;;) {
         /* Peek the freshest range sample (non-destructive). */
         range_sample_t s;
@@ -753,13 +767,29 @@ static void logic_task(void *arg)
             continue;   /* no sample yet */
         }
 
-        /* dt since the last decision. */
+        /* Wall-clock since the last loop pass, accumulated toward the next
+         * decision (multiple passes can elapse between fresh samples).        */
         int64_t now_us = esp_timer_get_time();
         float dt_s = (float)(now_us - last_us) / 1e6f;
         last_us = now_us;
         if (dt_s <= 0.0f) {
             dt_s = 0.001f;
         }
+        pending_dt_s += dt_s;
+
+        /* Decide only on a FRESH sample (new seq), or when the stale watchdog
+         * says the sensor has gone quiet and the dwell timers must advance on
+         * the held value anyway.                                              */
+        bool fresh      = !have_seq || (s.seq != last_seq);
+        bool stale_kick = pending_dt_s * 1000.0f >= (float)SAMPLE_STALE_MS;
+        if (!fresh && !stale_kick) {
+            vTaskDelay(pdMS_TO_TICKS(last_tick_ms));
+            continue;
+        }
+        float dt_dec = pending_dt_s;   /* true elapsed time for this decision  */
+        pending_dt_s = 0.0f;
+        last_seq     = s.seq;
+        have_seq     = true;
 
         /* Apply the learned ground reference: AGL = range - ground. On a
          * lost-signal sample, hold by feeding the previous AGL (sm clamps). */
@@ -787,7 +817,7 @@ static void logic_task(void *arg)
             static float    s_park_far_ft    = 0.0f;   /* farthest range this rest */
             static bool     s_park_latched   = false;  /* one-shot per rest        */
             if (agl <= DEMO_PARKED_BAND_FT) {
-                s_demo_parked_ms += dt_s * 1000.0f;
+                s_demo_parked_ms += dt_dec * 1000.0f;
                 if (!s_park_latched) {
                     /* Farthest-cluster the mean, mirroring the boot fill guard: a
                      * beam intrusion (a hand under the rig) can only read NEARER
@@ -872,7 +902,7 @@ static void logic_task(void *arg)
         }
 
         sm_out_t out;
-        sm_step(&sm, agl, dt_s, g_profile, &out);
+        sm_step(&sm, agl, dt_dec, g_profile, &out);
 
         /* Fire the callout, if any, mapping the profile height -> clip id.
          * Suppress any callout ABOVE the configured start-altitude cap so the
@@ -943,6 +973,7 @@ static void logic_task(void *arg)
         /* Decision cadence: fast in active states, relaxed when sleep-friendly
          * (the PM subsystem drops to light-sleep during the idle between ticks). */
         uint32_t tick_ms = sleep_allowed ? POLL_MS_CRUISE : 20;
+        last_tick_ms = tick_ms;   /* the stale-sample skip path paces off this  */
         vTaskDelay(pdMS_TO_TICKS(tick_ms));
     }
 }
@@ -1255,6 +1286,20 @@ void app_main(void)
         current_ft = ground_reads[n_fill - 1];
     }
 
+    /* Sanity-blend the boot reading through the robust estimator (median/MAD
+     * over the fresh fill + the current reading). The airborne/armed seeding
+     * below trusts current_ft, and a single corrupt sample here used to be
+     * able to seed ST_ARMED on a parked aircraft: with the fill in the vote, a
+     * lone flier is rejected outright, while a genuine in-flight reboot — where
+     * the fill itself was captured airborne — passes straight through.          */
+    if (n_fill > 0) {
+        bool est_ok = false;
+        float est = robust_estimate(ground_reads, n_fill, current_ft, &est_ok);
+        if (est_ok) {
+            current_ft = est;
+        }
+    }
+
     boot_result_t br;
     boot_buffer_resolve(stored, n_stored, current_ft, &br);
     s_ground_ref_ft = br.ground_ref_ft;
@@ -1288,6 +1333,26 @@ void app_main(void)
 #endif
     if (persist_ground) {
         boot_buffer_commit(ground_reads, n_fill, (uint32_t)(esp_timer_get_time() / 1000));
+
+        /* Fold TODAY's surface into the operative reference. The resolve above
+         * builds the ground ref from the PREVIOUS boot's stored fill only, so a
+         * modest surface change (grass tie-down -> pavement, strut compression)
+         * used to offset the whole session's AGL by a few feet — enough to hold
+         * idle taxi AGL above the parked band and block the 30 s taxi-back
+         * disarm entirely. When this boot is judged on-ground and the fresh
+         * fill's robust mean agrees with the stored reference within
+         * GROUND_DEV_FT, the fresh value IS the ground we are sitting on — use
+         * it. (persist_ground is never set on demo boots, which self-calibrate
+         * through their own cluster path above.)                                */
+        if (!br.calib_error) {
+            bool fresh_ok = false;
+            float fresh_ref = robust_mean(ground_reads, n_fill, &fresh_ok);
+            if (fresh_ok && fabsf(fresh_ref - br.ground_ref_ft) <= GROUND_DEV_FT) {
+                s_ground_ref_ft = fresh_ref;
+                ESP_LOGI(TAG, "ground ref refreshed from this boot's fill: %.2f ft",
+                         (double)fresh_ref);
+            }
+        }
     }
 
     /* 8. Seed the state machine from the reconstructed AGL. */
