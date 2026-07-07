@@ -100,10 +100,15 @@ void sf30c_init(void)
 
     /* Install WITH an event queue: framing/parity/overflow errors are detected
      * by the RX hardware on the exact bytes a light-sleep wake edge corrupts,
-     * and the read path uses those events to discard the poisoned drain.       */
+     * and the read path uses those events to discard the poisoned drain.
+     * Depth 64: the 78 Hz stream can post an RX-timeout UART_DATA event per
+     * 2-byte burst (~58 per 750 ms GROUND poll), and a full queue silently
+     * drops later events — including the error flags this sweep exists to see.
+     * (Even a dropped error is not fatal: the median/Hampel layers downstream
+     * still gate whatever the corrupt bytes decode to — defence in depth.)     */
     ESP_ERROR_CHECK(uart_driver_install(SF30C_UART_NUM,
                                         SF30C_UART_RX_BUF, SF30C_UART_TX_BUF,
-                                        16, &s_uart_evq, 0));
+                                        64, &s_uart_evq, 0));
     ESP_ERROR_CHECK(uart_param_config(SF30C_UART_NUM, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(SF30C_UART_NUM,
                                  PIN_SF30C_TX, PIN_SF30C_RX,
