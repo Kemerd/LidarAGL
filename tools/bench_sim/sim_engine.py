@@ -41,6 +41,11 @@ class SimEngine:
         self.max_range_ft = 328.0               # sensor max range (SF30/C ~100 m);
                                                 # beyond it the bench sends lost-signal
 
+        # Deliberate unreliability on top of the realistic model: spikes, random
+        # garbage, corruption bursts, stuck values (see noise.FaultInjector).
+        # The GUI's "Unreliable sensor" card drives these knobs live.
+        self.faults = noise.FaultInjector()
+
         # Read-back for the UI.
         self.last_agl_ft = 0.0
         self.last_cm = 0
@@ -75,11 +80,15 @@ class SimEngine:
             dt = now - last
             last = now
 
-            # Advance the altitude source and synthesise the sensor reading.
+            # Advance the altitude source and synthesise the sensor reading,
+            # then let the fault injector corrupt it (spikes / bursts / random
+            # garbage / stuck values) exactly where real corruption lands: in
+            # the VALUE the firmware's robust filter must judge.
             agl = self.model.update(dt)
             cm = noise.distance_cm(agl, self.ground_offset_ft,
                                    self.sigma_ft, self.dropout_prob, self._rng,
                                    self.max_range_ft)
+            cm = self.faults.apply(cm, self._rng, now)
             self.serial.send(codec.build_distance_frame(cm))
 
             self.last_agl_ft = agl

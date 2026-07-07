@@ -131,6 +131,7 @@ class BenchApp(ctk.CTk):
         self._build_sim_card(col)
         self._build_ils_card(col)
         self._build_noise_card(col)
+        self._build_faults_card(col)
         self._build_menu_card(col)
 
     def _card(self, parent, title):
@@ -272,6 +273,96 @@ class BenchApp(ctk.CTk):
         self.rate_slider.set(P.DEFAULT_STREAM_HZ)
         self.rate_slider.grid(row=10, column=0, columnspan=3, padx=16,
                               pady=(4, 14), sticky="ew")
+
+    def _build_faults_card(self, parent):
+        """The 'unreliable sensor' card: deliberate stream corruption.
+
+        Every control drives noise.FaultInjector live on the stream thread.
+        Expected firmware behaviour (v1.59 robust filter) is spelled out per
+        mode so a bench run is pass/fail by ear: a parked box must stay SILENT
+        through spikes, bursts and random garbage — only the stuck-value fault
+        is DESIGNED to be followed (it is indistinguishable from real terrain).
+        """
+        card = self._card(parent, "Unreliable sensor (fault injection)")
+
+        ctk.CTkLabel(card, text="Torture the stream and listen: with the robust "
+                     "filter a parked box must stay silent through everything "
+                     "here except the stuck fault (which re-acquires after ~3 "
+                     "polls, by design — same path a real terrain step takes).",
+                     text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=520,
+                     justify="left").grid(row=1, column=0, columnspan=3, padx=16,
+                                          sticky="w")
+
+        # --- One-shot spike: the classic isolated outlier. -------------------
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.grid(row=2, column=0, columnspan=3, padx=12, pady=(10, 0), sticky="ew")
+        row.grid_columnconfigure(4, weight=1)
+        ctk.CTkLabel(row, text="Spike").grid(row=0, column=0, padx=(4, 6))
+        self.spike_ft_entry = ctk.CTkEntry(row, width=64)
+        self.spike_ft_entry.insert(0, "400")
+        self.spike_ft_entry.grid(row=0, column=1)
+        ctk.CTkLabel(row, text="ft  ×").grid(row=0, column=2, padx=4)
+        self.spike_frames_entry = ctk.CTkEntry(row, width=48)
+        self.spike_frames_entry.insert(0, "1")
+        self.spike_frames_entry.grid(row=0, column=3)
+        ctk.CTkLabel(row, text="frames").grid(row=0, column=4, padx=4, sticky="w")
+        ctk.CTkButton(row, text="Inject ⚡", width=90, fg_color=WARN,
+                      text_color="#000", command=self._inject_spike).grid(
+                          row=0, column=5, padx=4)
+        ctk.CTkLabel(card, text="(expect: SILENCE — 1 frame dies in the drain "
+                     "median; longer spikes die at the Hampel gate and the range "
+                     "HOLDs last-good)", text_color=MUTED,
+                     font=ctk.CTkFont(size=11), wraplength=520, justify="left"
+                     ).grid(row=3, column=0, columnspan=3, padx=16, sticky="w")
+
+        # --- Continuous random corruption. ------------------------------------
+        self.fault_rand_lbl = ctk.CTkLabel(card, text="Random garbage frames: 0 %")
+        self.fault_rand_lbl.grid(row=4, column=0, columnspan=3, padx=16,
+                                 pady=(10, 0), sticky="w")
+        self.fault_rand_slider = ctk.CTkSlider(card, from_=0, to=20,
+                                               command=self._on_fault_random)
+        self.fault_rand_slider.set(0)
+        self.fault_rand_slider.grid(row=5, column=0, columnspan=3, padx=16,
+                                    pady=4, sticky="ew")
+
+        # --- Periodic corruption bursts (the light-sleep wake signature). -----
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.grid(row=6, column=0, columnspan=3, padx=12, pady=(8, 0), sticky="ew")
+        row.grid_columnconfigure(5, weight=1)
+        self.burst_switch = ctk.CTkSwitch(row, text="Garbage bursts",
+                                          command=self._on_burst_switch)
+        self.burst_switch.grid(row=0, column=0, padx=(4, 10))
+        ctk.CTkLabel(row, text="every").grid(row=0, column=1)
+        self.burst_period_entry = ctk.CTkEntry(row, width=48)
+        self.burst_period_entry.insert(0, "5")
+        self.burst_period_entry.grid(row=0, column=2, padx=4)
+        ctk.CTkLabel(row, text="s  ×").grid(row=0, column=3)
+        self.burst_len_entry = ctk.CTkEntry(row, width=48)
+        self.burst_len_entry.insert(0, "12")
+        self.burst_len_entry.grid(row=0, column=4, padx=4)
+        ctk.CTkLabel(row, text="frames").grid(row=0, column=5, padx=4, sticky="w")
+
+        # --- Stuck-value fault (correlated corruption / the re-acquire probe). -
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.grid(row=7, column=0, columnspan=3, padx=12, pady=(8, 0), sticky="ew")
+        row.grid_columnconfigure(3, weight=1)
+        self.stuck_switch = ctk.CTkSwitch(row, text="Stuck value",
+                                          command=self._on_stuck_switch)
+        self.stuck_switch.grid(row=0, column=0, padx=(4, 10))
+        ctk.CTkLabel(row, text="at").grid(row=0, column=1)
+        self.stuck_ft_entry = ctk.CTkEntry(row, width=64)
+        self.stuck_ft_entry.insert(0, "250")
+        self.stuck_ft_entry.grid(row=0, column=2, padx=4)
+        ctk.CTkLabel(row, text="ft   (expect: box FOLLOWS it after ~3 polls — "
+                     "the designed re-acquire path)", text_color=MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=3, padx=4,
+                                                     sticky="w")
+
+        # --- Live corruption counter. ------------------------------------------
+        self.fault_count_lbl = ctk.CTkLabel(card, text="corrupted frames: 0",
+                                            text_color=MUTED)
+        self.fault_count_lbl.grid(row=8, column=0, columnspan=3, padx=16,
+                                  pady=(10, 14), sticky="w")
 
     def _build_menu_card(self, parent):
         card = self._card(parent, "Config menu (remote)")
@@ -476,6 +567,32 @@ class BenchApp(ctk.CTk):
         tag = " (real sensor)" if hz == P.DEFAULT_STREAM_HZ else ""
         self.rate_lbl.configure(text="Stream rate: %d Hz%s" % (hz, tag))
 
+    # ---- Unreliable-sensor (fault injection) handlers ------------------------
+
+    def _inject_spike(self):
+        # One-shot: arm the injector; the stream thread corrupts the next N
+        # frames. Logged so the run is auditable against what was (not) heard.
+        ft = self._read_float(self.spike_ft_entry, 400.0)
+        frames = max(1, int(self._read_float(self.spike_frames_entry, 1.0)))
+        self.engine.faults.inject_spike(ft, frames)
+        self._append_log("[fault] spike injected: %g ft x %d frame(s)"
+                         % (ft, frames))
+
+    def _on_fault_random(self, value):
+        self.engine.faults.random_prob = float(value) / 100.0
+        self.fault_rand_lbl.configure(
+            text="Random garbage frames: %d %%" % int(round(float(value))))
+
+    def _on_burst_switch(self):
+        on = bool(self.burst_switch.get())
+        self.engine.faults.burst_enabled = on
+        self._append_log("[fault] garbage bursts %s" % ("ON" if on else "off"))
+
+    def _on_stuck_switch(self):
+        on = bool(self.stuck_switch.get())
+        self.engine.faults.stuck_enabled = on
+        self._append_log("[fault] stuck-value fault %s" % ("ON" if on else "off"))
+
     # =========================================================================
     #  Periodic refresh + serial callbacks
     # =========================================================================
@@ -484,6 +601,16 @@ class BenchApp(ctk.CTk):
         # Keep the ground offset + sensor max range live from their entries.
         self.engine.ground_offset_ft = self._read_float(self.offset_entry, 3.0)
         self.engine.max_range_ft = self._read_float(self.range_entry, 328.0)
+
+        # Fault-injector knobs read live too (same pattern as the offset entry),
+        # plus the corruption counter read-out — amber while any fault is armed.
+        faults = self.engine.faults
+        faults.burst_period_s = max(0.5, self._read_float(self.burst_period_entry, 5.0))
+        faults.burst_len = max(1, int(self._read_float(self.burst_len_entry, 12.0)))
+        faults.stuck_ft = self._read_float(self.stuck_ft_entry, 250.0)
+        self.fault_count_lbl.configure(
+            text="corrupted frames: %d" % faults.corrupted,
+            text_color=WARN if faults.any_active() else MUTED)
 
         # Drain RX log lines (thread -> UI handoff via the queue).
         drained = 0
