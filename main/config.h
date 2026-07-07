@@ -35,7 +35,7 @@
  *  which firmware a box is running, and it lives here in the pure-logic region
  *  so the host tests + the WASM emulator can read the same constant without
  *  pulling in any ESP-IDF headers.                                            */
-#define FIRMWARE_VERSION "v1.58"
+#define FIRMWARE_VERSION "v1.59"
 
 /* ---- Sensor model identifiers ------------------------------------------- */
 /*  Mirror of the enum in sensor_profile.h, expressed as plain ints so this
@@ -70,10 +70,68 @@
  *  or a very dark/wet surface). Value is in centimetres on both paths.         */
 #define SF30_LOST_SIGNAL_CM   16000
 
-/* ---- Range filtering ----------------------------------------------------- */
-/*  Light EMA on the state/voice path so callouts stay crisp; a heavier EMA on
- *  the tone path so lidar jitter doesn't make the pitch warble.                */
-#define RANGE_EMA_ALPHA   0.30f       /* state/voice path (responsive)          */
+/* ---- Range filtering (robust runtime pipeline — see range_filter.c) ------- */
+/*  The checksum-free SF30/C serial stream means a single corrupted byte can
+ *  decode to a plausible distance anywhere in 0..537 ft. The old bare EMA
+ *  (RANGE_EMA_ALPHA, retired) let exactly one such sample arm the callout
+ *  ladder on a taxiing aircraft and speak a phantom "50 40 30 20 10". The
+ *  runtime path now runs the textbook robust stack instead:
+ *  median-of-drain vote -> Hampel (median/MAD) outlier gate -> re-acquire ->
+ *  time-corrected EMA. Every knob lives here.                                  */
+
+/*  Per-drain median vote: every decoded sample in a poll's drain votes and the
+ *  median wins, so any MINORITY of arbitrarily-wrong samples is discarded for
+ *  free (Tukey median smoother). 64 covers the worst real drain (~58 samples
+ *  at the 750 ms GROUND poll x 78 Hz); longer drains keep the newest 64.       */
+#define RANGE_DRAIN_MEDIAN_N   64
+
+/*  Hampel identifier (Hampel 1974; Pearson 2002): a fresh per-drain median is
+ *  an outlier when it deviates from the median of the last HAMPEL_WIN accepted
+ *  values by more than
+ *      HAMPEL_K * max(1.4826 * MAD, HAMPEL_MAD_FLOOR_FT)
+ *    + min(RANGE_MAX_SLEW_FPS * dt * RANGE_SLEW_HORIZON, RANGE_GATE_CAP_FT)
+ *  The 1.4826 factor scales MAD to a Gaussian sigma (the standard estimator);
+ *  the FLOOR keeps the test meaningful when the window is quantization-flat
+ *  (a parked lidar reads bit-identical cm, MAD -> 0, and an un-floored gate
+ *  would reject legitimate first motion). K = 3 is the classic "3 sigma".      */
+#define HAMPEL_WIN             7      /* accepted values remembered             */
+#define HAMPEL_K               3.0f   /* sigma multiplier (textbook value)      */
+#define HAMPEL_MAD_FLOOR_FT    0.35f  /* MAD floor ~2x the SF30's +/-5 cm noise */
+#define HAMPEL_SEED_N          3      /* window fills this far before gating    */
+
+/*  Physical slew allowance: the window median lags the true trajectory by
+ *  about half the window, so a legitimate climb/descent deviates from it by
+ *  rate x lag. RANGE_MAX_SLEW_FPS bounds the airframe (a Glasair III dives
+ *  well under 60 ft/s vertically); RANGE_SLEW_HORIZON is the half-window lag
+ *  in polls; and RANGE_GATE_CAP_FT hard-caps the allowance so the slow GROUND/
+ *  CRUISE cadences (0.5-0.75 s polls) can never open the gate wide enough to
+ *  admit an arming-sized (>100 ft) spike in one poll.                          */
+#define RANGE_MAX_SLEW_FPS     60.0f  /* physical |d(range)/dt| bound           */
+#define RANGE_SLEW_HORIZON     4.5f   /* half Hampel window + 1, in polls       */
+#define RANGE_GATE_CAP_FT      60.0f  /* absolute ceiling on the slew allowance */
+
+/*  Re-acquisition: a REAL level step (terrain edge under final, in-flight
+ *  power-up over new ground) must not be held forever. When this many
+ *  CONSECUTIVE rejected medians agree with each other within the band, the
+ *  filter accepts the new level and re-seeds. Random garbage does not cluster,
+ *  so corruption cannot re-acquire; a genuine step gets through in N polls
+ *  (75 ms at the DESCENT cadence — invisible in the flare).                    */
+#define RANGE_REACQUIRE_N       3     /* agreeing rejects that force acceptance */
+#define RANGE_REACQUIRE_BAND_FT 8.0f  /* how tightly the rejects must agree     */
+
+/*  Sensor-ceiling sanity: a return farther than the active profile's
+ *  max_range_ft plus this margin is physically impossible (the SF30/C cannot
+ *  see 400 ft) and is treated as lost-signal junk at the gate.                 */
+#define RANGE_MAX_MARGIN_FT    15.0f
+
+/*  Final smoothing: a TIME-CORRECTED one-pole EMA, alpha = 1 - exp(-dt/tau).
+ *  The retired fixed-alpha-per-poll EMA had a 30x effective-bandwidth swing
+ *  between the 750 ms GROUND and 25 ms DESCENT cadences; this keeps ONE
+ *  wall-clock bandwidth everywhere. Tau matches the old filter's feel at the
+ *  fast (ARMED/DESCENT) cadences where callout timing lives.                   */
+#define RANGE_EMA_TAU_S        0.12f  /* one-pole time constant, all cadences   */
+
+/*  Tone-path EMA (audio side, unchanged by the robust-filter work).            */
 #define TONE_EMA_ALPHA    0.12f       /* tone path (smoother, a little laggy)   */
 
 /* ---- Ground reference / boot buffer (see boot_buffer.c, spec §5) --------- */
@@ -110,6 +168,23 @@
 #define REARM_MARGIN_FT   20.0f        /* climb this far back above a callout    */
                                        /* height to re-arm it (go-around).       */
 
+/*  Arming persistence. A single sample above ARM_FT used to latch the ENTIRE
+ *  callout ladder instantly — which is precisely how one garbage range spike
+ *  turned into a spoken phantom descent on the taxiway. Arming (and per-callout
+ *  RE-arming after a go-around) now requires the height to HOLD continuously,
+ *  mirroring the sustained-confirmation pattern the positive-rate detector has
+ *  always used. A real climb-out spends many seconds above ARM_FT so the dwell
+ *  is imperceptible; a one-poll spike (25-750 ms) can never satisfy it.
+ *  REARM_SUSTAIN_MS is shorter than ARM_DWELL_MS: it only re-enables single
+ *  already-proven callouts on a go-around, where a >=400 ms hold above
+ *  height+REARM_MARGIN_FT is trivially true for any genuine climb.             */
+#define ARM_DWELL_MS      1500u        /* AGL > ARM_FT this long -> armed        */
+#define REARM_SUSTAIN_MS  400u         /* above h+margin this long -> re-armed   */
+
+/*  The "on the ground" AGL band shared by the pre-arm GROUND classification and
+ *  the parked/taxi-back detector below (was a scattered magic 2.0f).            */
+#define GROUND_BAND_FT    2.0f         /* at/below this counts as on the ground  */
+
 /*  Direction (climb vs descent) comes purely from the smoothed range trend
  *  since there is no IMU/baro. A small dead-band stops noise flipping the sign. */
 #define TREND_DEADBAND_FPS 0.5f        /* |dAGL/dt| below this == "level"        */
@@ -122,6 +197,14 @@
  *  continuous GROUND dwell and resets the moment we leave the ground, so a touch-
  *  and-go inside this window keeps the arming and the tone.                       */
 #define GROUND_RESET_MS    30000u      /* 30 s parked -> disarm (re-arm via climb)*/
+
+/*  Stale-sample watchdog for the logic task. Decisions are now made ONCE PER
+ *  FRESH SENSOR SAMPLE (so the vertical-rate trend divides a real range change
+ *  by the real elapsed time instead of attributing a whole 750 ms poll step to
+ *  one 20 ms tick — the aliasing that made the taxi-back disarm unreachable).
+ *  If the sensor goes silent, this timeout forces a decision tick on the held
+ *  value anyway so dwell timers (parked disarm, posrate) keep accruing.         */
+#define SAMPLE_STALE_MS   2000u        /* force a decision tick after this long  */
 
 /* ---- Per-state poll cadence (ms between sensor reads) -------------------- */
 /*  One place defines the power/latency policy; set_poll_profile() maps state
