@@ -148,7 +148,12 @@ const clip_t *callout_clip(callout_id_t id)
         build_manifest();
     }
     if (id < 0 || id >= CO_COUNT) {
-        return &s_chirp;   /* harmless absent fallback */
+        /* Out-of-range id: return an EMPTY clip, never the chirp. The chirp is
+         * the calibration/sensor-failure ALARM — sounding it for what is purely
+         * an internal lookup slip would tell the pilot the LiDAR had failed. A
+         * silent skip is the honest response to a bug that has no audio.        */
+        static const clip_t s_none = { NULL, 0, "invalid-callout-id" };
+        return &s_none;
     }
     return &s_clips[id];
 }

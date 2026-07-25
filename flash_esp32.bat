@@ -18,6 +18,15 @@ REM  Usage:
 REM    Double-click it           -> arrow-key picker (Enter = last-used port).
 REM    flash_esp32.bat           -> same picker.
 REM    flash_esp32.bat COM7      -> skip the picker and flash COM7 directly.
+REM
+REM  DEMO_MODE:
+REM    This script ALWAYS passes -DDEMO_MODE=0. The flag is a CMake cache entry,
+REM    so it is STICKY for a build directory: once anyone runs
+REM    `idf.py -DDEMO_MODE=1 build` in this tree, every later plain `idf.py build`
+REM    keeps producing DEMO images until the flag is explicitly cleared. A demo
+REM    image on the AIRCRAFT drops ARM_FT to 50 ft and self-arms its AGL scaling
+REM    with no USB attach - phantom callouts at wildly wrong heights. This is the
+REM    path to the aircraft, so it pins the flag rather than trusting the cache.
 REM ============================================================================
 setlocal enabledelayedexpansion
 
@@ -43,14 +52,21 @@ if not defined PORT (
 )
 
 echo.
-echo  Building ^& flashing LidarAGL  -^>  %PORT%
+echo  Building ^& flashing LidarAGL (FLIGHT build, DEMO_MODE=0)  -^>  %PORT%
 echo  ----------------------------------------------
-powershell -NoProfile -ExecutionPolicy Bypass -Command ". 'C:\Espressif\tools\Microsoft.v6.0.1.PowerShell_profile.ps1' | Out-Null; $env:IDF_TOOLS_PATH='C:\Espressif\tools'; $env:IDF_PYTHON_ENV_PATH='C:\Espressif\tools\python\v6.0.1\venv'; idf.py -p %PORT% flash; exit $LASTEXITCODE"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ". 'C:\Espressif\tools\Microsoft.v6.0.1.PowerShell_profile.ps1' | Out-Null; $env:IDF_TOOLS_PATH='C:\Espressif\tools'; $env:IDF_PYTHON_ENV_PATH='C:\Espressif\tools\python\v6.0.1\venv'; idf.py -DDEMO_MODE=0 -p %PORT% flash; exit $LASTEXITCODE"
+set "IDF_RC=%ERRORLEVEL%"
 
 echo.
-echo  ==== idf.py exited with code %ERRORLEVEL% ====
-echo  (close the bench-sim / serial monitor first if you see a port-busy error)
+echo  ==== idf.py exited with code %IDF_RC% ====
+if not "%IDF_RC%"=="0" (
+    echo.
+    echo  **** FLASH FAILED - THE UNIT STILL HOLDS ITS PREVIOUS FIRMWARE ****
+    echo  (close the bench-sim / serial monitor first if you see a port-busy error)
+)
 echo.
 pause
 endlocal
-exit /b 0
+REM  Propagate the real result: exiting 0 on a failed flash would report stale
+REM  firmware as freshly flashed - the one lie this script must never tell.
+exit /b %IDF_RC%

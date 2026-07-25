@@ -408,6 +408,89 @@ static void test_arm_requires_dwell(const sensor_profile_t *p)
 }
 
 /* ---------------------------------------------------------------------------
+ *  The dwell must hold at the SLOW poll cadences too — the case the 25 ms tick
+ *  above cannot see. dt handed to sm_step is the gap since the PREVIOUS
+ *  decision, i.e. time spent BELOW the gate, so crediting it to the first
+ *  above-gate sample let one spike carry a whole poll period of dwell. On the
+ *  ground the box polls at 750 ms (light sleep): two such samples reached
+ *  ARM_DWELL_MS exactly, and after a dropped poll (or a 2 s stale-watchdog
+ *  kick) a SINGLE sample did it alone — arming the entire ladder from one
+ *  observation, which is precisely the taxi-phantom failure the dwell exists to
+ *  prevent. Same story for the per-callout re-arm at the 500 ms cruise rate.
+ * ------------------------------------------------------------------------- */
+static void test_arm_dwell_slow_cadence(const sensor_profile_t *p)
+{
+    char msg[96];
+    sm_out_t out;
+
+    /* --- Two GROUND-cadence spike samples (750 ms each) must NOT arm. ------ */
+    sm_ctx_t c;
+    sm_init(&c, ST_GROUND);
+    sm_step(&c, 0.0f,   0.75f, p, &out);      /* parked, establishes prev      */
+    sm_step(&c, 150.0f, 0.75f, p, &out);      /* spike sample 1               */
+    sm_step(&c, 150.0f, 0.75f, p, &out);      /* spike sample 2 (1500 ms raw) */
+    snprintf(msg, sizeof msg,
+             "[%s] two 750 ms samples do not arm (gap time is not dwell)", p->name);
+    ASSERT_TRUE(!c.armed, msg);
+
+    /* --- One sample after a long gap (dropped poll / stale kick) must NOT arm. */
+    sm_init(&c, ST_GROUND);
+    sm_step(&c, 0.0f,   0.75f, p, &out);
+    sm_step(&c, 150.0f, 2.00f, p, &out);      /* SAMPLE_STALE_MS-sized gap    */
+    snprintf(msg, sizeof msg,
+             "[%s] one sample after a 2 s gap does not arm", p->name);
+    ASSERT_TRUE(!c.armed, msg);
+
+    /* --- A genuine climb-out still arms: sustained samples at the same slow
+     *     cadence accrue normally once the height is actually being observed. */
+    sm_init(&c, ST_GROUND);
+    sm_step(&c, 0.0f, 0.75f, p, &out);
+    for (int i = 0; i < 6; ++i) {             /* 6 x 750 ms held above gate   */
+        sm_step(&c, 150.0f, 0.75f, p, &out);
+    }
+    snprintf(msg, sizeof msg,
+             "[%s] a sustained slow-cadence climb still arms", p->name);
+    ASSERT_TRUE(c.armed, msg);
+
+    /* --- Per-callout re-arm: one CRUISE-cadence sample above height+margin
+     *     must not re-arm a fired rung (500 ms alone once exceeded the 400 ms
+     *     sustain). Arm the ladder, fire the top rung, then graze the band.   */
+    sm_init(&c, ST_GROUND);
+    hold_agl(&c, p, 300.0f, DWELL_TICKS(ARM_DWELL_MS));   /* armed, ladder hot */
+    float top = p->callouts[p->n_callouts - 1];           /* lowest rung: 10 ft*/
+    (void)top;
+
+    /* Descend through the 50 ft rung to fire and disarm it. */
+    float fired = -1.0f;
+    for (float a = 60.0f; a >= 45.0f; a -= 1.0f) {
+        float h = step_height(&c, a, p);
+        if (h >= 0.0f) {
+            fired = h;
+        }
+    }
+    snprintf(msg, sizeof msg, "[%s] precondition: a rung fired on the way down",
+             p->name);
+    ASSERT_TRUE(fired > 0.0f, msg);
+
+    /* One 500 ms sample well above that rung + margin must NOT re-arm it: the
+     * elapsed 500 ms was spent below the band, not in it.                     */
+    uint32_t mask_before = c.armed_mask;
+    sm_step(&c, fired + REARM_MARGIN_FT + 15.0f, 0.5f, p, &out);
+    snprintf(msg, sizeof msg,
+             "[%s] one 500 ms sample above the re-arm band does not re-arm",
+             p->name);
+    ASSERT_TRUE(c.armed_mask == mask_before, msg);
+
+    /* Held there, it re-arms as intended (a real go-around climb). */
+    for (int i = 0; i < 4; ++i) {
+        sm_step(&c, fired + REARM_MARGIN_FT + 15.0f, 0.5f, p, &out);
+    }
+    snprintf(msg, sizeof msg,
+             "[%s] a sustained climb above the band does re-arm", p->name);
+    ASSERT_TRUE(c.armed_mask != mask_before, msg);
+}
+
+/* ---------------------------------------------------------------------------
  *  THE TAXI INCIDENT, state-machine layer: a spike-then-decay AGL trajectory
  *  (the shape one accepted garbage sample used to give the smoothed range)
  *  must produce ZERO callouts — in both the disarmed taxi-out configuration
@@ -739,6 +822,7 @@ int main(void)
         test_trend_deadband(p);
         test_ground_dwell_disarm(p);
         test_arm_requires_dwell(p);
+        test_arm_dwell_slow_cadence(p);
         test_spike_decay_regression(p);
         test_parked_jitter_disarm(p);
         test_multi_threshold_lowest(p);

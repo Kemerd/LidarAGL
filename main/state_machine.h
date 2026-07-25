@@ -71,9 +71,22 @@ typedef struct {
      *  time with AGL above ARM_FT toward the ARM_DWELL_MS latch; rearm_ms[i]
      *  accrues continuous time above callouts[i]+REARM_MARGIN_FT toward
      *  REARM_SUSTAIN_MS for the per-callout go-around re-arm. Both zero the
-     *  instant the height condition breaks, so a one-poll glitch can never arm. */
+     *  instant the height condition breaks, so a one-poll glitch can never arm.
+     *
+     *  The accompanying observation counters are what make that guarantee hold
+     *  at EVERY poll cadence. dt_s is the full wall-clock gap since the previous
+     *  decision — time during which the height was NOT observed above the gate,
+     *  and which a dropped poll or a stale-watchdog kick can stretch to seconds.
+     *  Crediting it raw let a single above-gate sample satisfy a 1500 ms dwell
+     *  outright (the 750 ms GROUND cadence needed only two, and one sufficed
+     *  after a gap). Counting observations alongside the time makes the dwell
+     *  mean what its name says: the FIRST in-band decision starts the window but
+     *  banks no time, so a lone spike sample can never latch anything however
+     *  long the gap before it was.                                              */
     float      arm_ms;                     /**< Dwell toward the ARM_FT latch.  */
+    uint16_t   arm_obs;                    /**< Consecutive in-band decisions.  */
     float      rearm_ms[SM_MAX_CALLOUTS];  /**< Per-callout re-arm dwell.       */
+    uint16_t   rearm_obs[SM_MAX_CALLOUTS]; /**< Per-callout in-band decisions.  */
 
     /*  "Positive rate" (climb) callout detector — see sm_step() and config.h.  */
     bool       posrate_armed;  /**< Armed once settled in the flare region.     */

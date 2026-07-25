@@ -44,6 +44,7 @@
 #include "esp_timer.h"
 #include "esp_pm.h"
 #include "esp_system.h"   /* esp_restart() — config menu reboot */
+#include "esp_task_wdt.h" /* TWDT: the flight-critical loops subscribe + feed    */
 #include "esp_attr.h"     /* RTC_NOINIT_ATTR — survives a software reboot         */
 #include "driver/usb_serial_jtag.h"  /* bench HIL: read the sim stream from USB  */
 #include "lwnx.h"                     /* bench HIL: parse bench-control frames    */
@@ -761,7 +762,17 @@ static void logic_task(void *arg)
     int64_t last_good_us = esp_timer_get_time();
     bool    tone_muted   = false;
 
+    /*  Subscribe to the task watchdog. This loop owns every audible decision the
+     *  box makes; if it wedges, the box is silent with no reset and no cue. It
+     *  blocks only on bounded waits (a 100 ms queue peek and its own tick delay),
+     *  so a healthy pass always reaches the feed below well inside the timeout. */
+    esp_task_wdt_add(NULL);
+
     for (;;) {
+        /* Feed FIRST: every path below can continue the loop, and a missed feed
+         * on any of them would be a false trip rather than a real hang.        */
+        esp_task_wdt_reset();
+
         /* Peek the freshest range sample (non-destructive). */
         range_sample_t s;
         if (xQueuePeek(q_range_latest, &s, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -927,6 +938,33 @@ static void logic_task(void *arg)
         sm_out_t out;
         sm_step(&sm, agl, dt_dec, g_profile, &out);
 
+        /* --- Light-sleep policy: decided FIRST, before anything is queued ------
+         * Allowed only in GROUND/CRUISE, where the tone is silent. The RESUME
+         * edge must be published BEFORE any callout is queued below: while the
+         * channel is suspended the audio task drain-and-DISCARDS the callout
+         * queue (nothing may arm while the channel is down), so a callout queued
+         * ahead of the resume can be destroyed by an audio-task poll landing in
+         * the gap. One sm_step tick can BOTH leave CRUISE and cross a rung — a
+         * steep descent or a re-acquire snap does exactly that — and because a
+         * fired rung is one-shot disarmed it could never speak again for the
+         * rest of the approach. Clearing the suspend request first closes that
+         * window: by the time anything is queued the audio task is either
+         * already running or will observe the cleared request before it drains.
+         *
+         * The SUSPEND edge stays after the queueing (see below), so a callout
+         * fired on the tick we ENTER a sleep state still gets queued to a live
+         * channel rather than into a channel we just tore down.                */
+        bool sleep_allowed = (out.state == ST_GROUND || out.state == ST_CRUISE);
+
+        /* Never light-sleep on the bench: sleeping gates the UART/poll cadence and
+         * makes the live altitude stutter. Stay awake + fast for responsive testing.*/
+        if (s_bench_scale) {
+            sleep_allowed = false;
+        }
+        if (!sleep_allowed && sleep_allowed_prev) {
+            audio_resume();
+        }
+
         /* Fire the callout, if any, mapping the profile height -> clip id.
          * Suppress any callout ABOVE the configured start-altitude cap so the
          * pilot only hears numbers from their chosen ceiling down (the tone is
@@ -996,6 +1034,19 @@ static void logic_task(void *arg)
             if (data_stale) {
                 ESP_LOGW(TAG, "sensor data stale >%u ms (lost signal / silent "
                               "sensor) -> tone muted", (unsigned)LOST_SIGNAL_MUTE_MS);
+                /* Annunciate the failure. Muting the tone is the honest cue only
+                 * when the tone was actually sounding — i.e. below the tone band.
+                 * ABOVE it (cruise, pattern work, anywhere the ladder has not
+                 * started) the tone was already silent, so the mute is audibly a
+                 * NO-OP and a dead LiDAR is indistinguishable from a healthy box
+                 * with nothing to say. That is the failed-silent trap the boot
+                 * chirp exists to close on the ground, and it applies just as
+                 * much in the air: a pilot trained on "500 ... 100 ... 50" would
+                 * otherwise discover the failure on short final, or read the
+                 * silence as "not yet at the first callout". Chirp instead.     */
+                if (!out.tone_active) {
+                    audio_request_sensor_alert();
+                }
             } else {
                 ESP_LOGI(TAG, "sensor data live again -> tone restored");
             }
@@ -1010,19 +1061,13 @@ static void logic_task(void *arg)
             g_poll_period_ms = SIM_POLL_MS;
         }
 
-        /* Light-sleep policy: allowed only in GROUND/CRUISE, where the tone is
-         * silent. Suspend the I2S channel before sleeping, resume on exit.    */
-        bool sleep_allowed = (out.state == ST_GROUND || out.state == ST_CRUISE);
-
-        /* Never light-sleep on the bench: sleeping gates the UART/poll cadence and
-         * makes the live altitude stutter. Stay awake + fast for responsive testing.*/
-        if (s_bench_scale) {
-            sleep_allowed = false;
-        }
+        /* Light-sleep policy, SUSPEND edge (the resume edge ran before the
+         * callout block above). Tearing the channel down last means a callout
+         * fired on this very tick was already queued to a live channel and gets
+         * spoken; the suspend then takes effect on a later tick once the state
+         * has genuinely settled into GROUND/CRUISE.                            */
         if (sleep_allowed && !sleep_allowed_prev) {
             audio_suspend();
-        } else if (!sleep_allowed && sleep_allowed_prev) {
-            audio_resume();
         }
         sleep_allowed_prev = sleep_allowed;
 
@@ -1194,6 +1239,39 @@ void app_main(void)
 
     /* 3. Audio up with the resolved runtime configuration. */
     audio_init(&audio_cfg);
+
+    /*  Verify every rung of the active ladder actually has a clip behind it.
+     *  The embedded clip set is GLOBBED at build time (see main/CMakeLists.txt),
+     *  so a renamed, moved, or failed-to-convert .pcm does not break the build —
+     *  it silently produces a {NULL,0} manifest entry. In the air that rung then
+     *  passes through the whole pipeline normally and simply makes no sound: a
+     *  missing "fifty" on short final looks identical to a working box that has
+     *  not reached 50 ft yet. Check it once at boot, where it is cheap and where
+     *  the console can name the exact clip, and chirp so the failure is audible
+     *  rather than buried in a log nobody reads at the hangar.                  */
+    size_t missing_clips = 0;
+    for (size_t i = 0; i < g_profile->n_callouts; ++i) {
+        float        ft  = g_profile->callouts[i];
+        callout_id_t cid = callout_id_for_ft(ft);
+        const clip_t *cl = (cid != CO_COUNT) ? callout_clip(cid) : NULL;
+        if (!cl || !cl->pcm || cl->len_bytes < 2) {
+            missing_clips++;
+            ESP_LOGE(TAG, "MISSING CLIP for %.0f ft callout (%s) — that rung "
+                          "will be SILENT in flight", (double)ft,
+                     (cid != CO_COUNT) ? callout_clip(cid)->name : "unmapped");
+        }
+    }
+    /* The gear reminder is a safety call in its own right; check it too. */
+    const clip_t *gear_clip = callout_clip(CO_CHECK_GEAR);
+    if (!gear_clip->pcm || gear_clip->len_bytes < 2) {
+        missing_clips++;
+        ESP_LOGE(TAG, "MISSING CLIP: 'check gear' reminder will be SILENT");
+    }
+    if (missing_clips > 0) {
+        ESP_LOGE(TAG, "%u callout clip(s) missing from this build",
+                 (unsigned)missing_clips);
+        audio_play_chirp();
+    }
 
     /* 4. Config button HELD at boot -> enter the config menu. Audio + profile are
      * both up, so the menu can speak prompts and cycle the right callout ladder.

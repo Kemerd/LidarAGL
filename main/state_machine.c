@@ -30,9 +30,13 @@ void sm_init(sm_ctx_t *c, sm_state_t initial)
     c->have_prev  = false;
     c->ground_ms  = 0.0f;   /* fresh ground-dwell timer */
 
-    /* Fresh arming-persistence dwells: nothing is part-way to arming. */
-    c->arm_ms = 0.0f;
-    memset(c->rearm_ms, 0, sizeof c->rearm_ms);
+    /* Fresh arming-persistence dwells: nothing is part-way to arming. The
+     * observation counters clear alongside their timers so the first in-band
+     * decision after a (re)init always opens a window rather than closing one. */
+    c->arm_ms  = 0.0f;
+    c->arm_obs = 0u;
+    memset(c->rearm_ms,  0, sizeof c->rearm_ms);
+    memset(c->rearm_obs, 0, sizeof c->rearm_obs);
 
     /*  Positive-rate detector. We pre-arm only when seeded on the ground; a
      *  flying seed (in-flight reboot) starts DISARMED so a reboot mid-climb can
@@ -148,6 +152,11 @@ static poll_profile_t poll_for_state(sm_state_t s)
  *  "50 40 30 20 10" heard on the taxiway. A real go-around climbs through a
  *  re-arm band in a sustained way (>=400 ms above height+margin is a few feet
  *  of climb), while a spike's peak spends at most a poll or two there.
+ *
+ *  As with the ARM_FT dwell, time accrues only from the SECOND consecutive
+ *  in-band decision: the elapsed dt handed to the first one was spent BELOW the
+ *  band. Without that rule a single sample at the 500 ms CRUISE cadence already
+ *  exceeded REARM_SUSTAIN_MS and re-armed a rung in one observation.
  * ------------------------------------------------------------------------- */
 static void rearm_above(sm_ctx_t *c, float agl_ft, float dt_s,
                         const sensor_profile_t *p)
@@ -158,17 +167,29 @@ static void rearm_above(sm_ctx_t *c, float agl_ft, float dt_s,
     }
     for (size_t i = 0; i < n; ++i) {
         if ((c->armed_mask & (1u << i)) != 0u) {
-            c->rearm_ms[i] = 0.0f;         /* already armed: nothing to accrue  */
+            c->rearm_ms[i]  = 0.0f;        /* already armed: nothing to accrue  */
+            c->rearm_obs[i] = 0u;
             continue;
         }
         if (agl_ft > p->callouts[i] + REARM_MARGIN_FT) {
-            c->rearm_ms[i] += dt_s * 1000.0f;
+            /* First in-band decision opens the window but banks NO time: the
+             * elapsed dt belongs to the interval BEFORE this sample, when the
+             * aircraft was still below the band. Only genuinely observed
+             * in-band spans accrue (see sm_ctx_t's observation-counter note). */
+            if (c->rearm_obs[i] < UINT16_MAX) {
+                c->rearm_obs[i]++;
+            }
+            if (c->rearm_obs[i] >= 2u) {
+                c->rearm_ms[i] += dt_s * 1000.0f;
+            }
             if (c->rearm_ms[i] >= (float)REARM_SUSTAIN_MS) {
-                c->armed_mask |= (1u << i);
-                c->rearm_ms[i] = 0.0f;
+                c->armed_mask  |= (1u << i);
+                c->rearm_ms[i]  = 0.0f;
+                c->rearm_obs[i] = 0u;
             }
         } else {
-            c->rearm_ms[i] = 0.0f;         /* dropped out of the band: restart  */
+            c->rearm_ms[i]  = 0.0f;        /* dropped out of the band: restart  */
+            c->rearm_obs[i] = 0u;
         }
     }
 }
@@ -244,6 +265,14 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
      *  two and can never accrue it. Same sustained-confirmation philosophy as
      *  the positive-rate detector below.
      *
+     *  The dwell is accrued only from the SECOND consecutive above-gate decision
+     *  onward. dt_s is the gap since the previous decision — time spent below
+     *  the gate — so crediting it on the first in-band sample handed that sample
+     *  a whole poll period (or a dropped poll's several seconds) of dwell it
+     *  never earned. At the 750 ms GROUND cadence that let two samples, or after
+     *  a gap a single one, latch the entire ladder: precisely the one-spike arm
+     *  this dwell exists to prevent.
+     *
      *  Why arm the higher ones too? A callout only ever FIRES on a genuine
      *  DOWNWARD crossing (see fire_descent_callout), so arming a number we're
      *  still climbing toward is harmless: it simply waits until the aircraft
@@ -257,16 +286,31 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
      *  hysteresis intact (rearm_above still gates RE-arming after a fire).        */
     if (!c->armed) {
         if (agl_ft > ARM_FT) {
-            c->arm_ms += dt_s * 1000.0f;
+            /* The first above-gate decision opens the window but banks NO time.
+             * dt_s measures the interval BEFORE this sample — during which the
+             * aircraft was observed (or unobserved) LOW — so crediting it would
+             * let one spike sample carry a dropped poll's worth of dwell and
+             * latch outright. Requiring a second consecutive in-band decision
+             * makes ARM_DWELL_MS a genuine sustained confirmation at every poll
+             * cadence, including the 750 ms GROUND rate where the taxi-phantom
+             * garbage actually occurred.                                        */
+            if (c->arm_obs < UINT16_MAX) {
+                c->arm_obs++;
+            }
+            if (c->arm_obs >= 2u) {
+                c->arm_ms += dt_s * 1000.0f;
+            }
             if (c->arm_ms >= (float)ARM_DWELL_MS) {
-                c->armed  = true;
-                c->arm_ms = 0.0f;
+                c->armed   = true;
+                c->arm_ms  = 0.0f;
+                c->arm_obs = 0u;
                 for (size_t i = 0; i < p->n_callouts; ++i) {
                     c->armed_mask |= (1u << i);
                 }
             }
         } else {
-            c->arm_ms = 0.0f;   /* dipped back below the gate: start over */
+            c->arm_ms  = 0.0f;   /* dipped back below the gate: start over */
+            c->arm_obs = 0u;
         }
     }
 

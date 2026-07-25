@@ -29,7 +29,13 @@ hear supply-correlated whine, add a small inline aux ground-loop isolator on L/R
 
 ## 2. Pin map (defaults — `config.h`)
 
-### SF30 lidar → ESP32-S3 (UART1, 115200 8N1)
+### SF30 lidar → ESP32-S3 (UART1, 460800 8N1)
+
+> **Baud must match `SF30C_BAUD` in `config.h` (currently 460800).** Set the
+> Serial port baud to the same value in LightWare Studio, with Output type set to
+> **"Distance over Serial"** — the SF30/C's legacy 2-byte stream, not the LWNX
+> binary protocol. A mismatch here reads as a dead sensor: the box chirps at
+> boot and stays silent.
 
 The SF30/C exits on a **7-conductor cable**; the wire **colors are fixed by
 LightWare** (Table 4 of the SF30/C manual). We only use four of them — TXD, RXD,

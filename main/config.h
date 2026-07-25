@@ -46,9 +46,9 @@
 #define DEMO_MODE 0                 /* compiled OUT unless the build defines it */
 #endif
 #if DEMO_MODE
-#define FIRMWARE_VERSION "v1.60-DEMO"
+#define FIRMWARE_VERSION "v1.61-DEMO"
 #else
-#define FIRMWARE_VERSION "v1.60"
+#define FIRMWARE_VERSION "v1.61"
 #endif
 
 /* ---- Sensor model identifiers ------------------------------------------- */
@@ -213,7 +213,11 @@
  *  RE-arming after a go-around) now requires the height to HOLD continuously,
  *  mirroring the sustained-confirmation pattern the positive-rate detector has
  *  always used. A real climb-out spends many seconds above ARM_FT so the dwell
- *  is imperceptible; a one-poll spike (25-750 ms) can never satisfy it.
+ *  is imperceptible; a one-poll spike can never satisfy it — the state machine
+ *  banks dwell only from the SECOND consecutive in-band decision, because the
+ *  elapsed time handed to the first was spent BELOW the gate. (Crediting that
+ *  first interval is what once let two 750 ms GROUND polls — or one poll after
+ *  a dropped read — arm the whole ladder; see rearm_above/sm_step.)
  *  REARM_SUSTAIN_MS is shorter than ARM_DWELL_MS: it only re-enables single
  *  already-proven callouts on a go-around, where a >=400 ms hold above
  *  height+REARM_MARGIN_FT is trivially true for any genuine climb.             */

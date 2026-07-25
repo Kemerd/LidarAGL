@@ -35,6 +35,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_pm.h"        /* NO_LIGHT_SLEEP lock — keep the I2S clock alive while playing */
+#include "esp_task_wdt.h"  /* audio_task subscribes to the TWDT                          */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -57,11 +58,30 @@ static bool              s_running = false;
  *  light-sleep to save power while it is silent. NULL if PM is not built in.        */
 static esp_pm_lock_handle_t s_pm_lock = NULL;
 
+/*  CPU_FREQ_MAX lock. sdkconfig documents "the audio task forces 240 MHz when
+ *  active", but NO_LIGHT_SLEEP alone does not raise the DFS frequency: it only
+ *  inhibits sleep. With PM enabled and a 40 MHz DFS floor, the render loop was
+ *  running at the floor (or 80 MHz while the I2S driver held its own APB lock)
+ *  — never the configured 240 MHz max. That matters because the loop pays two
+ *  powf() per sample at 16 kHz plus tanhf under voice, concurrent with 20 ms
+ *  logic ticks and 25 ms sensor drains on final: the phase with the least
+ *  headroom is the one the box must never stutter in. Held for exactly as long
+ *  as the channel is enabled, alongside s_pm_lock. NULL if PM is not built in. */
+static esp_pm_lock_handle_t s_pm_freq_lock = NULL;
+
 /*  Suspend REQUEST from the logic task. Only the audio task acts on it (it is the
  *  single owner of the I2S channel), so a render write can never race a disable
  *  done on another core — which is what produced the harmless but noisy
  *  "channel not enabled" driver errors. See audio_suspend() / audio_task().      */
 static volatile bool     s_suspend_req = false;
+
+/*  Pending in-flight sensor-failure alert (set by the logic task, cleared by the
+ *  audio task when it arms the chirp). Deliberately NOT routed through the
+ *  callout queue: the alert's whole purpose is to be heard when the sensor dies
+ *  at CRUISE, which is precisely when the channel is SUSPENDED and the queue is
+ *  being drained-and-discarded. A pending alert therefore also forces a resume,
+ *  overriding the suspend request until the chirp has been armed.               */
+static volatile bool     s_alert_req = false;
 
 /*  Resolved runtime behaviour (channel layout + which streams are live). Set by
  *  audio_init() from the boot config; read in the render loop. Defaults are
@@ -391,11 +411,25 @@ void audio_init(const audio_config_t *cfg)
     if (s_pm_lock) {
         esp_pm_lock_acquire(s_pm_lock);
     }
+
+    /* The CPU-frequency half of the guard: without it DFS keeps the core at its
+     * 40/80 MHz floor throughout playback, which is NOT what sdkconfig.defaults
+     * promises and leaves the render loop short of headroom exactly when the
+     * workload peaks (tone + vario blips + a callout clip on short final).      */
+    esp_err_t freqerr = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "audio_cpu",
+                                           &s_pm_freq_lock);
+    if (freqerr != ESP_OK) {
+        s_pm_freq_lock = NULL;
+    }
+    if (s_pm_freq_lock) {
+        esp_pm_lock_acquire(s_pm_freq_lock);
+    }
     /* TEMP DEBUG: confirm the no-light-sleep guard is actually live. If this says
      * UNAVAILABLE, PM locks aren't compiled in; if HELD but stalls persist, then
      * light-sleep is not what's gating the I2S clock and we look elsewhere.        */
-    ESP_LOGW(TAG, "PM no-light-sleep lock: %s (create=%s)",
-             s_pm_lock ? "HELD" : "UNAVAILABLE", esp_err_to_name(pmerr));
+    ESP_LOGW(TAG, "PM locks: no-light-sleep=%s (%s)  cpu-freq-max=%s (%s)",
+             s_pm_lock ? "HELD" : "UNAVAILABLE", esp_err_to_name(pmerr),
+             s_pm_freq_lock ? "HELD" : "UNAVAILABLE", esp_err_to_name(freqerr));
 
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx));
     s_running = true;
@@ -696,6 +730,15 @@ void audio_play_chirp(void)
     audio_play_clip_blocking(callout_chirp());
 }
 
+void audio_request_sensor_alert(void)
+{
+    /* Single flag, single writer (logic task), single clearer (audio task). A
+     * repeat request that lands before the previous chirp is armed simply
+     * coalesces into it — the logic task rate-limits the alert anyway, and two
+     * chirps in a row carry no more information than one.                      */
+    s_alert_req = true;
+}
+
 /* ---------------------------------------------------------------------------
  *  Suspend / resume around light-sleep
  * ------------------------------------------------------------------------- */
@@ -919,7 +962,19 @@ void audio_task(void *arg)
     uint32_t dbg_frames = 0, dbg_clip = 0, dbg_stall = 0, dbg_part = 0;
     float    dbg_peak = 0.0f;
 
+    /*  Task-watchdog subscription. This loop is the box's only voice: if it
+     *  wedges (an I2S driver call that stops returning, a write that times out
+     *  forever) the tone and every callout vanish while the rest of the firmware
+     *  runs on, happily deciding things nobody can hear. Its blocking calls are
+     *  all bounded — a 100 ms write timeout and the 20 ms suspended idle — so a
+     *  healthy pass always reaches the feed. A trip resets, and the boot path
+     *  re-seeds an airborne state with the ladder hot.                         */
+    esp_task_wdt_add(NULL);
+
     for (;;) {
+        /* Feed at the top: the suspended-idle path continues from mid-loop. */
+        esp_task_wdt_reset();
+
         /* Single-owner channel control: apply the logic task's suspend/resume
          * REQUEST here, so THIS task is the only code that ever enables or
          * disables the I2S channel. That removes the cross-core race that briefly
@@ -927,14 +982,26 @@ void audio_task(void *arg)
          * "channel not enabled" errors and the resume-time write timeouts). On
          * suspend we also reset the tone envelopes so a later descent ramps
          * cleanly from silence.                                                  */
-        if (s_suspend_req && s_running) {
+        /* A pending sensor-failure alert outranks the suspend request: the
+         * failure it announces happens at CRUISE, where the channel is already
+         * suspended and would otherwise swallow the chirp entirely. Holding the
+         * channel up for the duration of the alert is the only way the pilot
+         * hears it; the logic task's normal policy re-suspends afterwards.     */
+        bool suspend_req = s_suspend_req && !s_alert_req;
+
+        if (suspend_req && s_running) {
             i2s_channel_disable(s_tx);
             /* Channel is down: drop the NO_LIGHT_SLEEP lock so the box can actually
              * light-sleep and save power while it is silent (GROUND/CRUISE).        */
             if (s_pm_lock) {
                 esp_pm_lock_release(s_pm_lock);
-                ESP_LOGW(TAG, "PM lock RELEASED (audio suspended)");  /* TEMP DEBUG */
             }
+            /* Drop the frequency floor too — a silent channel has no deadline to
+             * meet, and holding 240 MHz through a whole cruise leg is pure heat. */
+            if (s_pm_freq_lock) {
+                esp_pm_lock_release(s_pm_freq_lock);
+            }
+            ESP_LOGW(TAG, "PM locks RELEASED (audio suspended)");  /* TEMP DEBUG */
             s_running    = false;
             s_gain_cur   = 0.0f;   /* ramp the tone back up from silence on resume */
             s_duck_cur   = 1.0f;   /* un-duck so the next descent starts full tone  */
@@ -954,14 +1021,28 @@ void audio_task(void *arg)
             s_clip_pcm   = NULL;
             s_clip_len   = 0;
             s_clip_pos   = 0;
-        } else if (!s_suspend_req && !s_running) {
-            /* Re-arm the clock guard BEFORE enabling so resume clocks out cleanly. */
+        } else if (!suspend_req && !s_running) {
+            /* Re-arm the clock guards BEFORE enabling so resume clocks out cleanly
+             * and the first frames already render at full CPU speed.              */
             if (s_pm_lock) {
                 esp_pm_lock_acquire(s_pm_lock);
-                ESP_LOGW(TAG, "PM lock ACQUIRED (audio resumed)");  /* TEMP DEBUG */
             }
+            if (s_pm_freq_lock) {
+                esp_pm_lock_acquire(s_pm_freq_lock);
+            }
+            ESP_LOGW(TAG, "PM locks ACQUIRED (audio resumed)");  /* TEMP DEBUG */
             i2s_channel_enable(s_tx);
             s_running = true;
+        }
+
+        /* Arm the sensor-failure chirp now that the channel is guaranteed up.
+         * It pre-empts any clip in progress: a half-spoken altitude describes a
+         * reading we no longer trust, so the warning is the more useful sound.
+         * Cleared here (not at request time) so a request arriving while the
+         * channel was down is still honoured once it comes back.               */
+        if (s_alert_req && s_running) {
+            s_alert_req = false;
+            start_clip(callout_chirp());
         }
 
         /* Pick up a queued callout (non-blocking) and start it if idle. When the

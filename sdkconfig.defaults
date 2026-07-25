@@ -51,5 +51,24 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 #  can keep a modest stack.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 
+# ---- Task watchdog ----------------------------------------------------------
+#  The three flight-critical loops (sensor, logic, audio) subscribe themselves
+#  to the TWDT and feed it each pass; see app_main.c. The IDF default only
+#  watches the IDLE tasks, which cannot detect the failure that actually
+#  matters here: all three loops block POLITELY (bounded queue waits, vTaskDelay,
+#  100 ms I2S timeouts), so a task wedged inside a driver call leaves the idle
+#  tasks running happily and nothing ever fires. The box just goes silent —
+#  no reset, no chirp, no cue for the pilot to power-cycle.
+#
+#  PANIC=y is the point of the exercise: a reset RECOVERS. The boot path already
+#  reconstructs an airborne state and seeds the ladder hot (see the airborne
+#  seeding in app_main), so a watchdog reset in flight costs a few seconds of
+#  audio and then resumes calling the approach. Staying wedged costs the whole
+#  approach. Timeout is generous versus the slowest loop pass (GROUND polls at
+#  750 ms, the stale-sample watchdog kicks at 2 s) so only a true hang trips it.
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
 # ---- Compiler ---------------------------------------------------------------
 CONFIG_COMPILER_OPTIMIZATION_PERF=y

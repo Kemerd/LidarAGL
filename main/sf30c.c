@@ -21,6 +21,7 @@
 #include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
 #include "esp_timer.h"   /* bench raw-byte dump throttle + filter dt           */
+#include "esp_task_wdt.h" /* sensor_task subscribes to the TWDT                */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -460,7 +461,16 @@ void sensor_task(void *arg)
 {
     (void)arg;
 
+    /*  Task-watchdog subscription. Every reading the box reasons about comes
+     *  through this loop, and it blocks only on bounded UART reads plus its own
+     *  cadence delay — so if it stops feeding, it is genuinely wedged (a driver
+     *  call that never returns), not merely idle. Without this the box would go
+     *  permanently blind with no reset and nothing audible to tell the pilot.  */
+    esp_task_wdt_add(NULL);
+
     for (;;) {
+        esp_task_wdt_reset();
+
         float range_ft;
         bool  valid;
         if (sf30c_read_latest_ft(&range_ft, &valid)) {

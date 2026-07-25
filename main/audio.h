@@ -129,6 +129,26 @@ void audio_request_callout(callout_id_t id);
 void audio_play_chirp(void);
 
 /**
+ * @brief Request the in-flight sensor-failure alert chirp (logic task, async).
+ *
+ * @details Non-blocking counterpart to audio_play_chirp(), safe to call from the
+ *          logic task while the render tasks are running. It exists for the
+ *          failed-silent case the boot chirp cannot cover: if the LiDAR dies at
+ *          cruise — connector vibrated loose, sensor unpowered — the tone was
+ *          already inactive above the tone band, so muting it is audibly a
+ *          no-op and the box goes quiet with no indication. A pilot trained to
+ *          expect the callout ladder would then discover the failure on short
+ *          final, or misread silence as "not yet at the first callout".
+ *
+ *          The request FORCES a resume of a suspended channel (a CRUISE
+ *          suspend is exactly when this fires), plays the chirp ahead of any
+ *          queued callout, and lets the normal suspend policy take the channel
+ *          back down afterwards. The logic task rate-limits repeats; this layer
+ *          only guarantees the alert is heard.
+ */
+void audio_request_sensor_alert(void);
+
+/**
  * @brief Synchronously play one clip to completion (centered, full level).
  *
  * @param c  Clip to play; NULL / absent clips are skipped silently.
