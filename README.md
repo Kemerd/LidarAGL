@@ -144,7 +144,7 @@ sensor's own memory, so it's a per-sensor, one-time job.
 
 | Studio parameter | Set to | Why |
 |------------------|--------|-----|
-| **Serial port baud rate** | **921600** | Must equal `SF30C_BAUD` (also 921600 — the factory default). A mismatch yields `n=0` (huge mismatch) or a `CE`-heavy garbage stream decoding to ~328 ft (~2× mismatch). Lower both sides together (e.g. 115200) for more cable margin if you like — just keep them equal. |
+| **Serial port baud rate** | **460800** | Must equal `SF30C_BAUD` in `main/config.h` — **460800 as shipped**. This is a SENSOR-side setting stored in the SF30's own memory: the legacy `#` command set has **no baud command**, so the firmware genuinely cannot set or fix it over the wire — Studio is the only place. A mismatch yields `n=0` (huge mismatch) or a `CE`-heavy garbage stream decoding to ~328 ft (~2× mismatch). Want a different rate for cable margin? Change BOTH sides together (Studio + `SF30C_BAUD`) and rebuild. |
 | **Output type** | **Distance over Serial** | The only mode that streams on the UART pins. Factory default *"Distance over USB"* puts nothing on the serial port. |
 | **Exposure time** | **12793 µs (78 / sec)** | Long exposure = best precision; staying **under 500 / sec keeps the rated ±5 cm** (above it the spec drops to ±10 cm). |
 | **Serial port output rate** | **78 / sec** | Matches the sampling rate; ~156 B/s at 115200 — trivial load for the ESP32, plenty fresh for flare callouts. |
@@ -160,6 +160,13 @@ sensor's own memory, so it's a per-sensor, one-time job.
 > explicitly advises slower rates for altimetry). Drop to **39 / sec** for the
 > longest exposure / best precision if you find that fast enough near the ground;
 > never exceed **312 / sec** or you cross the ±5 cm → ±10 cm accuracy line.
+>
+> **Got the two Studio rows wrong?** The unit can't hear the sensor at all —
+> and since **v1.60** that state announces itself instead of failing silent: the
+> boot ground-fill comes up empty, the box plays a warning **chirp** and logs
+> `SENSOR SILENT at boot`, and the console repeats `no sensor data yet (LiDAR
+> silent / miswired?)` about once a second until data appears. If you hear that
+> chirp on a bench boot, check **baud** and **Output type** in Studio first.
 
 ### 2) PCM5102A DAC → ESP32-S3 — I2S
 
@@ -440,7 +447,8 @@ to mono still works perfectly — the lean just isn't there.
 
 ### Prerequisites
 
-- **ESP-IDF v5.x or newer** (developed against **v6.0.1**) — the Espressif toolchain.
+- **ESP-IDF v6.x** (developed against **v6.0.1**) — the Espressif toolchain. (v5 won't
+  configure: the project lists the v6-era split per-peripheral driver components.)
   Install via the [ESP-IDF installer / VS Code extension](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/get-started/)
   or the offline EIM, then activate its environment so `idf.py` is on your PATH
   (`export.sh` / `export.ps1`, or the EIM-generated PowerShell profile on Windows).
