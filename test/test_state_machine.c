@@ -534,6 +534,48 @@ static void test_multi_threshold_lowest(const sensor_profile_t *p)
 }
 
 /* ---------------------------------------------------------------------------
+ *  crossed_mask: a multi-threshold step must REPORT every crossed rung, not
+ *  just the one (lowest) it speaks. Consumers pairing side-effects to a
+ *  specific height — the "check gear" reminder in app_main — need the full
+ *  set, because a skipped rung's one-shot is already spent and cannot recover
+ *  during the same approach.
+ * ------------------------------------------------------------------------- */
+static void test_crossed_mask_reports_all(const sensor_profile_t *p)
+{
+    char msg[96];
+    sm_ctx_t c;
+    sm_init(&c, ST_GROUND);
+
+    /* Arm and descend normally to 60 ft (higher rungs fire en route). */
+    float scratch[16];
+    float top = p->callouts[0] + REARM_MARGIN_FT + 20.0f;
+    ramp(&c, p, 0.0f, top, +2.0f, scratch, 16);
+    ramp(&c, p, top, 60.0f, -2.0f, scratch, 16);
+
+    /* One step 60 -> 22: every rung in [22, 60) is crossed at once. */
+    sm_out_t out;
+    sm_step(&c, 22.0f, DT, p, &out);
+
+    uint32_t expect_mask = 0u;
+    int      expect_low  = -1;
+    for (size_t i = 0; i < p->n_callouts; ++i) {
+        if (60.0f > p->callouts[i] && 22.0f <= p->callouts[i]) {
+            expect_mask |= (1u << i);
+            expect_low = (int)i;   /* ladders descend: the last hit is lowest */
+        }
+    }
+    snprintf(msg, sizeof msg, "[%s] crossed_mask reports EVERY crossed rung", p->name);
+    ASSERT_TRUE(out.crossed_mask == expect_mask, msg);
+    snprintf(msg, sizeof msg, "[%s] fired callout is the lowest crossed rung", p->name);
+    ASSERT_TRUE(out.fired_callout == expect_low, msg);
+
+    /* A quiet tick right after must report an EMPTY crossed set. */
+    sm_step(&c, 21.5f, DT, p, &out);
+    snprintf(msg, sizeof msg, "[%s] no crossing -> crossed_mask == 0", p->name);
+    ASSERT_TRUE(out.crossed_mask == 0u && out.fired_callout < 0, msg);
+}
+
+/* ---------------------------------------------------------------------------
  *  "Positive rate" climb callout. A confirmed-climb detector: armed only once
  *  settled in the flare region (held at/below POSRATE_ARM_FT for the flare
  *  fade-out time), then fires one-shot after a sustained >= POSRATE_MIN_FPS climb
@@ -700,6 +742,7 @@ int main(void)
         test_spike_decay_regression(p);
         test_parked_jitter_disarm(p);
         test_multi_threshold_lowest(p);
+        test_crossed_mask_reports_all(p);
         test_positive_rate(p);
         test_vertical_rate(p);
     }

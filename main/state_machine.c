@@ -227,7 +227,8 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
     bool  had_prev   = c->have_prev;
     float trend      = update_trend(c, agl_ft, dt_s);
 
-    int fired = -1;
+    int      fired        = -1;
+    uint32_t crossed_mask = 0u;   /* every rung crossed downward this tick */
 
     /* --- Arming: the silent climb-out ------------------------------------- */
     /*  Until the aircraft has climbed through ARM_FT for the first time, NO
@@ -301,9 +302,18 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
         /* Fire on a genuine downward crossing. We need a valid previous sample
          * (had_prev) so the very first tick after a boot — which seeds every
          * callout armed for in-flight-reboot recovery — does NOT mistake the
-         * initial reading for a crossing and blurt out every number at once.   */
+         * initial reading for a crossing and blurt out every number at once.
+         *
+         * The armed bits are snapshotted around the fire so the FULL crossed
+         * set can be reported, not just the lowest (spoken) rung: everything
+         * fire_descent_callout disarms this tick was genuinely passed, and a
+         * consumer pairing a side-effect to a specific height (the gear-check
+         * reminder) would otherwise silently lose a rung that a terrain drop
+         * or re-acquire snap stepped over.                                    */
         if (had_prev) {
-            fired = fire_descent_callout(c, prev_agl, agl_ft, p);
+            uint32_t mask_before = c->armed_mask;
+            fired        = fire_descent_callout(c, prev_agl, agl_ft, p);
+            crossed_mask = mask_before & ~c->armed_mask;
         }
     }
 
@@ -394,6 +404,7 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
 
     out->state               = next;
     out->fired_callout       = fired;
+    out->crossed_mask        = crossed_mask;
     out->poll                = poll_for_state(next);
     out->tone_agl            = agl_ft;
     out->tone_active         = tone_active;

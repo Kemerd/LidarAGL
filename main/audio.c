@@ -944,6 +944,16 @@ void audio_task(void *arg)
             s_lpf_l      = 0.0f;   /* drain the mix LPF so resume starts at silence */
             s_lpf_r      = 0.0f;
             s_flare_fade = 1.0f;   /* re-arm the flare fade for the next descent    */
+            /* Purge ALL callout playback state too. A clip frozen mid-word here
+             * would otherwise keep its position and replay its stale tail the
+             * moment the channel resumes — and for a CRUISE suspend that moment
+             * is the start of the NEXT approach: a phantom callout fragment in
+             * flight, the exact failure class the v1.59 filter work was built
+             * to eliminate. A word cut by the suspend is simply lost — the
+             * aircraft left the band it described, so it is stale by definition. */
+            s_clip_pcm   = NULL;
+            s_clip_len   = 0;
+            s_clip_pos   = 0;
         } else if (!s_suspend_req && !s_running) {
             /* Re-arm the clock guard BEFORE enabling so resume clocks out cleanly. */
             if (s_pm_lock) {
@@ -956,10 +966,21 @@ void audio_task(void *arg)
 
         /* Pick up a queued callout (non-blocking) and start it if idle. When the
          * active mode has callouts disabled (tone-only) we still DRAIN the queue
-         * so requests can't pile up, but we never start the clip.              */
+         * so requests can't pile up, but we never start the clip.
+         *
+         * While the channel is SUSPENDED we drain-and-DISCARD instead: this
+         * block used to run before the !s_running idle check, so a request that
+         * arrived during the silent window was dequeued, armed via start_clip(),
+         * and then played — whole and stale — the instant the channel resumed.
+         * Nothing may arm while the channel is down.                            */
         callout_id_t id;
-        if (s_clip_pcm == NULL && q_callouts &&
-            xQueueReceive(q_callouts, &id, 0) == pdTRUE) {
+        if (!s_running) {
+            while (q_callouts && xQueueReceive(q_callouts, &id, 0) == pdTRUE) {
+                /* discarded: a callout requested while silent describes a band
+                 * the aircraft has left by the time we can speak again          */
+            }
+        } else if (s_clip_pcm == NULL && q_callouts &&
+                   xQueueReceive(q_callouts, &id, 0) == pdTRUE) {
             if (s_cfg.callouts_enabled) {
                 start_clip(callout_clip(id));
             }

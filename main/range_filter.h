@@ -39,8 +39,13 @@
  *            4. RE-ACQUISITION — a genuine level step (terrain edge on final,
  *               in-flight power-up) must not be held forever: when
  *               RANGE_REACQUIRE_N consecutive rejected values AGREE with each
- *               other, the filter accepts the new level and re-seeds. Random
- *               corruption doesn't cluster, so garbage can never re-acquire.
+ *               other AND the agreeing cluster was backed by at least
+ *               RANGE_REACQUIRE_MIN_SAMPLES raw samples, the filter accepts
+ *               the new level and re-seeds (the window is pre-filled to
+ *               HAMPEL_SEED_N at the new level so the gate is live again on
+ *               the very next poll). Random corruption doesn't cluster, and a
+ *               short self-consistent burst can't muster the sample mass at
+ *               the fast cadences, so garbage can never re-acquire.
  *
  *            5. TIME-CORRECTED EMA — the final smoothing uses
  *               alpha = 1 - exp(-dt / RANGE_EMA_TAU_S), so the filter has ONE
@@ -110,6 +115,9 @@ typedef struct {
     /* --- Re-acquisition tracker (stage 4).                                   */
     float    pend_mean;    /**< Running mean of the agreeing rejected values.  */
     uint32_t pend_n;       /**< How many consecutive rejects agreed so far.    */
+    uint32_t pend_samples; /**< RAW samples backing those agreeing rejects —   */
+                           /**< the snap needs sample MASS, not just polls, so */
+                           /**< 1-2-sample fast-cadence drains can't fake it.  */
 
     /* --- Output (stage 5).                                                   */
     float    ema_ft;       /**< Published smoothed range (ft).                 */

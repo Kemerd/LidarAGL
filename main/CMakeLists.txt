@@ -93,4 +93,10 @@ idf_component_register(
 if(NOT CMAKE_SCRIPT_MODE_FILE AND DEMO_MODE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE DEMO_MODE=1)
     message(STATUS "LidarAGL: DEMO_MODE build — scaled-AGL show firmware")
+elseif(NOT CMAKE_SCRIPT_MODE_FILE)
+    #  State the mode POSITIVELY on every configure, so a stale sticky cache is
+    #  visible in the build log — and note the firmware itself now embeds the
+    #  discriminator too (FIRMWARE_VERSION gains a "-DEMO" suffix in demo
+    #  images), so the boot banner alone identifies which image is on a unit.
+    message(STATUS "LidarAGL: FLIGHT build (DEMO_MODE off)")
 endif()

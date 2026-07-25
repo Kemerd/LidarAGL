@@ -34,8 +34,22 @@
  *  banner (app_main.c) so a `idf.py monitor` / bench capture immediately shows
  *  which firmware a box is running, and it lives here in the pure-logic region
  *  so the host tests + the WASM emulator can read the same constant without
- *  pulling in any ESP-IDF headers.                                            */
-#define FIRMWARE_VERSION "v1.59"
+ *  pulling in any ESP-IDF headers.
+ *
+ *  DEMO builds carry an unmissable "-DEMO" suffix. The -DDEMO_MODE flag is
+ *  STICKY in a build directory's CMake cache (see main/CMakeLists.txt), so a
+ *  plain `idf.py build` can silently keep producing demo images — and a demo
+ *  image on the AIRCRAFT self-arms its AGL scaling with no USB attach. The
+ *  boot banner must therefore be a POSITIVE discriminator between the two
+ *  images, not leave identification to the easily-missed demo chirp.           */
+#ifndef DEMO_MODE
+#define DEMO_MODE 0                 /* compiled OUT unless the build defines it */
+#endif
+#if DEMO_MODE
+#define FIRMWARE_VERSION "v1.60-DEMO"
+#else
+#define FIRMWARE_VERSION "v1.60"
+#endif
 
 /* ---- Sensor model identifiers ------------------------------------------- */
 /*  Mirror of the enum in sensor_profile.h, expressed as plain ints so this
@@ -114,10 +128,21 @@
  *  power-up over new ground) must not be held forever. When this many
  *  CONSECUTIVE rejected medians agree with each other within the band, the
  *  filter accepts the new level and re-seeds. Random garbage does not cluster,
- *  so corruption cannot re-acquire; a genuine step gets through in N polls
- *  (75 ms at the DESCENT cadence — invisible in the flare).                    */
+ *  so corruption cannot re-acquire.
+ *
+ *  The poll count alone is NOT enough evidence at the fast cadences: a DESCENT
+ *  drain holds only ~2 raw samples (78 Hz x 25 ms), so its "median" carries no
+ *  minority immunity, and three polls of a SELF-CONSISTENT corrupt burst (a
+ *  stuck byte pattern repeating for ~75 ms, cleanly framed so the UART error
+ *  sweep never sees it) could once force a false snap and fire a phantom low
+ *  callout on final. The agreeing cluster must therefore ALSO have been backed
+ *  by a minimum number of RAW samples. At the GROUND cadence a single drain
+ *  (~58 samples) satisfies this instantly — behaviour there is unchanged; at
+ *  DESCENT a genuine step now takes ~4 polls (~100 ms, still invisible in the
+ *  flare) while a false snap needs corruption to dominate the whole window.    */
 #define RANGE_REACQUIRE_N       3     /* agreeing rejects that force acceptance */
 #define RANGE_REACQUIRE_BAND_FT 8.0f  /* how tightly the rejects must agree     */
+#define RANGE_REACQUIRE_MIN_SAMPLES 8u /* raw samples that must back the cluster */
 
 /*  Sensor-ceiling sanity: a return farther than the active profile's
  *  max_range_ft plus this margin is physically impossible (the SF30/C cannot
@@ -163,8 +188,22 @@
 /* ---- State machine (ft AGL) --------------------------------------------- */
 /*  ARM_FT is intentionally global (same for both sensors): the climb-out after
  *  takeoff is silent until the aircraft has climbed through it, which arms the
- *  descent callouts. CRUISE_FT and the callout list are per-PROFILE, not here. */
+ *  descent callouts. CRUISE_FT and the callout list are per-PROFILE, not here.
+ *
+ *  DEMO builds lower the gate to half the demo sweep: at the x50 default gain a
+ *  24-inch rig throw tops out at exactly 100 ft scaled, so the flight gate of
+ *  100 ft could NEVER be climbed through and the box would stay disarmed (and
+ *  silent) forever. Arming at 50 ft (~12 real inches) lets a full hoist arm the
+ *  ladder while the dwell still rejects one-poll spikes. (The fallback guard is
+ *  needed here because this line sits above the documented DEMO_MODE section.)  */
+#ifndef DEMO_MODE
+#define DEMO_MODE         0            /* compiled OUT unless the build defines it */
+#endif
+#if DEMO_MODE
+#define ARM_FT            50.0f        /* demo rig: arm at half the scaled sweep */
+#else
 #define ARM_FT            100.0f       /* arm descent callouts above this        */
+#endif
 #define REARM_MARGIN_FT   20.0f        /* climb this far back above a callout    */
                                        /* height to re-arm it (go-around).       */
 
@@ -205,6 +244,20 @@
  *  If the sensor goes silent, this timeout forces a decision tick on the held
  *  value anyway so dwell timers (parked disarm, posrate) keep accruing.         */
 #define SAMPLE_STALE_MS   2000u        /* force a decision tick after this long  */
+
+/*  No-data tone mute (fail-safe; enforced in logic_task). The range filter
+ *  deliberately HOLDS its last-good output through a lost-signal stretch (over
+ *  water, a dark wet runway — the sensor's own documented no-return cases) so
+ *  momentary dropouts never twitch the audio. But the presence tone encodes
+ *  ALTITUDE as PITCH: held long enough, that hold becomes an actively
+ *  misleading "altitude steady" cue while the aircraft may in fact still be
+ *  descending. The logic task therefore tracks wall-clock time since the last
+ *  FRESH sample the filter marked VALID and force-mutes the tone once the data
+ *  is older than this bound; the first live sample restores it instantly.
+ *  Silence == "no data" — an honest cue; a frozen pitch is a wrong one.
+ *  Sized well clear of the active-state poll gaps (ARMED 50 ms / DESCENT
+ *  25 ms); GROUND/CRUISE never sound the tone, so their slow polls don't care. */
+#define LOST_SIGNAL_MUTE_MS 1000u      /* data older than this mutes the tone    */
 
 /* ---- Per-state poll cadence (ms between sensor reads) -------------------- */
 /*  One place defines the power/latency policy; set_poll_profile() maps state
@@ -635,14 +688,26 @@
  *  level announces itself with a DOUBLE chirp since no "demo" voice clip exists.
  *  The choice persists in NVS; OFF (stored 0) makes the demo image behave
  *  exactly like flight firmware. Each real foot above the learned ground reads
- *  as <gain> feet of AGL, so at the x200 default 2 ft of pulley travel == 400 ft
- *  of demo altitude. A fresh/wiped demo unit boots straight into the default —
- *  no menu visit required before the show.                                      */
+ *  as <gain> feet of AGL, so at the x50 default 2 ft of pulley travel == 100 ft
+ *  of demo altitude — the full callout ladder rides the whole rig throw. A
+ *  fresh/wiped demo unit boots straight into the default — no menu visit
+ *  required before the show.                                                    */
 #ifndef DEMO_MODE
 #define DEMO_MODE            0       /* compiled OUT unless the build defines it */
 #endif
-#define DEMO_GAIN_DEFAULT    200.0f  /* fresh demo unit: 2 ft real == 400 ft demo */
+#define DEMO_GAIN_DEFAULT    50.0f   /* fresh demo unit: 2 ft real == 100 ft demo */
 #define NVS_KEY_DEMOGAIN     "demogain"  /* u16: demo AGL gain (0 == OFF)         */
+
+/*  Show-floor feature defaults. A booth unit should demonstrate the full voice
+ *  repertoire out of the box — "check gear", "positive rate" and the sink-rate
+ *  vario blip — without anyone crawling through the config menu first. In DEMO
+ *  builds the NVS loaders therefore treat an ABSENT key as ON (flight builds
+ *  keep their safety-first OFF defaults); an explicit menu choice still wins
+ *  either way, because a stored value is always honoured over the default.
+ *  Gear-check defaults to 200 ft (the flight menu's top SF30/C option). Note the
+ *  standard x50 sweep tops out at 100 ft, so demoing the gear call needs a
+ *  taller hoist or a bigger gain from LEVEL 9 — that's the booth's call.         */
+#define DEMO_GEAR_CHECK_DEFAULT_FT 200.0f /* demo: gear reminder on the 200 call  */
 
 /*  Demo "parked" watchdog band, in REAL feet. The state machine's own 30 s
  *  ground-dwell disarm evaluates its parked test on the SCALED AGL, where its

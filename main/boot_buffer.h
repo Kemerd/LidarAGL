@@ -322,10 +322,17 @@ size_t boot_buffer_load(boot_entry_t *out, size_t cap);
  * @param stored        Stored ground entries.
  * @param n_stored      Number of stored entries.
  * @param current_ft    The fresh current reading in feet.
+ * @param have_current  True when @p current_ft is REAL sensor data (a live read
+ *                      or a ground-fill fallback). False means the sensor never
+ *                      spoke this boot and @p current_ft is only a caller-side
+ *                      initialiser — with no stored reference that case MUST
+ *                      take the emergency-offset path and raise calib_error,
+ *                      never adopt the fabricated value as a perfect ground.
  * @param[out] result   Filled with ground ref, boot AGL, airborne & error flags.
  */
 void boot_buffer_resolve(const boot_entry_t *stored, size_t n_stored,
-                         float current_ft, boot_result_t *result);
+                         float current_ft, bool have_current,
+                         boot_result_t *result);
 
 /**
  * @brief Persist a fresh set of on-ground readings — the ONE NVS write per boot.

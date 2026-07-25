@@ -92,6 +92,17 @@ typedef struct {
 typedef struct {
     sm_state_t     state;          /**< New (or unchanged) state.             */
     int            fired_callout;  /**< Index into profile->callouts, or -1.  */
+    uint32_t       crossed_mask;   /**< One bit per callout index the aircraft */
+                                   /**< crossed DOWNWARD this tick — including */
+                                   /**< the rungs a multi-threshold step (a    */
+                                   /**< terrain drop, a re-acquire snap)       */
+                                   /**< skipped over. Only the LOWEST speaks   */
+                                   /**< (fired_callout), but consumers pairing */
+                                   /**< side-effects to a specific height —    */
+                                   /**< the "check gear" reminder — must see   */
+                                   /**< EVERY crossed rung, because a skipped  */
+                                   /**< rung is already disarmed and can never */
+                                   /**< recover during the same approach.      */
     poll_profile_t poll;           /**< Poll profile to apply.                */
     float          tone_agl;       /**< AGL to hand the audio engine.         */
     bool           tone_active;    /**< Whether the presence tone should play. */

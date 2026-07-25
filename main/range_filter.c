@@ -98,7 +98,8 @@ static void accept_value(range_filter_t *f, float v, float dt_s)
         f->ema_ft += alpha * (v - f->ema_ft);
     }
     win_push(f, v);
-    f->pend_n = 0;
+    f->pend_n       = 0;
+    f->pend_samples = 0;
 }
 
 /* ===========================================================================
@@ -207,25 +208,49 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
             if (f->pend_n > 0 &&
                 fabsf(med - f->pend_mean) <= RANGE_REACQUIRE_BAND_FT) {
                 /* Consecutive reject AGREEING with the previous ones: running
-                 * mean so the accepted level is the cluster's centre.          */
+                 * mean so the accepted level is the cluster's centre. The raw
+                 * sample count rides along — see the MIN_SAMPLES test below.   */
                 f->pend_mean += (med - f->pend_mean) / (float)(f->pend_n + 1u);
                 ++f->pend_n;
+                f->pend_samples += (uint32_t)n_valid;
             } else {
                 /* First reject, or it disagrees with the pending cluster:
                  * start a fresh cluster on this value.                         */
-                f->pend_mean = med;
-                f->pend_n    = 1;
+                f->pend_mean    = med;
+                f->pend_n       = 1;
+                f->pend_samples = (uint32_t)n_valid;
             }
 
-            if (f->pend_n >= (uint32_t)RANGE_REACQUIRE_N) {
-                /* A REAL level step: N consecutive rejects agreed. Snap to the
-                 * cluster (decisive — three polls of consistent evidence) and
-                 * re-seed the window on the new level.                         */
+            if (f->pend_n >= (uint32_t)RANGE_REACQUIRE_N &&
+                f->pend_samples >= (uint32_t)RANGE_REACQUIRE_MIN_SAMPLES) {
+                /* A REAL level step: N consecutive rejects agreed AND enough
+                 *  raw samples backed them. The second condition is what stops
+                 *  a fast-cadence false snap: a DESCENT drain is only ~2 raw
+                 *  samples, so its "median" has no minority immunity and poll
+                 *  count alone let ~75 ms of self-consistent corruption (a
+                 *  stuck, cleanly-framed byte pattern) re-acquire. Sample MASS
+                 *  makes the evidence cadence-independent: a GROUND drain
+                 *  (~58 samples) satisfies it in one poll as before, while at
+                 *  DESCENT a genuine step needs ~4 polls (~100 ms — still
+                 *  invisible in the flare).                                    */
                 f->win_n    = 0;
                 f->win_head = 0;
                 float level = f->pend_mean;
                 f->have_out = false;         /* seed the EMA at the new level  */
                 accept_value(f, level, dt_s);
+                /* Pre-fill the Hampel window to HAMPEL_SEED_N with the new
+                 *  level so the gate is LIVE again from the very next poll.
+                 *  accept_value() pushed one copy; left there, the seed phase
+                 *  (win_n < HAMPEL_SEED_N) would bypass the gate for the next
+                 *  TWO polls — and at the fast cadences a drain is 1-2 raw
+                 *  samples, so a single corrupted pair could ride ungated into
+                 *  the EMA exactly when corruption is most likely still in
+                 *  progress. Identical seeds give MAD == 0, so the
+                 *  HAMPEL_MAD_FLOOR_FT floor keeps the fresh gate meaningful,
+                 *  anchored at the newly accepted level.                       */
+                while (f->win_n < HAMPEL_SEED_N) {
+                    win_push(f, level);
+                }
                 *fresh_valid = true;
                 *range_ft    = f->ema_ft;
                 return true;

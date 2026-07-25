@@ -215,6 +215,77 @@ static void test_reacquire_real_step(void)
 }
 
 /* ---------------------------------------------------------------------------
+ *  Stage 4b: re-acquisition needs sample MASS, not just polls (fast cadence).
+ * ------------------------------------------------------------------------- */
+static void test_reacquire_needs_sample_mass(void)
+{
+    range_filter_t f;
+    rf_init(&f, SF30C_PROFILE.max_range_ft);
+    settle_on_ground(&f, 6);
+
+    /*  DESCENT cadence: a 25 ms poll catches only ~2 raw samples, so a drain
+     *  "median" there is really a mean-of-2 with zero minority immunity. Three
+     *  agreeing polls (the old, poll-count-only rule) are just ~6 samples of a
+     *  self-consistent burst — 75 ms of a stuck, cleanly-framed byte pattern
+     *  once forced a false snap and a phantom low callout on final. The
+     *  cluster must now ALSO bank RANGE_REACQUIRE_MIN_SAMPLES raw samples:
+     *  the first three 2-sample polls stay HELD, the fourth (8 banked)
+     *  re-acquires — a genuine terrain step still lands in ~100 ms, which
+     *  remains invisible in the flare.                                        */
+    const float cm150 = 150.0f / CM_TO_FT;
+    bool fresh = false;
+    float ft;
+    for (int i = 0; i < 3; ++i) {
+        push_n(&f, cm150, 2);
+        ft = fin(&f, 0.025f, &fresh);
+        ASSERT_TRUE(!fresh,          "2-sample drains: poll count alone can't snap");
+        ASSERT_NEAR(ft, 3.0f, 0.4f,  "still holding last-good through the burst");
+    }
+    push_n(&f, cm150, 2);
+    ft = fin(&f, 0.025f, &fresh);
+    ASSERT_TRUE(fresh,               "4th agreeing poll banks the mass -> re-acquire");
+    ASSERT_NEAR(ft, 150.0f, 1.5f,    "fast-cadence re-acquire snaps to the level");
+}
+
+/* ---------------------------------------------------------------------------
+ *  Stage 4c: the Hampel gate is LIVE on the very next poll after a re-acquire.
+ * ------------------------------------------------------------------------- */
+static void test_hampel_live_after_reacquire(void)
+{
+    range_filter_t f;
+    rf_init(&f, SF30C_PROFILE.max_range_ft);
+    settle_on_ground(&f, 6);
+
+    /* Force a legitimate re-acquire onto a 150 ft level (GROUND-size drains
+     * bank the sample mass instantly, so this snaps in RANGE_REACQUIRE_N).    */
+    const float cm150 = 150.0f / CM_TO_FT;
+    bool fresh = false;
+    float ft = 0.0f;
+    for (int i = 0; i < 8 && !fresh; ++i) {
+        push_n(&f, cm150, 58);
+        ft = fin(&f, 0.75f, &fresh);
+    }
+    ASSERT_TRUE(fresh, "precondition: level re-acquired at 150 ft");
+
+    /*  The window used to be re-seeded with a SINGLE value, leaving the gate
+     *  bypassed (win_n < HAMPEL_SEED_N) for the next two polls — a lone
+     *  corrupted pair in a 1-2 sample fast drain rode ungated straight into
+     *  the EMA right after the snap, exactly when corruption is most likely
+     *  still in progress. The window is now pre-filled at the new level, so a
+     *  garbage drain on the VERY next poll must be rejected and held.          */
+    push_n(&f, CM_GROUND, 1);            /* one corrupt pair: ~3 ft vs 150 ft   */
+    ft = fin(&f, 0.025f, &fresh);
+    ASSERT_TRUE(!fresh,              "garbage right after re-acquire is gated (held)");
+    ASSERT_NEAR(ft, 150.0f, 1.5f,    "output stays on the re-acquired level");
+
+    /* And genuine data at the new level keeps flowing normally. */
+    push_n(&f, cm150, 2);
+    ft = fin(&f, 0.025f, &fresh);
+    ASSERT_TRUE(fresh,               "clean data after the gated garbage is accepted");
+    ASSERT_NEAR(ft, 150.0f, 1.5f,    "still tracking the new level");
+}
+
+/* ---------------------------------------------------------------------------
  *  Stage 5: a legitimate fast descent passes untouched and stays timely.
  * ------------------------------------------------------------------------- */
 static void test_legit_descent_passes(void)
@@ -320,6 +391,8 @@ int main(void)
     test_median_of_drain();
     test_hampel_rejects_garbage_drain();
     test_reacquire_real_step();
+    test_reacquire_needs_sample_mass();
+    test_hampel_live_after_reacquire();
     test_legit_descent_passes();
     test_taxi_incident_end_to_end(false);
     test_taxi_incident_end_to_end(true);

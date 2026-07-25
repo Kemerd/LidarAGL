@@ -661,7 +661,7 @@ static void run_config_menu(void)
      * flown as this many feet of AGL, so a couple of feet of target travel sweeps
      * the whole callout ladder (see the DEMO_MODE section of config.h). The cycle
      * is x50 -> x100 -> x200 -> x400 -> OFF -> x50..., starting on the
-     * DEMO_GAIN_DEFAULT (x200 == "2 ft real = 400 ft demo"); OFF (stored 0) makes
+     * DEMO_GAIN_DEFAULT (x50 == "2 ft real = 100 ft demo"); OFF (stored 0) makes
      * the demo image behave exactly like flight firmware. There is no dedicated
      * "demo" voice clip, so the level announces itself with a DOUBLE chirp — no
      * other level opens that way — followed by the current selection: a gain is
@@ -748,21 +748,35 @@ static void logic_task(void *arg)
     float    pending_dt_s = 0.0f;
     uint32_t last_tick_ms = 20;
 
+    /*  Fail-safe no-data tracking (see LOST_SIGNAL_MUTE_MS in config.h).
+     *  last_good_us is the wall clock of the last FRESH sample the range filter
+     *  marked VALID. The filter deliberately republishes its held EMA through a
+     *  lost-signal stretch (seq keeps advancing, s.valid == false), which keeps
+     *  momentary dropouts inaudible — but the presence tone encodes ALTITUDE as
+     *  PITCH, so a hold sustained past the bound becomes an actively misleading
+     *  "altitude steady" cue over water / a dark wet runway while the aircraft
+     *  may still be descending. Once the data's age exceeds the bound the tone
+     *  is force-muted (silence == "no data", an honest cue); the first live
+     *  sample restores it instantly. tone_muted edge-detects for one-shot logs. */
+    int64_t last_good_us = esp_timer_get_time();
+    bool    tone_muted   = false;
+
     for (;;) {
         /* Peek the freshest range sample (non-destructive). */
         range_sample_t s;
         if (xQueuePeek(q_range_latest, &s, pdMS_TO_TICKS(100)) != pdTRUE) {
-            /* Bench debug: no sample means the sensor task has published nothing,
-             * i.e. the LiDAR is silent. Surface that (throttled to ~1 s) so a
-             * dead / miswired sensor is obvious rather than looking like "stuck
-             * at 0 ft". A flight build never sets s_bench_scale.                   */
-            if (s_bench_scale) {
-                static int64_t s_silent_log_us = 0;
-                int64_t t = esp_timer_get_time();
-                if (t - s_silent_log_us >= 1000 * 1000) {   /* ~1 s */
-                    s_silent_log_us = t;
-                    ESP_LOGW(TAG, "bench: no sensor data yet (LiDAR silent / miswired?)");
-                }
+            /* No sample means the sensor task has published NOTHING since boot:
+             * the LiDAR is silent (dead, miswired, or configured for the wrong
+             * serial mode). Surface that unconditionally (throttled to ~1 s) —
+             * this used to be bench-gated, which left a flight unit that failed
+             * silent audibly indistinguishable from a healthy parked one. The
+             * boot path has already chirped the pilot for this case (see the
+             * ground-fill check in app_main); here we keep the console honest.  */
+            static int64_t s_silent_log_us = 0;
+            int64_t t = esp_timer_get_time();
+            if (t - s_silent_log_us >= 1000 * 1000) {   /* ~1 s */
+                s_silent_log_us = t;
+                ESP_LOGW(TAG, "no sensor data yet (LiDAR silent / miswired?)");
             }
             continue;   /* no sample yet */
         }
@@ -790,6 +804,15 @@ static void logic_task(void *arg)
         pending_dt_s = 0.0f;
         last_seq     = s.seq;
         have_seq     = true;
+
+        /* Fail-safe data-age clock: refreshed ONLY by a fresh sample the filter
+         * accepted as valid. A held/lost-signal republish (s.valid == false) and
+         * the stale-watchdog tick both let it age toward the tone mute below.   */
+        if (fresh && s.valid) {
+            last_good_us = now_us;
+        }
+        bool data_stale = (now_us - last_good_us) >
+                          (int64_t)LOST_SIGNAL_MUTE_MS * 1000;
 
         /* Apply the learned ground reference: AGL = range - ground. On a
          * lost-signal sample, hold by feeding the previous AGL (sm clamps). */
@@ -916,8 +939,23 @@ static void logic_task(void *arg)
          * clip right after the number so it speaks "<height> ... check gear".    */
         if (out.fired_callout >= 0) {
             float ft = g_profile->callouts[out.fired_callout];
-            bool  is_gear_check = (s_gear_check_ft > 0.0f) &&
-                                  (fabsf(ft - s_gear_check_ft) < 0.5f);
+            /* The gear reminder pairs with ANY rung crossed this tick, not just
+             * the one (lowest) number spoken: a terrain drop or a re-acquire
+             * snap can cross several thresholds in one step, and the state
+             * machine deliberately speaks only the lowest — but a SKIPPED
+             * gear-check rung must still deliver its safety call, because its
+             * armed bit is already cleared and it cannot recover during the
+             * same approach. crossed_mask reports the full crossed set.         */
+            bool is_gear_check = false;
+            if (s_gear_check_ft > 0.0f) {
+                for (size_t i = 0; i < g_profile->n_callouts; ++i) {
+                    if ((out.crossed_mask & (1u << i)) != 0u &&
+                        fabsf(g_profile->callouts[i] - s_gear_check_ft) < 0.5f) {
+                        is_gear_check = true;
+                        break;
+                    }
+                }
+            }
             if (ft <= s_start_alt_ft || is_gear_check) {
                 callout_id_t cid = callout_id_for_ft(ft);
                 if (cid != CO_COUNT) {
@@ -943,8 +981,26 @@ static void logic_task(void *arg)
         }
 
         /* Publish tone params + poll cadence. The vertical rate rides along so the
-         * audio engine's vario blip can chop the tone by descent rate.              */
-        audio_set_params(out.tone_agl, out.tone_active, out.vert_fps);
+         * audio engine's vario blip can chop the tone by descent rate.
+         *
+         * Fail-safe overlay: when the sensor data has gone STALE (a sustained
+         * lost-signal hold or a silent sensor, older than LOST_SIGNAL_MUTE_MS)
+         * the tone is force-muted regardless of what the state machine wants —
+         * a pitch frozen on held data reads as "altitude steady" and is an
+         * actively WRONG cue; silence is an honest one. Callouts are unaffected:
+         * they only edge-fire on genuinely accepted crossings, and the filter's
+         * re-acquire already speaks the nearest number when live data returns.  */
+        bool tone_on = out.tone_active && !data_stale;
+        if (data_stale != tone_muted) {
+            tone_muted = data_stale;
+            if (data_stale) {
+                ESP_LOGW(TAG, "sensor data stale >%u ms (lost signal / silent "
+                              "sensor) -> tone muted", (unsigned)LOST_SIGNAL_MUTE_MS);
+            } else {
+                ESP_LOGI(TAG, "sensor data live again -> tone restored");
+            }
+        }
+        audio_set_params(out.tone_agl, tone_on, out.vert_fps);
         g_poll_period_ms = poll_profile_to_ms(out.poll);
 
         /* Bench real-sensor debug: keep the sensor draining briskly. GROUND/CRUISE
@@ -1300,12 +1356,35 @@ void app_main(void)
         }
     }
 
+    /* Whether current_ft is REAL sensor data (a live read, or the ground-fill
+     * fallback above) rather than the 0.0f initialiser of a totally silent
+     * sensor. resolve() must know the difference: a fabricated 0.0 would pass
+     * its ground-plausibility band and be adopted as a perfect ground with the
+     * calibration warning suppressed — in exactly the dead-sensor case that
+     * warning exists to catch.                                                 */
+    bool have_current = cur_valid || (n_fill > 0);
+
     boot_result_t br;
-    boot_buffer_resolve(stored, n_stored, current_ft, &br);
+    boot_buffer_resolve(stored, n_stored, current_ft, have_current, &br);
     s_ground_ref_ft = br.ground_ref_ft;
 
     ESP_LOGI(TAG, "ground_ref=%.2f ft  boot_agl=%.1f ft  airborne=%d calib_err=%d",
              br.ground_ref_ft, br.boot_agl_ft, br.airborne, br.calib_error);
+
+    /* Sensor-health annunciation. If the ENTIRE ground fill came up empty AND
+     * the latest read was invalid, the LiDAR never spoke this boot — dead unit,
+     * loose connector, or a sensor still configured for the wrong serial mode.
+     * Without this chirp a dead-sensor boot is audibly IDENTICAL to a healthy
+     * parked one (a normal flight boot plays no audio at all): the classic
+     * failed-silent trap for a landing aid whose pilot is trained to expect
+     * callouts. The chirp says "not healthy"; the console says why. When there
+     * is also no stored reference, the calib_error path below additionally
+     * speaks its instruction — that is fine, more signal for a sick boot.       */
+    if (n_fill == 0 && !cur_valid) {
+        ESP_LOGW(TAG, "SENSOR SILENT at boot: no LiDAR data during the ground "
+                      "fill (dead/miswired sensor, or wrong serial config?)");
+        audio_play_chirp();
+    }
 
     /* 6. Calibration error -> warn the pilot: the chirp grabs attention, then the
      *    spoken instruction tells them what to do ("please reset unit on the
@@ -1321,7 +1400,10 @@ void app_main(void)
      *    Only refresh the stored ground when we're actually on the ground —
      *    an in-flight reboot must NOT overwrite the learned ground with an
      *    airborne reading.                                                     */
-    bool persist_ground = !br.airborne && n_fill > 0;
+    /*  calib_error additionally vetoes the write: a boot that had to fall back
+     *  to the emergency offset has, by definition, no trustworthy notion of
+     *  where the ground is, so nothing it captured belongs in NVS.              */
+    bool persist_ground = !br.airborne && n_fill > 0 && !br.calib_error;
 #if DEMO_MODE
     /* Demo boots never write the ground buffer (runtime-only, like sim mode):
      * the rig's 2 ft of travel sits inside GROUND_DEV_FT, so a reboot with the
@@ -1344,10 +1426,24 @@ void app_main(void)
          * GROUND_DEV_FT, the fresh value IS the ground we are sitting on — use
          * it. (persist_ground is never set on demo boots, which self-calibrate
          * through their own cluster path above.)                                */
-        if (!br.calib_error) {
+        {
             bool fresh_ok = false;
             float fresh_ref = robust_mean(ground_reads, n_fill, &fresh_ok);
-            if (fresh_ok && fabsf(fresh_ref - br.ground_ref_ft) <= GROUND_DEV_FT) {
+            if (fresh_ok) {
+                /* The commit above just made THIS fill the persisted truth, so
+                 * flying the session on anything else is indefensible. The old
+                 * agree-within-GROUND_DEV_FT gate here kept a poisoned-HIGH
+                 * stored reference operative for the entire flight that had
+                 * already CORRECTED it in NVS — every AGL cue tens of feet low
+                 * ("ten" spoken at a true 40 ft, flare fade above the runway),
+                 * healed only by a power cycle. We are on the ground (the
+                 * airborne gate above) holding a robust fresh fill: use it, and
+                 * just log loudly when it contradicts the old reference.        */
+                if (fabsf(fresh_ref - br.ground_ref_ft) > GROUND_DEV_FT) {
+                    ESP_LOGW(TAG, "stored ground ref %.2f ft contradicts this "
+                                  "boot's on-ground fill %.2f ft; trusting the fill",
+                             (double)br.ground_ref_ft, (double)fresh_ref);
+                }
                 s_ground_ref_ft = fresh_ref;
                 ESP_LOGI(TAG, "ground ref refreshed from this boot's fill: %.2f ft",
                          (double)fresh_ref);
@@ -1359,6 +1455,22 @@ void app_main(void)
     static sm_state_t initial_state;
     initial_state = sm_initial_state(br.boot_agl_ft, !br.calib_error || br.airborne,
                                      g_profile);
+
+    /* An in-flight reboot BELOW ARM_FT — a brownout on short final, anywhere in
+     * the 10..100 ft band — used to fall through sm_initial_state's
+     * boot_agl <= ARM_FT test into a DISARMED ST_GROUND, silencing every
+     * remaining callout, the tone and the flare fade for exactly the landing
+     * this box exists to call. The resolver has already computed a trustworthy
+     * "we are airborne" verdict (current sits more than GROUND_DEV_FT above the
+     * learned ground); thread it into the seeding so ANY airborne boot starts
+     * ARMED. sm_init() arms the full ladder for ARMED seeds, and callouts still
+     * edge-trigger only on a genuine downward crossing, so this can never blurt
+     * numbers on the first tick.                                               */
+    if (br.airborne && !br.calib_error && initial_state == ST_GROUND) {
+        initial_state = ST_ARMED;
+        ESP_LOGI(TAG, "airborne at boot (%.1f ft) -> seeding ARMED, ladder hot",
+                 (double)br.boot_agl_ft);
+    }
     ESP_LOGI(TAG, "initial state = %d", initial_state);
 
     /* 9. Create the inter-task primitives. */

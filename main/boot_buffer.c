@@ -53,13 +53,23 @@ void boot_buffer_init(void)
 bool boot_buffer_reset_pressed(void)
 {
     /* Simple debounce: require the active level on several spaced reads so a
-     * glitch on the line can't trigger a wipe.                                */
+     * glitch on the line can't trigger a wipe.
+     *
+     * The spacing MUST be clamped to a whole tick: pdMS_TO_TICKS truncates, so
+     * at the 100 Hz FreeRTOS tick 5 ms is ZERO ticks and vTaskDelay(0) merely
+     * yields — the five "spaced" reads then run back-to-back in microseconds,
+     * compiling the entire glitch filter away. A sub-millisecond transient on
+     * the (weak-pull-up, panel-wired) button line at the boot check instant
+     * could pass all five reads and drop the unit into the config menu, which
+     * wipes the ground reference and every pilot setting unconfirmed. One tick
+     * (10 ms at 100 Hz) x 5 samples is a real ~40 ms window again.             */
     const int SAMPLES = 5;
     for (int i = 0; i < SAMPLES; ++i) {
         if (gpio_get_level(PIN_CONFIG_BTN) != CONFIG_BTN_ACTIVE_LEVEL) {
             return false;
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        TickType_t gap = pdMS_TO_TICKS(5);
+        vTaskDelay(gap > 0 ? gap : 1);
     }
     return true;
 }
@@ -67,11 +77,14 @@ bool boot_buffer_reset_pressed(void)
 bool boot_buffer_button_down(void)
 {
     /* Two quick spaced samples — enough to reject a single-sample glitch while
-     * keeping the config-menu poll loop snappy for tap detection.             */
+     * keeping the config-menu poll loop snappy for tap detection. Same
+     * tick-floor clamp as boot_buffer_reset_pressed(): 3 ms truncates to ZERO
+     * ticks at the 100 Hz tick, and an unspaced double-read is no debounce.    */
     if (gpio_get_level(PIN_CONFIG_BTN) != CONFIG_BTN_ACTIVE_LEVEL) {
         return false;
     }
-    vTaskDelay(pdMS_TO_TICKS(3));
+    TickType_t gap = pdMS_TO_TICKS(3);
+    vTaskDelay(gap > 0 ? gap : 1);
     return gpio_get_level(PIN_CONFIG_BTN) == CONFIG_BTN_ACTIVE_LEVEL;
 }
 
@@ -326,17 +339,25 @@ void config_wipe_tone_volume(void)
 
 float config_load_gear_check_alt(void)
 {
-    /* Stored as a u16 of feet. OFF by default: an absent key OR a stored 0 both
-     * mean disabled, so we never need to distinguish "never set" from "set OFF". */
+    /* Stored as a u16 of feet. Flight builds are OFF by default (absent key ->
+     * disabled); DEMO builds default an absent key to the show altitude instead,
+     * so a fresh booth unit speaks "check gear" with no menu visit (see the demo
+     * defaults block in config.h). A STORED 0 is an explicit pilot OFF and is
+     * honoured in both builds — only "never set" falls through to the default.   */
+#if DEMO_MODE
+    const float dflt = DEMO_GEAR_CHECK_DEFAULT_FT;
+#else
+    const float dflt = 0.0f;   /* OFF */
+#endif
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
-        return 0.0f;   /* OFF */
+        return dflt;
     }
     uint16_t v = 0;
     esp_err_t err = nvs_get_u16(h, NVS_KEY_GEARCHK, &v);
     nvs_close(h);
     if (err != ESP_OK) {
-        return 0.0f;   /* absent / unreadable -> OFF */
+        return dflt;   /* absent / unreadable -> build default */
     }
     return (float)v;   /* 0 == OFF, else the chosen altitude in feet */
 }
@@ -378,17 +399,20 @@ void config_wipe_gear_check_alt(void)
 
 bool config_load_positive_rate(void)
 {
-    /* Stored as a u8 (0/1). Disabled by default: absent / unreadable / zero all
-     * read as OFF, so a corrupt value can never enable an unwanted callout.      */
+    /* Stored as a u8 (0/1). Flight builds are disabled by default: absent /
+     * unreadable / zero all read as OFF, so a corrupt value can never enable an
+     * unwanted callout. DEMO builds flip the ABSENT-key default to ON so a fresh
+     * booth unit announces "positive rate" on the hoist (config.h demo defaults);
+     * an explicit stored 0 from the menu still reads as OFF in both builds.      */
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
-        return false;
+        return DEMO_MODE != 0;
     }
     uint8_t v = 0;
     esp_err_t err = nvs_get_u8(h, NVS_KEY_POSRATE, &v);
     nvs_close(h);
     if (err != ESP_OK) {
-        return false;
+        return DEMO_MODE != 0;
     }
     return v != 0;
 }
@@ -424,17 +448,19 @@ void config_wipe_positive_rate(void)
 
 bool config_load_sink_rate(void)
 {
-    /* Same OFF-by-default u8 contract as the positive-rate flag: absent /
-     * unreadable / zero all read as OFF, so a corrupt value never enables blips. */
+    /* Same u8 contract as the positive-rate flag: an explicit stored 0 always
+     * reads as OFF. Flight builds also default an ABSENT key to OFF (a corrupt
+     * value can never enable blips); DEMO builds default it to ON so the booth
+     * unit demos the sink-rate vario out of the box (config.h demo defaults).    */
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
-        return false;
+        return DEMO_MODE != 0;
     }
     uint8_t v = 0;
     esp_err_t err = nvs_get_u8(h, NVS_KEY_SINKRATE, &v);
     nvs_close(h);
     if (err != ESP_OK) {
-        return false;
+        return DEMO_MODE != 0;
     }
     return v != 0;
 }
@@ -690,7 +716,8 @@ void boot_buffer_commit(const float *ground_reads, size_t n, uint32_t marker)
 /* ---- Ground-reference resolution ----------------------------------------- */
 
 void boot_buffer_resolve(const boot_entry_t *stored, size_t n_stored,
-                         float current_ft, boot_result_t *result)
+                         float current_ft, bool have_current,
+                         boot_result_t *result)
 {
     /* Pull the stored ranges into a flat array for the robust estimator. */
     float vals[BOOT_BUFFER_N];
@@ -706,10 +733,19 @@ void boot_buffer_resolve(const boot_entry_t *stored, size_t n_stored,
     float ground_ref = robust_mean(vals, m, &have_ref);
 
     if (!have_ref) {
-        /* No usable stored ground. If the current reading itself looks like a
-         * plausible ground reading, adopt it as the reference; otherwise fall
-         * back to the emergency offset and flag a calibration error.          */
-        if (current_ft >= 0.0f && current_ft <= MAX_VALID_FT) {
+        /* No usable stored ground. Adopt the current reading as the reference
+         * ONLY when it (a) is REAL sensor data (have_current) and (b) sits in a
+         * plausible MOUNT-OFFSET band. The old test accepted anything up to
+         * MAX_VALID_FT — but that constant is a fill-selection junk cap, not a
+         * ground bound: a real mount reads ~MOUNT_OFFSET_FALLBACK_FT, so a
+         * 20-50 ft "ground" is physically impossible (it is a mid-air reboot
+         * over the runway, which must NOT silently zero its own AGL), and a
+         * totally silent sensor's fabricated 0.0 initialiser used to pass as a
+         * perfect ground here. Both defeated the calibration warning built for
+         * exactly these cases; both now fall through to the emergency offset
+         * and chirp the pilot.                                                */
+        if (have_current && current_ft >= 0.0f &&
+            current_ft <= MOUNT_OFFSET_FALLBACK_FT + GROUND_DEV_FT) {
             result->ground_ref_ft = current_ft;
             result->boot_agl_ft   = 0.0f;
             result->airborne      = false;
