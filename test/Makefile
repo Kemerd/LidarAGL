@@ -25,7 +25,7 @@ PURE := $(SRC)/robust.c $(SRC)/sensor_profile.c $(SRC)/state_machine.c \
         $(SRC)/boot_buffer.c
 
 TESTS := run_robust run_state_machine run_audio_math run_lwnx \
-         run_range_filter run_boot_buffer
+         run_range_filter run_boot_buffer run_flight
 
 .PHONY: all clean
 all: $(TESTS)
@@ -49,6 +49,9 @@ run_range_filter:  test_range_filter.c  $(PURE)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 run_boot_buffer:   test_boot_buffer.c   $(PURE)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+run_flight:        test_flight.c        $(PURE)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 clean:
