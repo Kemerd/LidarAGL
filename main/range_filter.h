@@ -146,6 +146,20 @@ typedef struct {
      *  teleport and re-anchor rather than walking the rungs between the two
      *  levels. See rf_finalize() and the logic task's handling.               */
     bool     track_break;
+
+    /* --- Tracking verdict (stage 1c): "is the sensor telling us anything?"    *
+     *  The single, directly-observed answer to whether this box has a usable
+     *  picture of the ground — as opposed to inferring it from ALTITUDE, which
+     *  is a guess about the sensor dressed up as a fact about the aircraft.
+     *
+     *  ASYMMETRIC by design: losing tracking requires sustained evidence
+     *  (RANGE_NOTRACK_POLLS consecutive useless drains), while REGAINING it
+     *  takes a single usable drain. That asymmetry is the whole safety
+     *  argument — we may be slow to conclude the sensor is blind, but we are
+     *  instant to notice it can see again, because the cost of those two
+     *  mistakes is wildly different on an approach.                            */
+    bool     tracking;        /**< False once the sensor has gone useless.      */
+    uint32_t notrack_polls;   /**< Consecutive drains with nothing usable.      */
 } range_filter_t;
 
 /**
@@ -211,5 +225,28 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
  * @return   True if the last finalize was a discontinuous re-acquisition.
  */
 bool rf_track_broken(const range_filter_t *f);
+
+/**
+ * @brief Is the sensor currently giving us a usable picture of the ground?
+ *
+ * @details This is the box's power/latency signal, and it is deliberately a
+ *          statement about the SENSOR, not about the aircraft. The older policy
+ *          slept whenever the ALTITUDE was high (ST_CRUISE), which is an
+ *          inference — "high means the sensor probably can't see" — and it was
+ *          wrong in both directions: it slept while the sensor was still
+ *          tracking fine just under its ceiling, and (worse) it could not tell
+ *          "high" from "sensor blind at any altitude".
+ *
+ *          Tracking is FALSE only after RANGE_NOTRACK_POLLS consecutive drains
+ *          produced nothing usable, and returns TRUE on the FIRST drain that
+ *          does. So a stream that is mostly junk with an occasional real return
+ *          — the ragged 350/400/325/375 mess near the ceiling — counts as
+ *          TRACKING, and the box stays awake and responsive through it. Only a
+ *          sensor that has genuinely gone quiet lets us relax.
+ *
+ * @param f  Filter state.
+ * @return   True while the sensor is usable; false once it has gone dark.
+ */
+bool rf_tracking(const range_filter_t *f);
 
 #endif /* LIDARAGL_RANGE_FILTER_H */

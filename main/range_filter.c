@@ -122,6 +122,14 @@ bool rf_track_broken(const range_filter_t *f)
     return f->track_break;
 }
 
+bool rf_tracking(const range_filter_t *f)
+{
+    /*  Before the first lock there is nothing to track, but we must NOT report
+     *  "not tracking" and invite the caller to relax — a box that has never seen
+     *  the ground yet is exactly when we want it awake and looking.             */
+    return f->tracking || !f->have_out;
+}
+
 void rf_push_cm(range_filter_t *f, float cm)
 {
     /* --- Stage 1: absolute validity gates ---------------------------------- */
@@ -179,6 +187,34 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
     /*  The track-break flag describes THIS finalize only; clear it up front so
      *  it is never left set from a previous call.                              */
     f->track_break = false;
+
+    /* --- Tracking verdict --------------------------------------------------- *
+     *  "Did this drain contain ANY usable return?" is the honest, directly
+     *  observed question — and it is the one the power policy should key off,
+     *  rather than inferring blindness from a high altitude reading.
+     *
+     *  Note this deliberately tests n_valid, NOT whether the value was finally
+     *  ACCEPTED. A drain that the Hampel gate rejects still proves the sensor is
+     *  seeing something and that we must stay alert; conflating "rejected" with
+     *  "blind" would put the box to sleep during exactly the noisy, ambiguous
+     *  stretch where it most needs to be watching.
+     *
+     *  The sensor's usable reach also degrades LONG before its rated ceiling —
+     *  a 328 ft spec is a best-case, clean-target number, so approaching it the
+     *  returns thin out into a ragged mix of real and erroneous values rather
+     *  than stopping at a clean line. One good return in a mostly-junk drain
+     *  therefore still counts as tracking.                                     */
+    if (n_valid > 0) {
+        f->notrack_polls = 0;
+        f->tracking      = true;        /* instant re-acquisition of awareness */
+    } else {
+        if (f->notrack_polls < UINT32_MAX) {
+            ++f->notrack_polls;
+        }
+        if (f->notrack_polls >= (uint32_t)RANGE_NOTRACK_POLLS) {
+            f->tracking = false;        /* sustained silence -> genuinely dark  */
+        }
+    }
 
     /* --- No usable fresh data: out-of-range ABOVE, or hold last-good -------- */
     /*  A drain that is EMPTY (sensor silent) or MAJORITY lost-signal is not

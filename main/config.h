@@ -182,6 +182,30 @@
  *  breaking is reserved for evidence that is both sustained AND self-agreeing.  */
 #define RANGE_TRACK_BREAK_POLLS  12u  /* agreeing polls to accept a broken track */
 
+/* ---- Tracking verdict: the box's REAL power/latency signal ---------------- */
+/*  Whether the box may relax (slow the poll, suspend audio, light-sleep) is a
+ *  question about the SENSOR — "can we see the ground?" — not about the
+ *  aircraft. The old policy slept whenever the ALTITUDE was at/above the
+ *  profile's cruise_ft, which is an inference standing in for the real thing,
+ *  and it was wrong in both directions: it relaxed while the sensor was still
+ *  tracking perfectly well just under its ceiling, and it had nothing to say
+ *  about a sensor that went blind at ANY altitude.
+ *
+ *  It is also a false premise about the hardware. The SF30/C's 328 ft figure is
+ *  a best-case, clean-target rating; in practice the returns thin out into a
+ *  ragged mixture of real and erroneous values well before it, so there is no
+ *  clean altitude at which "the sensor works" becomes "it doesn't". Keying off
+ *  tracking removes the guess entirely.
+ *
+ *  The verdict is ASYMMETRIC, and that asymmetry IS the safety argument: going
+ *  dark needs this many consecutive drains with nothing usable in them, while
+ *  ONE usable return restores tracking immediately. Being slow to conclude the
+ *  sensor is blind costs a little power; being slow to notice it can see again
+ *  costs callouts on an approach. Sized so a brief dropout (a dark patch, a
+ *  banked turn) never trips it, while a genuine climb out of range does within
+ *  a second or so at any cadence.                                              */
+#define RANGE_NOTRACK_POLLS      8u   /* useless drains before "sensor is dark" */
+
 /*  Sensor-ceiling sanity: a return farther than the active profile's
  *  max_range_ft plus this margin is physically impossible (the SF30/C cannot
  *  see 400 ft) and is treated as lost-signal junk at the gate.                 */

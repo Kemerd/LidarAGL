@@ -970,12 +970,35 @@ static void logic_task(void *arg)
          * The SUSPEND edge stays after the queueing (see below), so a callout
          * fired on the tick we ENTER a sleep state still gets queued to a live
          * channel rather than into a channel we just tore down.                */
-        bool sleep_allowed = (out.state == ST_GROUND || out.state == ST_CRUISE);
+        /*  We relax because the SENSOR has nothing to say — never because an
+         *  altitude reading happened to be large.
+         *
+         *  The old policy slept on ST_GROUND/ST_CRUISE, i.e. it inferred "the
+         *  sensor probably can't see" from "the number is big". That inference
+         *  was wrong in both directions. It relaxed while the sensor was still
+         *  tracking perfectly well just below its ceiling, and it had nothing
+         *  whatsoever to say about a sensor gone blind at a LOW altitude. It
+         *  also rested on a false premise about the hardware: the SF30/C's
+         *  328 ft rating is a best-case, clean-target figure, so real returns
+         *  thin out into a ragged mix of good and erroneous values well before
+         *  it — there is no altitude at which "works" cleanly becomes "doesn't".
+         *
+         *  So: stay awake whenever the sensor is TRACKING, and relax only once
+         *  it has genuinely gone dark. Crucially the verdict is asymmetric (see
+         *  RANGE_NOTRACK_POLLS) — sustained silence to go dark, but a SINGLE
+         *  usable return to wake. A stream that is 95% junk with the occasional
+         *  real value still counts as tracking and keeps the box fast, which is
+         *  exactly the behaviour wanted near the ceiling.
+         *
+         *  ST_GROUND is kept as an additional relax condition: parked on the
+         *  ramp the sensor tracks the tarmac perfectly well and would otherwise
+         *  hold the box at full rate forever, which is the one case where
+         *  "tracking" genuinely does not imply "something might happen".       */
+        bool sensor_dark   = !s.tracking;
+        bool sleep_allowed = sensor_dark || (out.state == ST_GROUND);
 
-        /* Compile-time master switch (config.h). Defaulted OFF: on a panel-powered
-         * installation the power saving buys little, while the suspend/poll-relax
-         * it implies has sat in the causal chain of every flight-critical silence
-         * this box has shipped. Build -DSLEEP_MODE_ENABLE=1 to restore it.       */
+        /* Compile-time master switch (config.h). Build -DSLEEP_MODE_ENABLE=0 to
+         * take light-sleep out of the picture entirely.                          */
 #if !SLEEP_MODE_ENABLE
         sleep_allowed = false;
 #endif
@@ -986,11 +1009,13 @@ static void logic_task(void *arg)
             sleep_allowed = false;
         }
 
-        /* Never light-sleep on data we KNOW is stale. Sleeping relaxes the poll to
-         * 500 ms and tears the audio channel down, so entering it on a held value
-         * costs exactly the latency we most need on a descent — and a held value
-         * is precisely when we are least entitled to assume nothing is happening. */
-        if (data_stale) {
+        /*  Never relax while the ladder is live and the aircraft is inside the
+         *  band the callouts and tone actually cover. A dark sensor below the
+         *  tone-start altitude is a FAILURE, not an idle period: the box should
+         *  be awake, annunciating, and ready for the first return — not saving
+         *  power. (Above the band a dark sensor is simply "we're high", which
+         *  is the ordinary case this policy exists to exploit.)                 */
+        if (sm.armed && agl <= sm.tone_start_ft) {
             sleep_allowed = false;
         }
         if (!sleep_allowed && sleep_allowed_prev) {
@@ -1086,6 +1111,19 @@ static void logic_task(void *arg)
         audio_set_params(out.tone_agl, tone_on, out.vert_fps);
         g_poll_period_ms = poll_profile_to_ms(out.poll);
 
+        /*  Cadence follows TRACKING, not just the state. A dark sensor cannot
+         *  produce a callout however fast we ask it, so polling it at the
+         *  DESCENT rate is pure heat — relax to the CRUISE cadence instead.
+         *  The moment ONE usable return arrives, rf_tracking() flips back and
+         *  the next pass restores the state's own (fast) rate: we give up
+         *  responsiveness only while there is demonstrably nothing to respond
+         *  to. Never applied inside the live tone band (guarded above), where a
+         *  dark sensor is a failure to annunciate rather than an idle period.  */
+        if (sensor_dark && !(sm.armed && agl <= sm.tone_start_ft) &&
+            g_poll_period_ms < POLL_MS_CRUISE) {
+            g_poll_period_ms = POLL_MS_CRUISE;
+        }
+
         /* Bench real-sensor debug: keep the sensor draining briskly. GROUND/CRUISE
          * normally relax the poll to ~750 ms, which makes the live readout look
          * frozen between updates — cap it so the tape tracks the LiDAR in real time.*/
@@ -1096,8 +1134,8 @@ static void logic_task(void *arg)
         /* Light-sleep policy, SUSPEND edge (the resume edge ran before the
          * callout block above). Tearing the channel down last means a callout
          * fired on this very tick was already queued to a live channel and gets
-         * spoken; the suspend then takes effect on a later tick once the state
-         * has genuinely settled into GROUND/CRUISE.                            */
+         * spoken; the suspend then takes effect on a later tick once the sensor
+         * has genuinely settled into darkness (or the aircraft into GROUND).   */
         if (sleep_allowed && !sleep_allowed_prev) {
             audio_suspend();
         }

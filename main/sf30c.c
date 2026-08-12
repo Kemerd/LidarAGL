@@ -483,6 +483,10 @@ void sensor_task(void *arg)
                  *  discontinuous level, so the consumer can re-anchor instead of
                  *  reading the jump as flown motion (see rf_track_broken).      */
                 .track_break = rf_track_broken(&s_rf),
+                /*  The sensor's own verdict on whether it can see the ground.
+                 *  The logic task's power policy keys off THIS rather than off
+                 *  altitude (see rf_tracking / the sleep block in logic_task). */
+                .tracking    = rf_tracking(&s_rf),
             };
             /* Overwrite so the logic task always sees the freshest sample with
              * no backlog lag — essential for on-time callouts.                */

@@ -43,6 +43,11 @@ typedef struct {
                          /**< previous one is NOT flown motion — the logic task  */
                          /**< re-anchors the state machine instead of letting it */
                          /**< walk the callout rungs across the gap.             */
+    bool     tracking;   /**< Whether the SENSOR currently has a usable picture  */
+                         /**< of the ground. This — not altitude — is what gates */
+                         /**< the box's power/latency policy: we relax because   */
+                         /**< the sensor has nothing to say, never because a     */
+                         /**< number happened to be large. See rf_tracking().    */
 } range_sample_t;
 
 /** Tone parameters the logic task publishes for the audio task. */

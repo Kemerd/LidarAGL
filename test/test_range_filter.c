@@ -1095,6 +1095,150 @@ static void test_out_of_range_erroneous_no_phantom(void)
                 "erroneous out-of-range: real descent still walks the ladder");
 }
 
+/* ===========================================================================
+ *  The TRACKING verdict — the box's real power/latency signal.
+ * ---------------------------------------------------------------------------
+ *  Whether the box may relax must be a statement about the SENSOR ("can we see
+ *  the ground?"), not an inference from ALTITUDE ("the number is big, so the
+ *  sensor probably can't see"). The inference was wrong both ways: it relaxed
+ *  while the sensor still tracked fine below its ceiling, and said nothing about
+ *  a sensor blind at low altitude. It also assumed a clean cutoff that the
+ *  hardware does not have — 328 ft is a best-case rating, so returns degrade
+ *  into a ragged mix of good and erroneous values well before it.
+ * ========================================================================= */
+
+/*  Build a drain with a given mix of lost-signal and usable returns. */
+static void mixed_drain(range_filter_t *f, int n_lost, int n_good, float good_cm)
+{
+    for (int i = 0; i < n_lost; ++i) {
+        rf_push_cm(f, CM_SENTINEL);
+    }
+    for (int i = 0; i < n_good; ++i) {
+        rf_push_cm(f, good_cm);
+    }
+}
+
+static void test_tracking_verdict(void)
+{
+    range_filter_t f;
+    rf_init(&f, SF30C_PROFILE.max_range_ft);
+
+    ASSERT_TRUE(rf_tracking(&f),
+                "tracking: a box that has never locked is NOT reported dark");
+
+    /* Establish a normal lock. */
+    for (int i = 0; i < 8; ++i) {
+        mixed_drain(&f, 0, 20, 3000.0f);
+        (void)fin(&f, 0.05f, NULL);
+    }
+    ASSERT_TRUE(rf_tracking(&f), "tracking: a clean lock is tracking");
+
+    /*  The headline case: a ragged near-ceiling stream that is overwhelmingly
+     *  junk but carries the occasional real return. The sensor CAN still see —
+     *  the box must stay awake and fast through this, not decide it is idle.  */
+    bool stayed = true;
+    for (int i = 0; i < 20; ++i) {
+        mixed_drain(&f, 19, 1, (float)(9000 + (i % 7) * 300));
+        (void)fin(&f, 0.05f, NULL);
+        if (!rf_tracking(&f)) {
+            stayed = false;
+        }
+    }
+    ASSERT_TRUE(stayed,
+                "tracking: 95% junk + 5% good still counts as TRACKING");
+
+    /*  Now genuinely out of range: nothing usable at all. Going dark must take
+     *  SUSTAINED evidence — never a single bad drain — but must not take so long
+     *  that a real climb-out keeps the box at full rate indefinitely.
+     *
+     *  The exact count is deliberately not asserted: the ragged stream above may
+     *  legitimately leave the no-track counter part-way advanced (its final
+     *  drain can carry no usable return), and pinning the sequencing would make
+     *  this a test of the fixture rather than of the behaviour. What matters is
+     *  the bound — more than one drain, and inside RANGE_NOTRACK_POLLS.        */
+    int polls_to_dark = 0;
+    for (int i = 0; i < 30; ++i) {
+        mixed_drain(&f, 20, 0, 0.0f);
+        (void)fin(&f, 0.05f, NULL);
+        ++polls_to_dark;
+        if (!rf_tracking(&f)) {
+            break;
+        }
+    }
+    ASSERT_TRUE(!rf_tracking(&f),
+                "tracking: sustained all-lost drains DO go dark");
+    ASSERT_TRUE(polls_to_dark > 1,
+                "tracking: one bad drain alone never goes dark");
+    ASSERT_TRUE(polls_to_dark <= (int)RANGE_NOTRACK_POLLS,
+                "tracking: goes dark within RANGE_NOTRACK_POLLS drains");
+
+    /*  And the asymmetry that carries the safety argument: ONE usable return
+     *  restores tracking immediately. Being slow to notice the sensor can see
+     *  again would cost callouts on an approach.                              */
+    mixed_drain(&f, 19, 1, 3000.0f);
+    (void)fin(&f, 0.05f, NULL);
+    ASSERT_TRUE(rf_tracking(&f),
+                "tracking: ONE usable return wakes the box instantly");
+}
+
+/*  The exact go-dark count, on a clean fixture where nothing has part-way
+ *  advanced the counter. Kept separate from the ragged-stream test above so the
+ *  precise threshold is pinned without depending on that fixture's sequencing. */
+static void test_tracking_dark_threshold_exact(void)
+{
+    range_filter_t f;
+    rf_init(&f, SF30C_PROFILE.max_range_ft);
+
+    for (int i = 0; i < 8; ++i) {
+        mixed_drain(&f, 0, 20, 3000.0f);
+        (void)fin(&f, 0.05f, NULL);
+    }
+    ASSERT_TRUE(rf_tracking(&f), "tracking (exact): clean lock is tracking");
+
+    /*  Every drain up to the threshold must still read as tracking. */
+    bool held = true;
+    for (uint32_t i = 1; i < RANGE_NOTRACK_POLLS; ++i) {
+        mixed_drain(&f, 20, 0, 0.0f);
+        (void)fin(&f, 0.05f, NULL);
+        if (!rf_tracking(&f)) {
+            held = false;
+        }
+    }
+    ASSERT_TRUE(held,
+                "tracking (exact): still tracking right up to the threshold");
+
+    /*  ...and the threshold drain itself flips it. */
+    mixed_drain(&f, 20, 0, 0.0f);
+    (void)fin(&f, 0.05f, NULL);
+    ASSERT_TRUE(!rf_tracking(&f),
+                "tracking (exact): the RANGE_NOTRACK_POLLS'th drain goes dark");
+}
+
+/*  A rejected value still proves the sensor is SEEING something. Conflating
+ *  "the gate rejected it" with "the sensor is blind" would relax the box during
+ *  exactly the noisy, ambiguous stretch where it most needs to be watching.   */
+static void test_tracking_counts_rejected_returns(void)
+{
+    range_filter_t f;
+    rf_init(&f, SF30C_PROFILE.max_range_ft);
+    settle_on_ground(&f, 8);
+
+    /*  Whole drains of plausible-band garbage: the Hampel gate rejects every
+     *  one of them (proven by test_hampel_rejects_garbage_drain), but they are
+     *  real returns and must keep the box awake.                              */
+    bool tracked = true;
+    for (int i = 0; i < 15; ++i) {
+        push_n(&f, CM_SPIKE, 40);
+        bool fresh_;
+        (void)fin(&f, 0.05f, &fresh_);
+        if (!rf_tracking(&f)) {
+            tracked = false;
+        }
+    }
+    ASSERT_TRUE(tracked,
+                "tracking: gate-REJECTED returns still count as tracking");
+}
+
 int main(void)
 {
     printf("== range_filter ==\n");
@@ -1119,6 +1263,9 @@ int main(void)
     test_garbage_cannot_teleport_across_rungs();
     test_real_level_step_still_reacquires();
     test_out_of_range_erroneous_no_phantom();
+    test_tracking_verdict();
+    test_tracking_dark_threshold_exact();
+    test_tracking_counts_rejected_returns();
 
     TEST_SUMMARY();
     return TEST_EXIT_CODE();
