@@ -233,6 +233,21 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
                  : 0.02f;
     s_last_fin_us = now_us;
 
+    /*  Bound the elapsed time before it reaches the filter. dt_s drives the
+     *  Hampel slew allowance and the EMA bandwidth, and both misbehave on a
+     *  degenerate value: a non-positive dt (a clock that did not advance, or a
+     *  64-bit read torn across a wrap) makes alpha zero or negative, and an
+     *  unboundedly large one is harmless to the capped gate but meaningless as
+     *  a rate. Neither is data — they are timekeeping artefacts — so clamp to
+     *  the range the poll cadences can actually produce. The generous ceiling
+     *  still lets a genuinely long gap collapse the EMA to a passthrough, which
+     *  is the correct behaviour: state that old deserves no weight.            */
+    if (!(dt_s > 0.0f)) {
+        dt_s = 0.001f;
+    } else if (dt_s > SENSOR_MAX_DT_S) {
+        dt_s = SENSOR_MAX_DT_S;
+    }
+
     /* Hardware flagged corrupt bytes since the last poll (real sensor only):
      * flush everything, resync the pair decoder, and hold last-good — parsing
      * a drain the UART itself called garbage is how phantom callouts happen.    */

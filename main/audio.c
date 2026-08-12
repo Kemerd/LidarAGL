@@ -83,6 +83,17 @@ static volatile bool     s_suspend_req = false;
  *  overriding the suspend request until the chirp has been armed.               */
 static volatile bool     s_alert_req = false;
 
+/*  Latched for as long as the sensor-failure chirp is actually SOUNDING, as
+ *  opposed to merely requested. s_alert_req is cleared the moment the clip is
+ *  armed, which is far too early to hold the channel up: the suspend request
+ *  that the alert overrode is still set (the logic task only clears it on a
+ *  sleep_allowed falling edge), so the very next loop pass saw suspend_req go
+ *  true again, tore the channel down and PURGED the clip mid-word. The pilot
+ *  got a single 8 ms frame — a click — in place of the one annunciation that
+ *  tells them the LiDAR has died. The latch keeps the channel up until the clip
+ *  has genuinely finished, then normal suspend policy resumes.                 */
+static bool              s_alert_playing = false;
+
 /*  Resolved runtime behaviour (channel layout + which streams are live). Set by
  *  audio_init() from the boot config; read in the render loop. Defaults are
  *  harmless until init runs.                                                    */
@@ -447,6 +458,50 @@ void audio_init(const audio_config_t *cfg)
 
 void audio_set_params(float tone_agl, bool tone_active, float vert_fps)
 {
+    /*  SANITISE AT THE BOUNDARY. Everything downstream of here is a one-pole
+     *  follower or a slew limiter, and every one of them is a NaN TRAP with no
+     *  recovery path: slew_limit() computes cur + (target - cur), and since both
+     *  NaN comparisons inside it are false, a single NaN target poisons the
+     *  carried value permanently — no amount of later-valid input clears it.
+     *  The poisoned value then reaches nco_advance(), whose LUT index is
+     *  (int)(phase * LUT_SIZE); (int) of a NaN is undefined and on Xtensa
+     *  typically yields 0 or INT_MIN, so the sine LUT gets read at an arbitrary
+     *  offset. That is a genuine memory-safety fault: the audio task dies and
+     *  the aircraft loses EVERY callout for the rest of the flight, silently.
+     *
+     *  The logic task should never publish a non-finite value, but "should
+     *  never" is not a guarantee worth a dead landing aid, and the cost of the
+     *  check is two comparisons per decision tick (~20 ms). Reject rather than
+     *  clamp: a non-finite reading carries no information, so the correct
+     *  action is to leave the previous good parameters in place and let the
+     *  existing stale-data mute upstream handle annunciation.                  */
+    if (!isfinite(tone_agl) || !isfinite(vert_fps)) {
+        static uint32_t s_bad_params = 0;
+        if ((s_bad_params++ % 50u) == 0u) {   /* ~1 s at the 20 ms tick */
+            ESP_LOGE(TAG, "audio_set_params: NON-FINITE input rejected "
+                          "(agl=%f vert=%f) — holding last good params",
+                     (double)tone_agl, (double)vert_fps);
+        }
+        return;
+    }
+
+    /*  Bound the magnitudes too. A finite but absurd value (a corrupted range
+     *  that survived the filter, a runaway trend) cannot crash the LUT, but it
+     *  can drive the pitch schedule and the vario cadence to nonsense. Clamping
+     *  to the physically meaningful envelope keeps the audio sane without ever
+     *  discarding a legitimate reading: real AGL is bounded by the sensor's
+     *  reach and real vertical rate by the airframe.                          */
+    if (tone_agl < 0.0f) {
+        tone_agl = 0.0f;
+    } else if (tone_agl > AUDIO_MAX_AGL_FT) {
+        tone_agl = AUDIO_MAX_AGL_FT;
+    }
+    if (vert_fps >  RANGE_MAX_SLEW_FPS) {
+        vert_fps =  RANGE_MAX_SLEW_FPS;
+    } else if (vert_fps < -RANGE_MAX_SLEW_FPS) {
+        vert_fps = -RANGE_MAX_SLEW_FPS;
+    }
+
     if (g_audio_mutex && xSemaphoreTake(g_audio_mutex, 0) == pdTRUE) {
         g_audio_params.tone_agl    = tone_agl;
         g_audio_params.tone_active = tone_active;
@@ -513,8 +568,43 @@ void audio_request_callout(callout_id_t id)
     /* The logic task posts the id; the audio task picks it up and starts the
      * clip. We route through the queue so we never touch clip state from two
      * tasks at once.                                                          */
-    if (q_callouts) {
-        xQueueSend(q_callouts, &id, 0);
+    if (!q_callouts) {
+        return;
+    }
+
+    if (xQueueSend(q_callouts, &id, 0) == pdTRUE) {
+        return;
+    }
+
+    /*  QUEUE FULL. The old code discarded the return value here, so the request
+     *  vanished with no sound, no log, and no trace — and the arithmetic of a
+     *  FIFO makes that failure land in the worst possible place. Clips run
+     *  roughly half a second to a second each while the ladder can enqueue two
+     *  ids in a single tick (an altitude plus its paired "check gear"), and a
+     *  terrain drop or a re-acquire snap can cross several rungs at once. When
+     *  the queue saturates it is holding the OLDEST, highest, most stale
+     *  numbers — and the id being dropped is the newest, which on an approach
+     *  is the LOWEST and most safety-critical one. The box would silently trade
+     *  "ten" for "two hundred".
+     *
+     *  So on overflow we evict the oldest entry and retry, making the queue
+     *  drop-oldest rather than drop-newest. The freshest altitude always wins,
+     *  which is the only ordering that makes sense for a descending ladder: a
+     *  number the aircraft has already passed is worthless next to the one it
+     *  is passing now. The eviction is logged, because a saturated callout
+     *  queue means the audio path is falling behind the descent and that is
+     *  something the pilot's post-flight console should show.                  */
+    callout_id_t evicted;
+    if (xQueueReceive(q_callouts, &evicted, 0) == pdTRUE) {
+        ESP_LOGW(TAG, "callout queue full: evicted stale id %d to make room "
+                      "for %d (audio falling behind the descent)",
+                 (int)evicted, (int)id);
+    }
+    if (xQueueSend(q_callouts, &id, 0) != pdTRUE) {
+        /* Still full: the consumer is wedged, not merely busy. Surface it —
+         * this is the audible-failure case the task watchdog exists for.      */
+        ESP_LOGE(TAG, "callout queue STILL full after eviction; dropping id %d "
+                      "(audio task stalled?)", (int)id);
     }
 }
 
@@ -766,16 +856,39 @@ void audio_resume(void)
  *  fundamental and the 2nd harmonic each keep an independent phase.             */
 static inline float nco_advance(float *phase, float freq_hz)
 {
+    /*  Defence in depth: audio_set_params() sanitises the inputs, but this
+     *  function's LUT index is a raw float->int cast, and (int) of a NaN or of
+     *  a value beyond INT_MAX is UNDEFINED — on Xtensa typically 0 or INT_MIN.
+     *  Indexing s_sine_lut with INT_MIN is a wild read that kills the audio
+     *  task outright, so the oscillator must never depend on a caller upstream
+     *  having been careful. A non-finite frequency or a corrupted carried phase
+     *  resets the oscillator to a known-good state instead.                    */
+    if (!isfinite(freq_hz) || !isfinite(*phase)) {
+        *phase = 0.0f;
+        return 0.0f;
+    }
+
     /* Advance phase, wrapping into [0,1). */
     *phase += freq_hz / (float)SAMPLE_RATE;
     if (*phase >= 1.0f) {
         *phase -= 1.0f;
     }
+    /*  A single subtraction only re-normalises a phase that advanced by less
+     *  than one full turn. Guard the pathological case (an enormous freq_hz, or
+     *  a negative phase from a negative frequency) so the index below is always
+     *  inside the table.                                                       */
+    if (*phase >= 1.0f || *phase < 0.0f) {
+        *phase -= floorf(*phase);
+        if (!isfinite(*phase) || *phase < 0.0f || *phase >= 1.0f) {
+            *phase = 0.0f;
+        }
+    }
+
     /* Linear-interpolated LUT read (sine is smooth, so 1024 + interp is clean). */
     float x   = *phase * (float)LUT_SIZE;
-    int   i0  = (int)x;
+    int   i0  = (int)x & (LUT_SIZE - 1);   /* mask BOTH indices, not just i1 */
     int   i1  = (i0 + 1) & (LUT_SIZE - 1);
-    float frac = x - (float)i0;
+    float frac = x - floorf(x);
     return s_sine_lut[i0] * (1.0f - frac) + s_sine_lut[i1] * frac;
 }
 
@@ -952,8 +1065,10 @@ void audio_task(void *arg)
     /*  Always interleaved stereo (L,R,L,R,...); mono modes write L == R. */
     int16_t frame[AUDIO_FRAME_LEN * AUDIO_CH];
 
-    /* TEMP DEBUG — ~1 Hz render-health meter to root-cause the flight-audio jitter.
-     * Remove this block (and the two tagged spots below) once it's diagnosed:
+    /*  ~1 Hz render-health meter (bench only — gated on sf30c_sim_active()).
+     *  Kept rather than removed: `part` is the counter that would have caught
+     *  the truncated sensor-failure chirp, and it was dead code until the write
+     *  loop was fixed to increment it. Fields:
      *   peak  = loudest output sample after headroom (>1.0 => backstop is clipping)
      *   clip  = samples the backstop limiter actually clamped this second
      *   stall = bounded i2s_channel_write stalls (DMA not draining / timeout)
@@ -987,7 +1102,11 @@ void audio_task(void *arg)
          * suspended and would otherwise swallow the chirp entirely. Holding the
          * channel up for the duration of the alert is the only way the pilot
          * hears it; the logic task's normal policy re-suspends afterwards.     */
-        bool suspend_req = s_suspend_req && !s_alert_req;
+        /*  The alert outranks the suspend request while it is REQUESTED and for
+         *  as long as it is still SOUNDING. Testing s_alert_req alone released
+         *  the override the instant the clip was armed, so the pending suspend
+         *  immediately tore the channel down and purged the chirp mid-word.    */
+        bool suspend_req = s_suspend_req && !s_alert_req && !s_alert_playing;
 
         if (suspend_req && s_running) {
             i2s_channel_disable(s_tx);
@@ -1021,6 +1140,10 @@ void audio_task(void *arg)
             s_clip_pcm   = NULL;
             s_clip_len   = 0;
             s_clip_pos   = 0;
+            /*  The purge just destroyed whatever was sounding, so the alert hold
+             *  must not survive it — leaving it latched would pin the channel up
+             *  forever with nothing to play, defeating the suspend entirely.    */
+            s_alert_playing = false;
         } else if (!suspend_req && !s_running) {
             /* Re-arm the clock guards BEFORE enabling so resume clocks out cleanly
              * and the first frames already render at full CPU speed.              */
@@ -1030,7 +1153,7 @@ void audio_task(void *arg)
             if (s_pm_freq_lock) {
                 esp_pm_lock_acquire(s_pm_freq_lock);
             }
-            ESP_LOGW(TAG, "PM locks ACQUIRED (audio resumed)");  /* TEMP DEBUG */
+            ESP_LOGD(TAG, "PM locks acquired (audio resumed)");
             i2s_channel_enable(s_tx);
             s_running = true;
         }
@@ -1041,7 +1164,8 @@ void audio_task(void *arg)
          * Cleared here (not at request time) so a request arriving while the
          * channel was down is still honoured once it comes back.               */
         if (s_alert_req && s_running) {
-            s_alert_req = false;
+            s_alert_req     = false;
+            s_alert_playing = true;   /* hold the channel up until it finishes */
             start_clip(callout_chirp());
         }
 
@@ -1151,6 +1275,10 @@ void audio_task(void *arg)
                     s_clip_pcm = NULL;
                     s_clip_len = 0;
                     s_clip_pos = 0;
+                    /*  Release the sensor-alert channel hold. Whatever just
+                     *  finished, nothing is sounding now, so a pending suspend
+                     *  may take effect on the next pass.                        */
+                    s_alert_playing = false;
                 }
             }
 
@@ -1248,9 +1376,18 @@ void audio_task(void *arg)
             if (off >= sizeof frame) {
                 break;                         /* whole frame queued — done           */
             }
-            /* Channel going down (single-owner suspend handled at loop top): stop
-             * pushing this frame rather than block against a disabled channel.       */
-            if (werr == ESP_ERR_INVALID_STATE || s_suspend_req) {
+            /*  Channel going down (single-owner suspend handled at loop top): stop
+             *  pushing this frame rather than block against a disabled channel.
+             *
+             *  The suspend test must mirror the one at the loop top, alert hold
+             *  included. Testing raw s_suspend_req here aborted the write on
+             *  EVERY frame of a sensor-failure chirp — the request stays set for
+             *  the whole alert, since the logic task only clears it on a
+             *  sleep_allowed falling edge — so the one annunciation that says
+             *  "the LiDAR is dead" was truncated to a fragment of each frame.  */
+            if (werr == ESP_ERR_INVALID_STATE ||
+                (s_suspend_req && !s_alert_req && !s_alert_playing)) {
+                dbg_part++;    /* a genuinely dropped frame tail (click source) */
                 break;
             }
             if (wrote == 0) {

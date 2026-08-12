@@ -825,6 +825,23 @@ static void logic_task(void *arg)
         bool data_stale = (now_us - last_good_us) >
                           (int64_t)LOST_SIGNAL_MUTE_MS * 1000;
 
+        /*  Guard the sample BEFORE it becomes an altitude. This is the seam
+         *  where hardware-derived data enters the pure decision logic, and
+         *  everything downstream — the trend estimator, the dwell timers, the
+         *  audio followers — carries state forward, so a single non-finite
+         *  value here is not a bad tick but a permanently poisoned box. The
+         *  filter should never emit one; this costs two comparisons per sample
+         *  and removes the dependency on "should".                            */
+        if (!isfinite(s.range_ft)) {
+            static uint32_t s_bad_range = 0;
+            if ((s_bad_range++ % 50u) == 0u) {
+                ESP_LOGE(TAG, "non-finite range from the sensor path (%f) — "
+                              "sample discarded", (double)s.range_ft);
+            }
+            vTaskDelay(pdMS_TO_TICKS(last_tick_ms));
+            continue;
+        }
+
         /* Apply the learned ground reference: AGL = range - ground. On a
          * lost-signal sample, hold by feeding the previous AGL (sm clamps). */
         float agl = s.range_ft - s_ground_ref_ft;
@@ -1556,7 +1573,22 @@ void app_main(void)
     /*  calib_error additionally vetoes the write: a boot that had to fall back
      *  to the emergency offset has, by definition, no trustworthy notion of
      *  where the ground is, so nothing it captured belongs in NVS.              */
-    bool persist_ground = !br.airborne && n_fill > 0 && !br.calib_error;
+    /*  A MINIMUM SAMPLE COUNT is required before a fill may become the persisted
+     *  truth. The gate was n_fill > 0, and a single sample satisfies it — but a
+     *  one-element set makes robust_mean's outlier rejection vacuous (median is
+     *  the sample, MAD is zero, the lone value is trivially an inlier), so ONE
+     *  corrupt-but-plausible reading could be written to NVS as the learned
+     *  ground for every future flight. That is the failure mode a marginal
+     *  connector or a sensor still warming up produces: not a wrong altitude
+     *  this flight, but a permanently wrong one until someone recalibrates.
+     *  Requiring a real set restores the robustness the estimator assumes.     */
+    bool enough_fill = (n_fill >= GROUND_PERSIST_MIN_SAMPLES);
+    if (!br.airborne && !br.calib_error && !enough_fill) {
+        ESP_LOGW(TAG, "ground fill too small (%u < %u samples) -> NOT persisting; "
+                      "running on the resolved reference only",
+                 (unsigned)n_fill, (unsigned)GROUND_PERSIST_MIN_SAMPLES);
+    }
+    bool persist_ground = !br.airborne && enough_fill && !br.calib_error;
 #if DEMO_MODE
     /* Demo boots never write the ground buffer (runtime-only, like sim mode):
      * the rig's 2 ft of travel sits inside GROUND_DEV_FT, so a reboot with the

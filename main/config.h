@@ -206,6 +206,15 @@
  *  a second or so at any cadence.                                              */
 #define RANGE_NOTRACK_POLLS      8u   /* useless drains before "sensor is dark" */
 
+/*  Ceiling on the elapsed time handed to the range filter. dt drives the
+ *  Hampel slew allowance and the EMA bandwidth; a value far larger than any
+ *  real poll gap is a timekeeping artefact (a stalled task, a long sleep, a
+ *  torn clock read), not information about the aircraft. Clamping keeps the
+ *  arithmetic meaningful while still being loose enough that a genuinely long
+ *  gap collapses the EMA to a passthrough — the right answer, since state that
+ *  old deserves no weight against a fresh reading.                             */
+#define SENSOR_MAX_DT_S          5.0f /* clamp on the filter's elapsed-time input*/
+
 /*  Sensor-ceiling sanity: a return farther than the active profile's
  *  max_range_ft plus this margin is physically impossible (the SF30/C cannot
  *  see 400 ft) and is treated as lost-signal junk at the gate.                 */
@@ -269,10 +278,38 @@
 /*  Robust (MAD) outlier rejection strength for the ground-fill set.            */
 #define MAD_K                    3.0f
 
+/*  Minimum ground-fill samples before the fill may be PERSISTED to NVS as the
+ *  learned reference. The gate used to be "more than zero", and a single sample
+ *  passes that — but robust_mean over one element cannot reject anything (the
+ *  median IS the sample and the MAD is zero, so it is trivially an inlier).
+ *  One corrupt-but-plausible reading from a marginal connector could therefore
+ *  become the persisted ground for every subsequent flight: not a bad altitude
+ *  once, but a permanently offset one until someone recalibrates. A boot that
+ *  cannot collect this many samples still FLIES on its resolved reference — we
+ *  simply decline to write a conclusion we cannot support.                     */
+#define GROUND_PERSIST_MIN_SAMPLES 5u
+
 /*  Emergency ground offset when no usable reference can be established
  *  (empty buffer AND the first reading looks airborne). The box proceeds on
  *  this value and chirps a calibration-error tone so the pilot is aware.       */
 #define MOUNT_OFFSET_FALLBACK_FT 3.0f
+
+/*  Upper bound on a reading that may be ADOPTED as the ground reference on a
+ *  first boot (empty NVS buffer — a new box, or one the config menu just
+ *  wiped). This is a statement about the MOUNT, not about valid ranges: the
+ *  sensor looks down from the airframe, so a genuine parked reading is the
+ *  mount height plus strut travel and surface variation — a few feet.
+ *
+ *  The band used to be MOUNT_OFFSET_FALLBACK_FT + GROUND_DEV_FT = 13 ft, which
+ *  is over four times a real mount and sits squarely in the altitudes a bounce
+ *  or a low pass occupies. A wiped box that power-glitched at 12 ft AGL adopted
+ *  12.4 ft as its ground with NO calibration error raised: silent, seeded
+ *  disarmed for the landing, and persisted to NVS for every later flight.
+ *  Anything above this now falls to the emergency offset, which chirps the
+ *  pilot and refuses to persist — the honest response to "I cannot tell where
+ *  the ground is". Sized to pass any plausible installation while excluding
+ *  altitudes an aircraft can actually be at.                                   */
+#define MOUNT_GROUND_MAX_FT      6.0f
 
 /* ---- State machine (ft AGL) --------------------------------------------- */
 /*  ARM_FT is intentionally global (same for both sensors): the climb-out after
@@ -368,6 +405,18 @@
  *  ceiling differs per profile.                                                */
 #define SAMPLE_RATE       16000       /* plenty for voice + tone, saves flash    */
 #define AUDIO_FRAME_LEN   128         /* samples generated per render block      */
+
+/*  Sanity ceiling applied to the AGL handed to the audio engine. Everything
+ *  downstream of audio_set_params() is a one-pole follower or a slew limiter,
+ *  and each is a NaN trap with no recovery — a single non-finite value poisons
+ *  the carried state permanently and ultimately reaches the oscillator's LUT
+ *  index, where a float->int cast of a NaN is undefined behaviour and reads the
+ *  table out of bounds. That kills the audio task and with it every remaining
+ *  callout of the flight. Non-finite input is therefore REJECTED at the
+ *  boundary and finite input is clamped to this envelope, which is generous
+ *  enough to never touch a legitimate reading (well above the SF30/D's 656 ft
+ *  reach, and above any DEMO_MODE scaled altitude worth sounding).             */
+#define AUDIO_MAX_AGL_FT  1000.0f     /* clamp on the AGL fed to the audio task  */
 
 /* ---- Audio: channel layout & runtime config defaults -------------------- */
 /*  The PCM5102A is a true stereo DAC. The I2S peripheral ALWAYS runs in stereo

@@ -12,7 +12,18 @@
 #include "robust.h"
 
 #include <string.h>
+#include <math.h>       /* isfinite() — NaN guards on the resolve path */
 
+/*  HARDWARE-ONLY REGION. boot_buffer_resolve() — the function that decides
+ *  where the ground is, whether the box booted airborne, and whether the
+ *  calibration can be trusted — is PURE: it reads its inputs and writes its
+ *  result, touching no peripheral. That makes it the most safety-critical
+ *  host-testable logic in the firmware, and it had no coverage at all while the
+ *  NVS/GPIO includes below forced the whole translation unit to be
+ *  firmware-only. Fencing them (the same UNIT_TEST split config.h already uses)
+ *  lets the resolver be exercised on the desktop, where the obstruction, jack,
+ *  in-flight-reboot and NaN cases can each be pinned by a test.                */
+#ifndef UNIT_TEST
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "driver/gpio.h"
@@ -20,8 +31,25 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#else
+/*  Host build: the persistence/GPIO surface is compiled out entirely (see the
+ *  #ifndef UNIT_TEST fence further down), so only these logging shims are
+ *  needed to keep the pure code identical to what ships.                       */
+#include <stdio.h>
+#define ESP_LOGW(tag, fmt, ...) ((void)0)
+#define ESP_LOGE(tag, fmt, ...) ((void)0)
+#define ESP_LOGI(tag, fmt, ...) ((void)0)
+#endif
 
 static const char *TAG = "bootbuf";
+
+#ifndef UNIT_TEST
+/* =========================================================================
+ *  PERSISTENCE / GPIO SURFACE (firmware build only).
+ *  Everything from here to the matching #endif talks to NVS or the config
+ *  button. The host test build skips it and compiles only the pure resolver
+ *  at the bottom of the file.
+ * ========================================================================= */
 
 /* ---- NVS bring-up -------------------------------------------------------- */
 
@@ -670,32 +698,108 @@ size_t boot_buffer_load(boot_entry_t *out, size_t cap)
         return 0;
     }
 
+    /*  NVS is persistent storage that outlives firmware versions, so its
+     *  contents are UNTRUSTED INPUT exactly like the sensor wire. A blob whose
+     *  length is not a whole number of entries did not come from this struct
+     *  layout — it is a partial write, a legacy record, or corruption — and
+     *  reinterpreting those bytes as floats yields arbitrary "ground readings"
+     *  that would be adopted as the aircraft's reference. Reject the whole
+     *  record rather than decode a prefix of it; a first-boot calibration is a
+     *  far better outcome than a confidently wrong ground.                     */
+    if ((blob_len % sizeof(boot_entry_t)) != 0u) {
+        ESP_LOGW(TAG, "ground buffer blob is %u bytes, not a multiple of %u "
+                      "(corrupt or from an older layout) -> ignoring it",
+                 (unsigned)blob_len, (unsigned)sizeof(boot_entry_t));
+        nvs_close(h);
+        return 0;
+    }
+
     /* Clamp to what the caller can hold and to BOOT_BUFFER_N. */
     size_t n = blob_len / sizeof(boot_entry_t);
     if (n > cap) {
         n = cap;
     }
-    size_t want = n * sizeof(boot_entry_t);
-    err = nvs_get_blob(h, NVS_KEY_GROUNDBUF, out, &want);
+    if (n == 0u) {
+        nvs_close(h);
+        return 0;
+    }
+
+    /*  nvs_get_blob fails with ESP_ERR_NVS_INVALID_LENGTH when the caller's
+     *  buffer is smaller than the stored blob, which is precisely the clamped
+     *  case above (a blob holding more entries than we can accept). Read the
+     *  whole record into a local of known size and copy across the prefix we
+     *  want, so a larger stored buffer degrades gracefully instead of being
+     *  discarded outright.                                                     */
+    boot_entry_t scratch[BOOT_BUFFER_N];
+    size_t avail = blob_len / sizeof(boot_entry_t);
+    if (avail > BOOT_BUFFER_N) {
+        avail = BOOT_BUFFER_N;
+    }
+    size_t want = avail * sizeof(boot_entry_t);
+    err = nvs_get_blob(h, NVS_KEY_GROUNDBUF, scratch, &want);
     nvs_close(h);
 
     if (err != ESP_OK) {
         return 0;
     }
-    return n;
+
+    /*  Validate every decoded value before it can reach the estimator. A stored
+     *  range that is non-finite, negative, or beyond the ground-fill junk cap
+     *  cannot describe a parked aircraft, so it is dropped rather than averaged
+     *  in. Entries are compacted so the caller always receives a dense, wholly
+     *  usable set and never has to know that filtering happened.               */
+    size_t kept = 0;
+    size_t limit = (n < avail) ? n : avail;
+    for (size_t i = 0; i < limit; ++i) {
+        float v = scratch[i].range_ft;
+        if (!isfinite(v) || v < 0.0f || v > MAX_VALID_FT) {
+            continue;
+        }
+        out[kept++] = scratch[i];
+    }
+    if (kept < limit) {
+        ESP_LOGW(TAG, "ground buffer: dropped %u implausible stored entries "
+                      "(kept %u)", (unsigned)(limit - kept), (unsigned)kept);
+    }
+    return kept;
 }
 
 void boot_buffer_commit(const float *ground_reads, size_t n, uint32_t marker)
 {
+    if (!ground_reads || n == 0u) {
+        /*  Writing an empty record would REPLACE a perfectly good stored
+         *  reference with nothing — a silent downgrade to first-boot behaviour
+         *  on the next power-up. The caller currently gates this, but the
+         *  function must not depend on that: refusing here makes the contract
+         *  safe for every future caller.                                       */
+        ESP_LOGW(TAG, "boot_buffer_commit: nothing to persist; keeping the "
+                      "existing stored reference");
+        return;
+    }
     if (n > BOOT_BUFFER_N) {
         n = BOOT_BUFFER_N;
     }
 
+    /*  Never persist a value we would refuse to load. Filtering on the way IN
+     *  as well as on the way out means a corrupt reading cannot become
+     *  tomorrow's ground even if some future caller skips its own validation.  */
     boot_entry_t entries[BOOT_BUFFER_N];
+    size_t kept = 0;
     for (size_t i = 0; i < n; ++i) {
-        entries[i].range_ft = ground_reads[i];
-        entries[i].marker   = marker;
+        float v = ground_reads[i];
+        if (!isfinite(v) || v < 0.0f || v > MAX_VALID_FT) {
+            continue;
+        }
+        entries[kept].range_ft = v;
+        entries[kept].marker   = marker;
+        ++kept;
     }
+    if (kept == 0u) {
+        ESP_LOGW(TAG, "boot_buffer_commit: every candidate reading was "
+                      "implausible; keeping the existing stored reference");
+        return;
+    }
+    n = kept;
 
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
@@ -713,12 +817,29 @@ void boot_buffer_commit(const float *ground_reads, size_t n, uint32_t marker)
     nvs_close(h);
 }
 
+#endif /* !UNIT_TEST — end of the persistence / GPIO surface */
+
 /* ---- Ground-reference resolution ----------------------------------------- */
+/*  PURE from here down: no NVS, no GPIO, no clock. This is the function that
+ *  decides where the ground is and whether the box can trust its calibration,
+ *  so it is exercised directly by test/test_boot_buffer.c.                    */
 
 void boot_buffer_resolve(const boot_entry_t *stored, size_t n_stored,
                          float current_ft, bool have_current,
                          boot_result_t *result)
 {
+    /*  A non-finite current reading must never reach the comparisons below.
+     *  Every one of them is a floating-point ordering test, and EVERY such test
+     *  against NaN is false — so a NaN silently takes whichever branch the code
+     *  happens to fall through to, and the `boot_agl < 0` clamp further down is
+     *  provably ineffective against it (NaN < 0 is false, so the clamp does not
+     *  fire and the NaN propagates into the seeded state). Treat it as "no
+     *  current reading at all", which is exactly what it is.                    */
+    if (have_current && !isfinite(current_ft)) {
+        have_current = false;
+        current_ft   = 0.0f;
+    }
+
     /* Pull the stored ranges into a flat array for the robust estimator. */
     float vals[BOOT_BUFFER_N];
     size_t m = (n_stored > BOOT_BUFFER_N) ? BOOT_BUFFER_N : n_stored;
@@ -744,8 +865,20 @@ void boot_buffer_resolve(const boot_entry_t *stored, size_t n_stored,
          * perfect ground here. Both defeated the calibration warning built for
          * exactly these cases; both now fall through to the emergency offset
          * and chirp the pilot.                                                */
+        /*  The band was MOUNT_OFFSET_FALLBACK_FT + GROUND_DEV_FT = 13 ft, which
+         *  is more than four times a real mount height and squarely inside the
+         *  altitudes a bounced landing or a low pass occupies. A freshly wiped
+         *  box (the config menu erases the buffer) that power-glitches at 12 ft
+         *  AGL therefore adopted 12.4 ft as "ground" with calib_error CLEAR: no
+         *  chirp, no warning, the ladder seeded DISARMED for the whole landing,
+         *  and the airborne value written to NVS to poison later flights.
+         *
+         *  MOUNT_GROUND_MAX_FT bounds it to what a mount can physically read
+         *  instead. Anything above falls to the emergency-offset branch, which
+         *  chirps the pilot and refuses to persist — the honest answer when the
+         *  box genuinely cannot tell where the ground is.                       */
         if (have_current && current_ft >= 0.0f &&
-            current_ft <= MOUNT_OFFSET_FALLBACK_FT + GROUND_DEV_FT) {
+            current_ft <= MOUNT_GROUND_MAX_FT) {
             result->ground_ref_ft = current_ft;
             result->boot_agl_ft   = 0.0f;
             result->airborne      = false;
@@ -764,13 +897,34 @@ void boot_buffer_resolve(const boot_entry_t *stored, size_t n_stored,
 
     /* We have a trustworthy stored ground reference. Decide ground vs airborne
      * by how far the current reading sits above it.                           */
-    float agl = current_ft - ground_ref;
+    float dev = current_ft - ground_ref;      /* signed: +above, -below */
+    float agl = dev;
     if (agl < 0.0f) {
         agl = 0.0f;
     }
 
     result->ground_ref_ft = ground_ref;
     result->boot_agl_ft   = agl;
-    result->airborne      = (current_ft - ground_ref) > GROUND_DEV_FT;
-    result->calib_error   = false;
+    result->airborne      = dev > GROUND_DEV_FT;
+
+    /*  DISAGREEMENT IS TWO-SIDED. The old test looked only at the HIGH side and
+     *  then cleared calib_error unconditionally, which left the low side — a
+     *  reading well BELOW the learned ground — indistinguishable from a perfect
+     *  on-ground boot. It is not: nothing legitimately parks the aircraft
+     *  measurably closer to the sensor than the ground it learned on.
+     *
+     *  The realistic causes are an OBSTRUCTION under the sensor (a mechanic's
+     *  shoulder, a tow bar, a chock, a puddle giving a specular return) or the
+     *  aircraft sitting on JACKS. Both were silently clamped to agl = 0 and
+     *  reported healthy — and because the caller's persist gate keys off
+     *  !airborne && !calib_error, the obstructed reading was then WRITTEN TO
+     *  NVS as the new learned ground. That is the worst failure in this file:
+     *  it is not confined to the current flight, it silently offsets every
+     *  future one until someone recalibrates on a clean surface.
+     *
+     *  Flagging it costs nothing when the box is genuinely healthy (a real
+     *  parked boot sits within a few inches of its learned ground, far inside
+     *  GROUND_DEV_FT) and buys a boot chirp plus a persist veto exactly when
+     *  the reference cannot be trusted.                                        */
+    result->calib_error = (dev < -GROUND_DEV_FT);
 }
