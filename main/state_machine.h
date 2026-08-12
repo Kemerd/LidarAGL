@@ -160,6 +160,27 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
              const sensor_profile_t *p, sm_out_t *out);
 
 /**
+ * @brief Re-anchor the machine onto a DISCONTINUOUS new altitude.
+ *
+ * @details Called when the range filter reports a broken track
+ *          (rf_track_broken()): the published altitude is trustworthy again,
+ *          but the aircraft did NOT fly through the heights between the old
+ *          value and the new one. Walking the callout ladder across that gap
+ *          would speak numbers the aircraft never passed — a phantom low
+ *          callout, the most dangerous thing this box can say.
+ *
+ *          So we move the trend's anchor to the new altitude WITHOUT producing
+ *          a crossing, and zero the smoothed rate (the discontinuity carries no
+ *          velocity information). Armed state and the per-rung one-shot mask are
+ *          deliberately preserved: the rungs the aircraft genuinely passed
+ *          earlier stay spent, and the rungs still ahead of it stay available.
+ *
+ * @param c       Carried context (updated in place).
+ * @param agl_ft  The new, trustworthy AGL to anchor on.
+ */
+void sm_reanchor(sm_ctx_t *c, float agl_ft);
+
+/**
  * @brief Map a poll profile to a concrete period in milliseconds (config.h).
  * @param pp  Poll profile.
  * @return    Milliseconds between sensor reads for that profile.

@@ -61,6 +61,32 @@ void sm_init(sm_ctx_t *c, sm_state_t initial)
     }
 }
 
+void sm_reanchor(sm_ctx_t *c, float agl_ft)
+{
+    if (agl_ft < 0.0f) {
+        agl_ft = 0.0f;
+    }
+
+    /*  Move the crossing anchor to the new level WITHOUT letting the move look
+     *  like flown motion. fire_descent_callout() compares prev_agl against the
+     *  current AGL, so seeding prev_agl to the new value means the very next
+     *  sm_step() sees no crossing across the gap — only genuine movement from
+     *  here on can fire a rung.                                                 */
+    c->prev_agl  = agl_ft;
+    c->have_prev = true;
+
+    /*  A discontinuity carries no velocity information: the jump did not happen
+     *  at any particular rate. Leaving the old trend in place would let a stale
+     *  climb/descent sign drive the state transition (and the vario blip) for
+     *  several ticks after the re-anchor.                                        */
+    c->trend_fps = 0.0f;
+
+    /*  Arming, the per-rung one-shot mask and every dwell timer are deliberately
+     *  LEFT ALONE. The rungs already spoken were genuinely passed and must stay
+     *  spent; the rungs ahead must stay available; and the arm/parked dwells are
+     *  about time spent in a band, which the re-anchor does not invalidate.      */
+}
+
 sm_state_t sm_initial_state(float boot_agl, bool ok, const sensor_profile_t *p)
 {
     /* Untrustworthy estimate -> assume parked. GROUND is the safe default: it
@@ -329,7 +355,19 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
         }
     } else {
         /* Armed life. Cruise band gates the low-power state; below it we are
-         * ARMED (level/climbing) or DESCENT (sinking).                         */
+         * ARMED (level/climbing) or DESCENT (sinking).
+         *
+         * The CRUISE test is deliberately on ALTITUDE ALONE, never on the trend.
+         * That matters because CRUISE must not be a one-way door: it suspends
+         * audio, relaxes the poll and permits light-sleep, so anything that can
+         * make the machine enter but not leave costs the entire approach. The
+         * historical failure was exactly that — climbing out of the sensor's
+         * range froze the published AGL just above cruise_ft, a frozen input
+         * yields a zero trend, and an exit conditioned on "descending" could
+         * therefore never fire. Keying the exit off the height means any fall
+         * below cruise_ft leaves immediately, whatever the trend estimator
+         * thinks; the range filter's ceiling handling supplies a height that
+         * actually moves (see RANGE_CEILING_NEAR_FT).                          */
         if (agl_ft >= p->cruise_ft) {
             next = ST_CRUISE;
         } else if (is_descending(trend)) {

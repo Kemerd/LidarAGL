@@ -37,6 +37,12 @@ typedef struct {
     float    range_ft;   /**< Filtered range in feet (mount offset NOT applied). */
     bool     valid;      /**< False on a lost-signal / no-return sample.         */
     uint32_t seq;        /**< Monotonic sample counter (for dt sanity).          */
+    bool     track_break;/**< True for the ONE sample where the filter broke     */
+                         /**< track and re-acquired a DISCONTINUOUS level. The   */
+                         /**< value is trustworthy, but the jump from the        */
+                         /**< previous one is NOT flown motion — the logic task  */
+                         /**< re-anchors the state machine instead of letting it */
+                         /**< walk the callout rungs across the gap.             */
 } range_sample_t;
 
 /** Tone parameters the logic task publishes for the audio task. */

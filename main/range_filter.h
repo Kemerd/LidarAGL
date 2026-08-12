@@ -125,6 +125,27 @@ typedef struct {
 
     /* --- Validity gate configuration.                                        */
     float    max_range_ft; /**< Active sensor ceiling; beyond +margin = junk.  */
+
+    /* --- Out-of-range (above the ceiling) verdict, stage 1b.                 *
+     *  A lost-signal drain is ambiguous on its own: the SF30 reports "no
+     *  return" both when the target is BEYOND its range and when the surface
+     *  simply does not reflect (water, a dark wet runway). The two demand
+     *  OPPOSITE handling — the first means "we are higher than the sensor can
+     *  see", the second means "we know nothing" — so the filter records which
+     *  case the evidence supports rather than collapsing both into a hold.
+     *  See rf_finalize()'s ceiling test for how the verdict is reached.        */
+    bool     above_ceiling;   /**< Last drain read as out-of-range ABOVE.       */
+    uint32_t ceiling_polls;   /**< Consecutive drains supporting that verdict.  */
+
+    /* --- Track-break annunciation (stage 4b).                                *
+     *  Set for exactly ONE finalize when the filter RE-ACQUIRES onto a level
+     *  that is discontinuous with the one it was tracking. The published value
+     *  is trustworthy again from that moment, but the JUMP itself is not a
+     *  flown trajectory — nothing crossed the intervening heights. Consumers
+     *  that edge-trigger on movement (the callout ladder) must treat it as a
+     *  teleport and re-anchor rather than walking the rungs between the two
+     *  levels. See rf_finalize() and the logic task's handling.               */
+    bool     track_break;
 } range_filter_t;
 
 /**
@@ -169,5 +190,26 @@ void rf_drain_abort(range_filter_t *f);
  *                         "have last-good" contract); false before first lock.
  */
 bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_valid);
+
+/**
+ * @brief Did the LAST rf_finalize() re-acquire onto a DISCONTINUOUS level?
+ *
+ * @details True for exactly one finalize after the filter breaks track and
+ *          snaps to a new level (a genuine terrain step, an in-flight power-up,
+ *          or a recovery from a stretch of untrustworthy data). The published
+ *          range is trustworthy again — but the aircraft did NOT fly through
+ *          the heights between the old level and the new one, so a consumer
+ *          that edge-triggers on downward movement must NOT walk the callout
+ *          rungs across the gap. It should re-anchor to the new level instead.
+ *
+ *          This mirrors the "break track / re-acquire" distinction a radar
+ *          altimeter draws: a track that has been broken and re-established is
+ *          a NEW track, not a continuation of the old one, and the discontinuity
+ *          must never be interpreted as motion.
+ *
+ * @param f  Filter state.
+ * @return   True if the last finalize was a discontinuous re-acquisition.
+ */
+bool rf_track_broken(const range_filter_t *f);
 
 #endif /* LIDARAGL_RANGE_FILTER_H */

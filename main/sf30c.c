@@ -478,6 +478,11 @@ void sensor_task(void *arg)
                 .range_ft = range_ft,
                 .valid    = valid,
                 .seq      = ++s_seq,
+                /*  Carry the filter's track-break verdict to the logic task. It
+                 *  is true for exactly the one sample that re-acquired onto a
+                 *  discontinuous level, so the consumer can re-anchor instead of
+                 *  reading the jump as flown motion (see rf_track_broken).      */
+                .track_break = rf_track_broken(&s_rf),
             };
             /* Overwrite so the logic task always sees the freshest sample with
              * no backlog lag — essential for on-time callouts.                */

@@ -46,9 +46,9 @@
 #define DEMO_MODE 0                 /* compiled OUT unless the build defines it */
 #endif
 #if DEMO_MODE
-#define FIRMWARE_VERSION "v1.61-DEMO"
+#define FIRMWARE_VERSION "v1.62-DEMO"
 #else
-#define FIRMWARE_VERSION "v1.61"
+#define FIRMWARE_VERSION "v1.62"
 #endif
 
 /* ---- Sensor model identifiers ------------------------------------------- */
@@ -144,10 +144,75 @@
 #define RANGE_REACQUIRE_BAND_FT 8.0f  /* how tightly the rejects must agree     */
 #define RANGE_REACQUIRE_MIN_SAMPLES 8u /* raw samples that must back the cluster */
 
+/*  Physical-reachability guard on the SNAP itself. Poll count and sample mass
+ *  both measure how CONSISTENT the agreeing cluster is — and a stuck byte
+ *  pattern is perfectly consistent, so it satisfies both for free. The one
+ *  property corruption cannot fabricate is being physically reachable: the snap
+ *  must not move the published range farther than the airframe could actually
+ *  have flown while the cluster was being collected (RANGE_MAX_SLEW_FPS x the
+ *  cluster's own wall-clock duration), plus this slack.
+ *
+ *  Without it, a 4-poll stuck burst at the DESCENT cadence re-acquired a ~110 ft
+ *  downward step in ~100 ms and made the box speak "one hundred" while the
+ *  aircraft was still at 186 ft AGL — a phantom low callout on final, which is
+ *  the most dangerous place this box can lie. The slack keeps a genuine terrain
+ *  edge (a bluff or a displaced threshold, which really can step the ground
+ *  under a fast aircraft) comfortably inside the allowance.
+ *
+ *  The guard applies to DOWNWARD snaps only. A snap to a FARTHER level cannot
+ *  fabricate a callout — the ladder fires only on downward crossings — and the
+ *  in-flight power-up case (box anchored near the ground, true range hundreds
+ *  of feet away) is exactly that shape, so it must stay unrestricted.           */
+#define RANGE_REACQUIRE_JUMP_SLACK_FT 25.0f /* headroom over the physical reach  */
+
+/*  TRACK BREAK. A downward snap larger than the (bounded) physical reach cannot
+ *  have been flown — but refusing it forever would strand the filter on a stale
+ *  anchor after a genuine discontinuity: an in-flight power-up, a real cliff
+ *  edge, or recovery from a long out-of-range stretch. So we accept it after
+ *  this many agreeing polls, while explicitly flagging that the TRACK BROKE
+ *  (rf_track_broken()). The published value is trustworthy again; the JUMP is
+ *  not motion, and the callout ladder must re-anchor across it rather than
+ *  speak the rungs in between.
+ *
+ *  This is the standard avionics distinction — a radar altimeter that loses and
+ *  re-establishes lock treats the result as a NEW track, never as a continuous
+ *  trajectory — and it is what PX4's rangefinder path does in spirit with its
+ *  kinematic-consistency check plus rejection hysteresis. The count is set well
+ *  above RANGE_REACQUIRE_N so an ordinary noisy patch can never break track:
+ *  breaking is reserved for evidence that is both sustained AND self-agreeing.  */
+#define RANGE_TRACK_BREAK_POLLS  12u  /* agreeing polls to accept a broken track */
+
 /*  Sensor-ceiling sanity: a return farther than the active profile's
  *  max_range_ft plus this margin is physically impossible (the SF30/C cannot
  *  see 400 ft) and is treated as lost-signal junk at the gate.                 */
 #define RANGE_MAX_MARGIN_FT    15.0f
+
+/* ---- Out-of-range-ABOVE detection (the "silent descent" fix) ------------- */
+/*  The SF30 emits its lost-signal sentinel for TWO physically opposite reasons:
+ *  the target is BEYOND the sensor's range (we climbed out of its ~328 ft
+ *  reach), or the surface returns nothing (water, a dark wet runway). The old
+ *  filter collapsed both into "hold the last good value", and that hold is what
+ *  silenced a real approach:
+ *
+ *    Climb above 328 ft -> every drain is majority-lost -> the EMA freezes at
+ *    ~318 ft and is republished forever. A frozen value has ZERO trend, so the
+ *    state machine sees "level at 318 ft", parks in ST_CRUISE (audio suspended,
+ *    500 ms poll, light sleep) and NEVER leaves — because leaving requires a
+ *    descending trend that a frozen input can never produce. On the way back
+ *    down the Hampel gate then has to re-acquire from a 318 ft anchor, burning
+ *    several polls, and by the time it snaps prev_agl is already below the top
+ *    rungs. A rung with no DOWNWARD crossing on the books cannot speak, and it
+ *    is one-shot disarmed, so the whole ladder is lost for that approach.
+ *
+ *  We disambiguate on the evidence we actually have: if the last GOOD reading
+ *  was already within CEILING_NEAR_FT of the sensor's ceiling and the drains
+ *  then went lost, the aircraft climbed out of range — nothing else explains a
+ *  reading that walked UP to the ceiling and off the end of it. A lost-signal
+ *  stretch that begins from 50 ft over water fails that test and is still HELD
+ *  exactly as before. CEILING_CONFIRM_POLLS keeps a single ragged drain at the
+ *  noisy top of the range from flipping the verdict.                          */
+#define RANGE_CEILING_NEAR_FT      40.0f  /* last-good within this of the ceiling */
+#define RANGE_CEILING_CONFIRM_POLLS 2u    /* consecutive lost drains to confirm   */
 
 /*  Final smoothing: a TIME-CORRECTED one-pole EMA, alpha = 1 - exp(-dt/tau).
  *  The retired fixed-alpha-per-poll EMA had a 30x effective-bandwidth swing
@@ -757,6 +822,37 @@
 /* ---- Power management frequency envelope -------------------------------- */
 #define PM_MAX_FREQ_MHZ   240
 #define PM_MIN_FREQ_MHZ   40
+
+/* ---- Light-sleep master switch (compile-time) ---------------------------- */
+/*  Automatic light-sleep saves power in GROUND/CRUISE, where the box is silent
+ *  anyway. It also costs us: sleeping gates the UART clock (the documented
+ *  source of the wake-edge framing garbage sf30c.c drains around), tears the
+ *  I2S channel down via audio_suspend(), and relaxes the poll to 500 ms — so
+ *  every millisecond of latency in noticing a descent is paid back on final.
+ *
+ *  It is left ENABLED. Sleep was the prime suspect for the silent approach that
+ *  motivated this switch, but it turned out to be the accomplice rather than the
+ *  culprit: the real defect was that ST_CRUISE became a ONE-WAY DOOR. Climbing
+ *  out of the sensor's range froze the published value; a frozen value has zero
+ *  trend; and leaving CRUISE requires a descending trend — so the box could
+ *  ENTER the sleep state but never leave it, for the rest of the flight. With
+ *  the ceiling handling in range_filter.c (see RANGE_CEILING_NEAR_FT) the
+ *  descent is visible again and CRUISE exits normally, which is what makes the
+ *  power saving safe to keep.
+ *
+ *  The switch stays because it is the one knob that removes sleep from the
+ *  variables entirely if a future flight is still unexplained. Build with
+ *  -DSLEEP_MODE_ENABLE=0 and esp_pm_configure() runs with light_sleep_enable =
+ *  false (DFS still scales the CPU frequency, which is free) while the logic
+ *  task never requests an audio suspend, so the I2S channel stays up for the
+ *  whole flight.
+ *
+ *  Independently of this switch, the logic task now also refuses to enter a
+ *  sleep state on data it knows is STALE — a held value is precisely when we
+ *  are least entitled to assume nothing is happening below us.                 */
+#ifndef SLEEP_MODE_ENABLE
+#define SLEEP_MODE_ENABLE 1           /* 1 = allow light-sleep in GROUND/CRUISE */
+#endif
 
 #endif /* !UNIT_TEST */
 

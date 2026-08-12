@@ -117,6 +117,11 @@ void rf_set_max_range(range_filter_t *f, float max_range_ft)
     f->max_range_ft = max_range_ft;
 }
 
+bool rf_track_broken(const range_filter_t *f)
+{
+    return f->track_break;
+}
+
 void rf_push_cm(range_filter_t *f, float cm)
 {
     /* --- Stage 1: absolute validity gates ---------------------------------- */
@@ -171,16 +176,80 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
         dt_s = 0.001f;
     }
 
-    /* --- No usable fresh data: hold last-good ------------------------------ */
+    /*  The track-break flag describes THIS finalize only; clear it up front so
+     *  it is never left set from a previous call.                              */
+    f->track_break = false;
+
+    /* --- No usable fresh data: out-of-range ABOVE, or hold last-good -------- */
     /*  A drain that is EMPTY (sensor silent) or MAJORITY lost-signal is not
      *  trusted even if a few stray "returns" survived the gates — when the
      *  sensor itself says "no return" 40 times in a row, the two samples that
-     *  disagree are more likely corruption than ground.                        */
+     *  disagree are more likely corruption than ground.
+     *
+     *  But "no return" has two opposite physical causes, and holding is only
+     *  right for ONE of them. If the last GOOD reading had already climbed to
+     *  within RANGE_CEILING_NEAR_FT of the sensor's ceiling, the aircraft flew
+     *  out the TOP of the sensor's range — the reading walked up to the limit
+     *  and off the end of it, which a non-reflective surface cannot imitate
+     *  (that begins from wherever the aircraft happens to be, typically low).
+     *  In that case the honest output is the CEILING, not a frozen mid-air
+     *  number: it keeps the published range monotonically consistent with the
+     *  climb, and — critically — it means the descent back through the ceiling
+     *  is a genuine DOWNWARD movement the state machine can see and the
+     *  callout ladder can edge-trigger on. Freezing instead produced a
+     *  zero-trend "level at 318 ft" that pinned the box in ST_CRUISE for the
+     *  rest of the flight (see RANGE_CEILING_NEAR_FT in config.h).
+     *
+     *  The verdict needs RANGE_CEILING_CONFIRM_POLLS consecutive lost drains so
+     *  one ragged drain in the noisy top of the range cannot flip it, and it is
+     *  reported as fresh_valid == false either way: this is an INFERENCE about
+     *  where we are, not a measurement, so the tone's stale-data mute and the
+     *  no-data annunciation upstream still behave exactly as before.           */
     if (n_valid == 0 || n_lost > n_valid) {
+        bool near_ceiling = f->have_out && f->max_range_ft > 0.0f &&
+                            f->ema_ft >= f->max_range_ft - RANGE_CEILING_NEAR_FT;
+
+        if (near_ceiling && n_lost > 0) {
+            /* Only a drain that actually SAW lost-signal returns is evidence of
+             * flying out of range; a wholly EMPTY drain (n_lost == 0) means the
+             * sensor said nothing at all — dead, unplugged, or wrong baud — and
+             * must never be read as an altitude claim.                          */
+            if (f->ceiling_polls < UINT32_MAX) {
+                ++f->ceiling_polls;
+            }
+            if (f->ceiling_polls >= RANGE_CEILING_CONFIRM_POLLS) {
+                f->above_ceiling = true;
+            }
+        } else {
+            f->ceiling_polls = 0;
+            f->above_ceiling = false;
+        }
+
+        if (f->above_ceiling) {
+            /* Pin the output AT the ceiling and drag the Hampel window with it,
+             * so the descent back into range is gated against "we were at the
+             * ceiling" rather than against a stale mid-air anchor. Without the
+             * re-anchor the first in-range reading would look like a huge
+             * outlier and burn RANGE_REACQUIRE_N polls before it was believed —
+             * several hundred feet of descent at the CRUISE cadence.            */
+            f->ema_ft = f->max_range_ft;
+            f->win_n    = 0;
+            f->win_head = 0;
+            while (f->win_n < HAMPEL_SEED_N) {
+                win_push(f, f->max_range_ft);
+            }
+            f->pend_n       = 0;
+            f->pend_samples = 0;
+        }
+
         *fresh_valid = false;
         *range_ft    = f->ema_ft;
         return f->have_out;
     }
+
+    /* A usable drain arrived: we are back inside the sensor's range. */
+    f->ceiling_polls = 0;
+    f->above_ceiling = false;
 
     /* --- Stage 2: the drain votes; the median wins -------------------------- */
     float med = median_inplace(scratch, n_valid);
@@ -221,8 +290,85 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
                 f->pend_samples = (uint32_t)n_valid;
             }
 
+            /*  How far this snap would MOVE the published range, and how far the
+             *  aircraft could physically have moved while the cluster was being
+             *  collected. A re-acquire is an admission that our anchor is wrong,
+             *  so it deliberately bypasses the Hampel gate — but "the anchor is
+             *  wrong" must not become "any self-consistent garbage may teleport
+             *  us anywhere". A stuck byte pattern repeats cleanly and therefore
+             *  agrees with itself perfectly, satisfying the poll count and the
+             *  sample mass for free; the only thing it cannot fake is being
+             *  physically reachable in the time it took to observe.
+             *
+             *  Concretely, this is what a 4-poll stuck burst on final used to
+             *  do: at 186 ft AGL it re-acquired a garbage level of ~76 ft — a
+             *  110 ft downward teleport in ~100 ms — and the state machine
+             *  faithfully spoke "one hundred" through it. That is the taxi
+             *  phantom's exact failure class, except in the air on approach,
+             *  where a spurious low callout is at its most dangerous. Requiring
+             *  the jump to be reachable at RANGE_MAX_SLEW_FPS costs a genuine
+             *  terrain step nothing (real ground moves at aircraft speeds) and
+             *  makes a fabricated one need corruption that lasts long enough to
+             *  be physically plausible — by which point it is indistinguishable
+             *  from, and as slow as, a real level change.
+             *
+             *  NOTE the allowance is bounded by RANGE_GATE_CAP_FT and does NOT
+             *  grow without limit with the cluster's duration. An unbounded
+             *  version was worse than useless: simply waiting long enough
+             *  bought an arbitrarily large teleport, so an out-of-range stretch
+             *  that eventually settled on a low erroneous cluster snapped
+             *  335 ft -> 12 ft in a single poll and spoke "twenty" at altitude.
+             *  Past the cap the jump is not judged reachable at all — it is a
+             *  BROKEN TRACK, handled below, which is a different thing from a
+             *  measurement and must be reported as such.                        */
+            /*  Direction matters. An UPWARD jump (the new level reads FARTHER
+             *  than our anchor) cannot fabricate a low callout — the callout
+             *  ladder only ever fires on a DOWNWARD crossing, so adopting a
+             *  higher level can at worst delay a number, never invent one. The
+             *  in-flight power-up case this filter must support is exactly that
+             *  shape: the box wakes anchored near the ground and the true range
+             *  is hundreds of feet farther away. Those stay governed by the
+             *  poll-count and sample-mass rules alone.
+             *
+             *  A DOWNWARD jump is the dangerous direction, and it is the one a
+             *  stuck pattern exploited: adopting a lower level walks the ladder
+             *  and speaks numbers the aircraft never reached. So only downward
+             *  snaps must additionally be physically reachable.                 */
+            float jump_ft    = f->ema_ft - f->pend_mean;   /* >0 == downward     */
+            float cluster_s  = dt_s * (float)f->pend_n;
+            float reach_ft   = RANGE_MAX_SLEW_FPS * cluster_s +
+                               RANGE_REACQUIRE_JUMP_SLACK_FT;
+            /*  Bounded exactly like the Hampel slew allowance, and for the same
+             *  reason: an allowance that grows with elapsed time lets patience
+             *  substitute for evidence.                                         */
+            if (reach_ft > RANGE_GATE_CAP_FT) {
+                reach_ft = RANGE_GATE_CAP_FT;
+            }
+            bool  reachable  = !f->have_out ||
+                               jump_ft <= 0.0f ||          /* upward: unrestricted */
+                               jump_ft <= reach_ft;
+
+            /*  A downward jump too large to have been flown is still something
+             *  we must eventually accept — refusing forever would strand the
+             *  filter on a stale anchor after a genuine discontinuity (an
+             *  in-flight power-up, a recovery from a long out-of-range stretch,
+             *  a real cliff edge). We accept it, but we do NOT pretend the
+             *  aircraft flew there: the track is BROKEN and re-established, and
+             *  rf_track_broken() tells the consumer so. The callout ladder
+             *  re-anchors on the new level instead of speaking the rungs in
+             *  between — which is exactly the phantom this prevents.
+             *
+             *  The extra evidence required scales with how implausible the jump
+             *  is, so ordinary noise can never trigger a break.                 */
+            bool  breaks_track = !reachable &&
+                                 f->pend_n >= (uint32_t)RANGE_TRACK_BREAK_POLLS;
+
             if (f->pend_n >= (uint32_t)RANGE_REACQUIRE_N &&
-                f->pend_samples >= (uint32_t)RANGE_REACQUIRE_MIN_SAMPLES) {
+                f->pend_samples >= (uint32_t)RANGE_REACQUIRE_MIN_SAMPLES &&
+                (reachable || breaks_track)) {
+                /*  Annunciate a discontinuous snap so downstream can re-anchor
+                 *  rather than interpret the gap as flown motion.               */
+                f->track_break = breaks_track;
                 /* A REAL level step: N consecutive rejects agreed AND enough
                  *  raw samples backed them. The second condition is what stops
                  *  a fast-cadence false snap: a DESCENT drain is only ~2 raw

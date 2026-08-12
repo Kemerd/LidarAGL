@@ -424,10 +424,10 @@ void audio_init(const audio_config_t *cfg)
     if (s_pm_freq_lock) {
         esp_pm_lock_acquire(s_pm_freq_lock);
     }
-    /* TEMP DEBUG: confirm the no-light-sleep guard is actually live. If this says
-     * UNAVAILABLE, PM locks aren't compiled in; if HELD but stalls persist, then
-     * light-sleep is not what's gating the I2S clock and we look elsewhere.        */
-    ESP_LOGW(TAG, "PM locks: no-light-sleep=%s (%s)  cpu-freq-max=%s (%s)",
+    /* One-shot at channel start: confirms the PM guards are actually live. If this
+     * says UNAVAILABLE, the locks aren't compiled in and the render loop is at the
+     * mercy of DFS/light-sleep — worth knowing from a single boot capture.         */
+    ESP_LOGI(TAG, "PM locks: no-light-sleep=%s (%s)  cpu-freq-max=%s (%s)",
              s_pm_lock ? "HELD" : "UNAVAILABLE", esp_err_to_name(pmerr),
              s_pm_freq_lock ? "HELD" : "UNAVAILABLE", esp_err_to_name(freqerr));
 
@@ -1001,7 +1001,7 @@ void audio_task(void *arg)
             if (s_pm_freq_lock) {
                 esp_pm_lock_release(s_pm_freq_lock);
             }
-            ESP_LOGW(TAG, "PM locks RELEASED (audio suspended)");  /* TEMP DEBUG */
+            ESP_LOGD(TAG, "PM locks released (audio suspended)");
             s_running    = false;
             s_gain_cur   = 0.0f;   /* ramp the tone back up from silence on resume */
             s_duck_cur   = 1.0f;   /* un-duck so the next descent starts full tone  */

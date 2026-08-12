@@ -935,6 +935,22 @@ static void logic_task(void *arg)
             agl = scaled;
         }
 
+        /*  Broken track: the filter re-acquired onto a level that is
+         *  DISCONTINUOUS with the one it was following (a genuine terrain step,
+         *  an in-flight power-up, or recovery from a stretch of untrustworthy
+         *  data). The new altitude is trustworthy, but the aircraft did not fly
+         *  through the heights in between — so re-anchor the state machine on it
+         *  rather than letting the gap read as a descent and speak every rung it
+         *  spans. That phantom is the worst thing this box can say: an out-of-
+         *  range stretch that settled on a low erroneous cluster once snapped
+         *  335 ft -> 12 ft in one poll and called "twenty" at altitude.          */
+        if (fresh && s.track_break) {
+            sm_reanchor(&sm, agl);
+            ESP_LOGW(TAG, "range track BROKEN -> re-anchored at %.1f ft AGL "
+                          "(gap is not flown motion; no rungs spoken across it)",
+                     (double)agl);
+        }
+
         sm_out_t out;
         sm_step(&sm, agl, dt_dec, g_profile, &out);
 
@@ -956,9 +972,25 @@ static void logic_task(void *arg)
          * channel rather than into a channel we just tore down.                */
         bool sleep_allowed = (out.state == ST_GROUND || out.state == ST_CRUISE);
 
+        /* Compile-time master switch (config.h). Defaulted OFF: on a panel-powered
+         * installation the power saving buys little, while the suspend/poll-relax
+         * it implies has sat in the causal chain of every flight-critical silence
+         * this box has shipped. Build -DSLEEP_MODE_ENABLE=1 to restore it.       */
+#if !SLEEP_MODE_ENABLE
+        sleep_allowed = false;
+#endif
+
         /* Never light-sleep on the bench: sleeping gates the UART/poll cadence and
          * makes the live altitude stutter. Stay awake + fast for responsive testing.*/
         if (s_bench_scale) {
+            sleep_allowed = false;
+        }
+
+        /* Never light-sleep on data we KNOW is stale. Sleeping relaxes the poll to
+         * 500 ms and tears the audio channel down, so entering it on a held value
+         * costs exactly the latency we most need on a descent — and a held value
+         * is precisely when we are least entitled to assume nothing is happening. */
+        if (data_stale) {
             sleep_allowed = false;
         }
         if (!sleep_allowed && sleep_allowed_prev) {
@@ -1084,18 +1116,23 @@ static void logic_task(void *arg)
  * ------------------------------------------------------------------------- */
 static void enable_power_management(void)
 {
+    /*  SLEEP_MODE_ENABLE (config.h) is the single master switch. With it clear we
+     *  still configure PM — dynamic frequency scaling is free and the audio task's
+     *  CPU_FREQ_MAX lock depends on the PM subsystem being live — but we never let
+     *  the SoC actually light-sleep.                                              */
     esp_pm_config_t pm = {
         .max_freq_mhz       = PM_MAX_FREQ_MHZ,
         .min_freq_mhz       = PM_MIN_FREQ_MHZ,
-        .light_sleep_enable = true,
+        .light_sleep_enable = (SLEEP_MODE_ENABLE != 0),
     };
     esp_err_t err = esp_pm_configure(&pm);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "esp_pm_configure failed (%s); running without light-sleep",
                  esp_err_to_name(err));
     } else {
-        ESP_LOGI(TAG, "power management: %d/%d MHz, light-sleep on",
-                 PM_MAX_FREQ_MHZ, PM_MIN_FREQ_MHZ);
+        ESP_LOGI(TAG, "power management: %d/%d MHz, light-sleep %s",
+                 PM_MAX_FREQ_MHZ, PM_MIN_FREQ_MHZ,
+                 SLEEP_MODE_ENABLE ? "on" : "OFF (SLEEP_MODE_ENABLE=0)");
     }
 }
 
