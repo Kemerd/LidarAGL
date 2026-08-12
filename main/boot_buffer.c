@@ -41,7 +41,9 @@
 #define ESP_LOGI(tag, fmt, ...) ((void)0)
 #endif
 
-static const char *TAG = "bootbuf";
+#ifndef UNIT_TEST
+static const char *TAG = "bootbuf";   /* only the fenced NVS/GPIO code logs */
+#endif
 
 #ifndef UNIT_TEST
 /* =========================================================================
@@ -922,9 +924,14 @@ void boot_buffer_resolve(const boot_entry_t *stored, size_t n_stored,
      *  it is not confined to the current flight, it silently offsets every
      *  future one until someone recalibrates on a clean surface.
      *
-     *  Flagging it costs nothing when the box is genuinely healthy (a real
-     *  parked boot sits within a few inches of its learned ground, far inside
-     *  GROUND_DEV_FT) and buys a boot chirp plus a persist veto exactly when
-     *  the reference cannot be trusted.                                        */
-    result->calib_error = (dev < -GROUND_DEV_FT);
+     *  The threshold is NOT GROUND_DEV_FT. That constant bounds how far ABOVE
+     *  the ground the aircraft can be and still count as parked, and 10 ft is
+     *  sensible there because the sky is unbounded. Downward it is nonsense:
+     *  the ground sits only ~MOUNT_OFFSET_FALLBACK_FT below the sensor, so a
+     *  reading cannot be 10 ft below it without being negative. Reusing it
+     *  would make the low-side test unreachable — the exact bug this guard
+     *  exists to close. GROUND_BELOW_DEV_FT is scaled to the mount instead:
+     *  large enough to pass strut compression, surface variation and sensor
+     *  noise, small enough that a solid object in the beam is caught.          */
+    result->calib_error = (dev < -GROUND_BELOW_DEV_FT);
 }

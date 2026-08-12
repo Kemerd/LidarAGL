@@ -270,6 +270,22 @@
  *  ground, so anything beyond it cannot be the ground.                         */
 #define GROUND_DEV_FT            10.0f
 
+/*  The DOWNWARD counterpart, and deliberately a different number. GROUND_DEV_FT
+ *  bounds how far ABOVE the learned ground a boot can be and still count as
+ *  parked; 10 ft is reasonable there because the sky is unbounded. Downward it
+ *  is meaningless: the ground sits only ~MOUNT_OFFSET_FALLBACK_FT beneath the
+ *  sensor, so a reading cannot be 10 ft BELOW it without going negative — reuse
+ *  would make the low-side test unreachable.
+ *
+ *  A reading materially closer than the learned ground means something is IN
+ *  THE BEAM (a mechanic under the wing, a tow bar, a chock, a puddle returning
+ *  specularly) or the aircraft is on JACKS. Both used to be clamped to
+ *  "AGL = 0, perfectly healthy" and — because the persist gate keys off
+ *  !airborne && !calib_error — WRITTEN TO NVS as the new ground, silently
+ *  offsetting every future flight. Sized to pass strut compression, surface
+ *  variation and sensor noise, while catching a solid object in the beam.      */
+#define GROUND_BELOW_DEV_FT      1.5f
+
 /*  Hard junk cap used only while selecting ground-fill samples: a *ground*
  *  reading above this is obvious garbage and is dropped before averaging. This
  *  is NOT an in-flight range limit (in flight we read the sensor's full range). */
