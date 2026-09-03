@@ -100,3 +100,31 @@ elseif(NOT CMAKE_SCRIPT_MODE_FILE)
     #  images), so the boot banner alone identifies which image is on a unit.
     message(STATUS "LidarAGL: FLIGHT build (DEMO_MODE off)")
 endif()
+
+# -----------------------------------------------------------------------------
+#  SLEEP_MODE_ENABLE — light-sleep master switch (see the matching section of
+#  config.h). Take light-sleep out of the picture entirely with:
+#
+#      idf.py -DSLEEP_MODE_ENABLE=0 build
+#
+#  IMPORTANT: `idf.py -D<x>` sets a CMake *cache variable*, which is a different
+#  namespace from a C preprocessor define — it does NOT reach the compiler on its
+#  own. Without this forwarding block config.h's `#ifndef SLEEP_MODE_ENABLE`
+#  fallback silently wins and the image ships with sleep ENABLED, exactly
+#  contradicting the requested build. That is a genuinely dangerous failure mode
+#  for a flight test whose whole purpose is to remove sleep as a variable, so we
+#  forward it explicitly and announce the result on every configure.
+#
+#  Only 0 disables: the variable is compared against 0 rather than tested for
+#  truthiness so an empty/absent cache entry keeps the safe default (enabled),
+#  and the value is passed through verbatim to keep config.h the single source
+#  of truth for what the macro means.
+# -----------------------------------------------------------------------------
+if(NOT CMAKE_SCRIPT_MODE_FILE)
+    if(DEFINED SLEEP_MODE_ENABLE AND SLEEP_MODE_ENABLE EQUAL 0)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE SLEEP_MODE_ENABLE=0)
+        message(STATUS "LidarAGL: light-sleep DISABLED (SLEEP_MODE_ENABLE=0)")
+    else()
+        message(STATUS "LidarAGL: light-sleep enabled (default)")
+    endif()
+endif()
