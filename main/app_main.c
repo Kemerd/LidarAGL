@@ -1589,6 +1589,23 @@ void app_main(void)
                  (unsigned)n_fill, (unsigned)GROUND_PERSIST_MIN_SAMPLES);
     }
     bool persist_ground = !br.airborne && enough_fill && !br.calib_error;
+
+    /*  Bench HIL boots are RUNTIME-ONLY and must never touch the stored ground
+     *  reference. In sim mode every "range" arrives from the PC, so the fill
+     *  describes a fabricated surface (the bench streams whatever altitude the
+     *  operator dragged to, commonly a flat 0 ft AGL over an invented mount
+     *  height) rather than the tarmac the box is actually sitting on. Writing
+     *  that to NVS poisons the reference for the NEXT REAL FLIGHT: the stored
+     *  value disagrees with the true mount height, so the following boot either
+     *  raises a calibration error or — worse, if the fabricated number happens
+     *  to land inside GROUND_DEV_FT — silently biases every AGL of the sortie.
+     *
+     *  Caught by the QC harness: it streamed a 3 ft simulated ground and left the
+     *  unit flagging a calibration error against its real ~8.8 ft mount on the
+     *  very next power-up. Mirrors the DEMO_MODE guard directly below.           */
+    if (sf30c_sim_active()) {
+        persist_ground = false;
+    }
 #if DEMO_MODE
     /* Demo boots never write the ground buffer (runtime-only, like sim mode):
      * the rig's 2 ft of travel sits inside GROUND_DEV_FT, so a reboot with the
