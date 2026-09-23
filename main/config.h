@@ -46,9 +46,9 @@
 #define DEMO_MODE 0                 /* compiled OUT unless the build defines it */
 #endif
 #if DEMO_MODE
-#define FIRMWARE_VERSION "v1.63-DEMO"
+#define FIRMWARE_VERSION "v1.64-DEMO"
 #else
-#define FIRMWARE_VERSION "v1.63"
+#define FIRMWARE_VERSION "v1.64"
 #endif
 
 /* ---- Sensor model identifiers ------------------------------------------- */
@@ -84,270 +84,154 @@
  *  or a very dark/wet surface). Value is in centimetres on both paths.         */
 #define SF30_LOST_SIGNAL_CM   16000
 
-/* ---- Range filtering (robust runtime pipeline — see range_filter.c) ------- */
-/*  The checksum-free SF30/C serial stream means a single corrupted byte can
- *  decode to a plausible distance anywhere in 0..537 ft. The old bare EMA
- *  (RANGE_EMA_ALPHA, retired) let exactly one such sample arm the callout
- *  ladder on a taxiing aircraft and speak a phantom "50 40 30 20 10". The
- *  runtime path now runs the textbook robust stack instead:
- *  median-of-drain vote -> Hampel (median/MAD) outlier gate -> re-acquire ->
- *  time-corrected EMA. Every knob lives here.                                  */
+/* ---- Range tracking (per-sample Kalman tracker — see range_filter.c) ------ */
+/*  The checksum-free SF30/C stream can decode a corrupted byte to any plausible
+ *  distance in 0..537 ft; the protective window can reflect a "0 ft" return;
+ *  and the sensor emits erroneous distances before it reports lost signal. The
+ *  v1.64 tracker processes every raw sample with its own timestamp:
+ *  validity gates -> a two-state Kalman filter behind an innovation gate ->
+ *  M-of-N candidate tracks for (re)acquisition -> explicit track states.
+ *
+ *  HISTORY, kept so the lessons survive the rewrite. The v1.59-v1.63 design was
+ *  built around per-POLL batches: a median-of-drain vote, a Hampel window
+ *  (HAMPEL_WIN 7, K 3, MAD floor 0.35 ft) with a slew allowance capped at
+ *  60 ft, poll-count re-acquisition (3 agreeing polls + 8 raw samples), a
+ *  12-poll track break, a drain-coherence test, and an EMA later replaced by an
+ *  alpha-beta smoother (tau 0.12 s). Every one was right at one poll cadence
+ *  and wrong at another: a 1-2 sample drain has no median immunity; "12 polls"
+ *  is 0.3 s at DESCENT and 6 s at CRUISE; a per-poll band capped the descent
+ *  rate the filter could follow, which silenced whole approaches (Sept 2026
+ *  flight: frozen at the ceiling pin, grass returning from ~250 ft). Working
+ *  per SAMPLE makes the cadence irrelevant to every decision below.          */
 
-/*  Per-drain median vote: every decoded sample in a poll's drain votes and the
- *  median wins, so any MINORITY of arbitrarily-wrong samples is discarded for
- *  free (Tukey median smoother). 64 covers the worst real drain (~58 samples
- *  at the 750 ms GROUND poll x 78 Hz); longer drains keep the newest 64.       */
+/*  Drain buffer: the samples of one poll, in arrival order, newest kept. 64
+ *  covers the slowest poll (750 ms x 78 Hz = ~58 samples).                    */
 #define RANGE_DRAIN_MEDIAN_N   64
 
-/*  Hampel identifier (Hampel 1974; Pearson 2002): a fresh per-drain median is
- *  an outlier when it deviates from the median of the last HAMPEL_WIN accepted
- *  values by more than
- *      HAMPEL_K * max(1.4826 * MAD, HAMPEL_MAD_FLOOR_FT)
- *    + min(RANGE_MAX_SLEW_FPS * dt * RANGE_SLEW_HORIZON, RANGE_GATE_CAP_FT)
- *  The 1.4826 factor scales MAD to a Gaussian sigma (the standard estimator);
- *  the FLOOR keeps the test meaningful when the window is quantization-flat
- *  (a parked lidar reads bit-identical cm, MAD -> 0, and an un-floored gate
- *  would reject legitimate first motion). K = 3 is the classic "3 sigma".      */
-#define HAMPEL_WIN             7      /* accepted values remembered             */
-#define HAMPEL_K               3.0f   /* sigma multiplier (textbook value)      */
-#define HAMPEL_MAD_FLOOR_FT    0.35f  /* MAD floor ~2x the SF30's +/-5 cm noise */
-#define HAMPEL_SEED_N          3      /* window fills this far before gating    */
-
-/*  Physical slew allowance: the window median lags the true trajectory by
- *  about half the window, so a legitimate climb/descent deviates from it by
- *  rate x lag. RANGE_MAX_SLEW_FPS bounds the airframe; RANGE_SLEW_HORIZON is
- *  the half-window lag in polls; and RANGE_GATE_CAP_FT hard-caps the allowance
- *  so the slow GROUND/CRUISE cadences (0.5-0.75 s polls) can never open the
- *  gate wide enough to admit an arming-sized (>100 ft) spike in one poll.
- *
- *  The bound used to be 60 ft/s on the belief that "a Glasair III dives well
- *  under 60 ft/s vertically". It does not: gear down at idle and ~120 kt it
- *  sinks 3500-4000 fpm (58-67 ft/s), and ~2000 fpm approaches trip the panel's
- *  TAWS "SINK RATE" routinely. A bound the aircraft can exceed makes the filter
- *  reject the real descent as physically impossible. 100 ft/s (6000 fpm) sits
- *  well above anything flown; the same bound sizes the re-acquire track gate's
- *  first step and the downward-snap reachability test, so the whole filter
- *  shares ONE statement of what the airframe can physically do.               */
+/*  The airframe's physical |d(range)/dt| bound. Gear down at idle the Glasair
+ *  III sinks 3500-4000 fpm (58-67 ft/s) and ~2000 fpm approaches trip TAWS
+ *  "SINK RATE" routinely; an old 60 ft/s bound made the filter reject real
+ *  descents as impossible. 100 ft/s = 6000 fpm clamps the tracked rate and
+ *  sizes the candidate's first step and the downward-reachability test.        */
 #define RANGE_MAX_SLEW_FPS     100.0f /* physical |d(range)/dt| bound (6000 fpm)*/
-#define RANGE_SLEW_HORIZON     4.5f   /* half Hampel window + 1, in polls       */
-#define RANGE_GATE_CAP_FT      60.0f  /* absolute ceiling on the slew allowance */
 
-/*  Re-acquisition: a REAL level step (terrain edge under final, in-flight
- *  power-up over new ground) must not be held forever. When this many
- *  CONSECUTIVE rejected medians agree with each other within the band, the
- *  filter accepts the new level and re-seeds. Random garbage does not cluster,
- *  so corruption cannot re-acquire.
+/* ---- Main track: Kalman filter + innovation gate ------------------------- */
+/*  State [range, rate]; constant-velocity model driven by white-noise
+ *  acceleration (Kalata 1984; the standard radar/altimeter tracker). A sample is
+ *  accepted when its innovation nu = z - x_pred satisfies nu^2 <= g^2 * S with
+ *  S = P00 + R: a statistical, per-sample test (the PX4 EKF2 rangefinder gate
+ *  uses g = 5). It replaces the median, Hampel, coherence and slew-allowance
+ *  layers at once, and because P grows with time the gate WIDENS by itself
+ *  across a gap and tightens again once the track is re-established.
  *
- *  The poll count alone is NOT enough evidence at the fast cadences: a DESCENT
- *  drain holds only ~2 raw samples (78 Hz x 25 ms), so its "median" carries no
- *  minority immunity, and three polls of a SELF-CONSISTENT corrupt burst (a
- *  stuck byte pattern repeating for ~75 ms, cleanly framed so the UART error
- *  sweep never sees it) could once force a false snap and fire a phantom low
- *  callout on final. The agreeing cluster must therefore ALSO have been backed
- *  by a minimum number of RAW samples. At the GROUND cadence a single drain
- *  (~58 samples) satisfies this instantly — behaviour there is unchanged; at
- *  DESCENT a genuine step now takes ~4 polls (~100 ms, still invisible in the
- *  flare) while a false snap needs corruption to dominate the whole window.    */
-#define RANGE_REACQUIRE_N       3     /* agreeing rejects that force acceptance */
-#define RANGE_REACQUIRE_BAND_FT 8.0f  /* how tightly the rejects must agree     */
-#define RANGE_REACQUIRE_MIN_SAMPLES 8u /* raw samples that must back the cluster */
+ *  sigma_a is the manoeuvre the model must follow without losing the target:
+ *  a round-out from a 4000 fpm descent to a flare is ~10-20 ft/s^2.
+ *  sigma_m is the FLOOR of the measurement noise (the SF30's +/-5 cm plus a
+ *  little surface texture); the actual R is estimated online from the accepted
+ *  innovations and bounded by RF_SIGMA_MEAS_MAX_FT, so the gate adapts to real
+ *  grass/tarmac texture without ever opening wide enough to admit junk.       */
+#define RF_SIGMA_ACCEL_FPS2    15.0f  /* white-noise acceleration (ft/s^2)      */
+#define RF_SIGMA_MEAS_FT       0.25f  /* measurement noise floor (ft)           */
+#define RF_SIGMA_MEAS_MAX_FT   2.0f   /* adaptive measurement noise ceiling (ft)*/
+#define RF_R_ADAPT_ALPHA       0.02f  /* innovation-variance follower gain      */
+#define RF_GATE_SIGMA          5.0f   /* innovation gate, in sigmas (PX4: 5)    */
 
-/*  Physical-reachability guard on the SNAP itself. Poll count and sample mass
- *  both measure how CONSISTENT the agreeing cluster is — and a stuck byte
- *  pattern is perfectly consistent, so it satisfies both for free. The one
- *  property corruption cannot fabricate is being physically reachable: the snap
- *  must not move the published range farther than the airframe could actually
- *  have flown while the cluster was being collected (RANGE_MAX_SLEW_FPS x the
- *  cluster's own wall-clock duration), plus this slack.
- *
- *  Without it, a 4-poll stuck burst at the DESCENT cadence re-acquired a ~110 ft
- *  downward step in ~100 ms and made the box speak "one hundred" while the
- *  aircraft was still at 186 ft AGL — a phantom low callout on final, which is
- *  the most dangerous place this box can lie. The slack keeps a genuine terrain
- *  edge (a bluff or a displaced threshold, which really can step the ground
- *  under a fast aircraft) comfortably inside the allowance.
- *
- *  The guard applies to DOWNWARD snaps only. A snap to a FARTHER level cannot
- *  fabricate a callout — the ladder fires only on downward crossings — and the
- *  in-flight power-up case (box anchored near the ground, true range hundreds
- *  of feet away) is exactly that shape, so it must stay unrestricted.           */
+/*  COAST: no accepted sample for up to this long (a dark patch, a wet spot) and
+ *  the track keeps predicting from its measured rate, so the tone and callouts
+ *  keep moving on time — at 4000 fpm a 0.3 s freeze would be ~20 ft of callout
+ *  lateness. Beyond it the track is LOST and the output holds.               */
+#define RF_COAST_MAX_S         0.3f   /* longest predicted-only stretch (s)     */
+
+/* ---- Candidate track: M-of-N initiation --------------------------------- */
+/*  Lock-on, re-entry into range, and a genuine terrain step all go through a
+ *  separate candidate track built from samples the main gate rejects (radar
+ *  M-of-N track initiation). The candidate is a Kalman track of its own,
+ *  seeded at rest with a velocity prior of RANGE_MAX_SLEW_FPS / RF_GATE_SIGMA
+ *  (so its first gate admits any motion the airframe can make and nothing
+ *  more), and every later sample must pass the same innovation gate against
+ *  its constant-velocity PREDICTION — so a real descent at any rate confirms,
+ *  while scattered junk cannot line up. (v1.59-v1.63 used a fixed 8 ft
+ *  poll-to-poll band here: ~5% of full-span junk fell inside it; the
+ *  statistical gate admits well under 1%.) Confirmation needs:
+ *    - RF_CONFIRM_SAMPLES members spanning at least RF_CONFIRM_MIN_S, and
+ *    - members >= RF_CONFIRM_MEMBER_FRAC of EVERY sample since its first
+ *      member: disagreeing returns, junk and no-returns alike. A genuine
+ *      surface moves ALL the returns; a bimodal minority cannot steal the
+ *      track (every sample the main track accepts is a miss), and a blind,
+ *      junk-dominated stream cannot line up half its samples on one line.
+ *  A no-member stretch longer than RF_CANDIDATE_GAP_S ends a candidate: its
+ *  members must be consecutive, or a blind junk stream could collect scattered
+ *  "members" over many seconds (a phantom "100" at 450 ft, found in the sweep). */
+#define RF_CONFIRM_SAMPLES     8u     /* members needed to confirm (M)          */
+#define RF_CONFIRM_MIN_S       0.10f  /* ...spanning at least this long (s)     */
+#define RF_CONFIRM_MEMBER_FRAC 0.5f   /* members / all samples in the span      */
+#define RF_CANDIDATE_GAP_S     0.15f  /* no-member gap that ends a candidate    */
+
+/*  Switching onto a confirmed candidate while the main track is alive:
+ *    - A level the aircraft could physically have reached from the main
+ *      track's prediction — |jump| <= RANGE_MAX_SLEW_FPS * span +
+ *      RANGE_REACQUIRE_JUMP_SLACK_FT, capped at RANGE_REACQUIRE_JUMP_CAP_FT —
+ *      switches CONTINUOUSLY on the ordinary evidence (a manoeuvre the model
+ *      lagged, a small terrain step).
+ *    - Anything else needs RF_BREAK_S of agreement and switches as a TRACK
+ *      BREAK (the consumer re-anchors instead of walking the ladder across the
+ *      gap). A self-consistent stuck byte pattern satisfies every consistency
+ *      test for free; physical reachability is the one thing it cannot fake (a
+ *      110 ft teleport on final once spoke "one hundred" at 186 ft). A cap, not
+ *      a time-grown allowance: an allowance that grows with waiting lets
+ *      patience substitute for evidence. v1.63 let UPWARD jumps through
+ *      unrestricted; they now need the same persistence, so a 0.1-0.3 s junk
+ *      burst is coasted through instead of yanking the tone up and back.
+ *  From LOST every new track is a TRACK BREAK (a re-established track is a new
+ *  track — the radar-altimeter convention). A DESCENDING candidate (sinking
+ *  faster than RANGE_REENTRY_SINK_FPS) is the approach coming back into range
+ *  and confirms on the ordinary evidence; a STATIONARY one — the shape of a
+ *  stuck byte pattern — needs RF_BREAK_S. Only a descending re-entry that the
+ *  aircraft could physically have flown from its last tracked position is a
+ *  RE-ENTRY for the late-rung window (see CALLOUT_LATE_TOL_*): the rungs in
+ *  the gap were genuinely passed while the laser was blind.                   */
 #define RANGE_REACQUIRE_JUMP_SLACK_FT 25.0f /* headroom over the physical reach  */
-
-/*  TRACK BREAK. A downward snap larger than the (bounded) physical reach cannot
- *  have been flown — but refusing it forever would strand the filter on a stale
- *  anchor after a genuine discontinuity: an in-flight power-up, a real cliff
- *  edge, or recovery from a long out-of-range stretch. So we accept it after
- *  this many agreeing polls, while explicitly flagging that the TRACK BROKE
- *  (rf_track_broken()). The published value is trustworthy again; the JUMP is
- *  not motion, and the callout ladder must re-anchor across it rather than
- *  speak the rungs in between.
- *
- *  This is the standard avionics distinction — a radar altimeter that loses and
- *  re-establishes lock treats the result as a NEW track, never as a continuous
- *  trajectory — and it is what PX4's rangefinder path does in spirit with its
- *  kinematic-consistency check plus rejection hysteresis. The count is set well
- *  above RANGE_REACQUIRE_N so an ordinary noisy patch can never break track:
- *  breaking is reserved for evidence that is both sustained AND self-agreeing.  */
-#define RANGE_TRACK_BREAK_POLLS  12u  /* agreeing polls to accept a broken track */
-
-/*  ...or, at the slow polls, this much agreeing wall-clock time (still at least
- *  RANGE_REACQUIRE_N polls). A poll COUNT is cadence-dependent evidence: 12
- *  polls is 0.3 s at DESCENT but 6 s at the 500 ms CRUISE poll, and a CRUISE
- *  poll carries ~39 raw samples, so each one is already a strong vote. Six
- *  seconds of descent is ~50-100 ft on an approach: over a surface that only
- *  returns from ~230 ft, the 200 ft rung was re-anchored past and never spoke.
- *  Evidence is judged in time as well, so a slow-cadence break lands in ~1.5 s
- *  while the fast cadences keep the 12-poll rule unchanged.                  */
-#define RANGE_TRACK_BREAK_S      1.5f /* agreeing time that also breaks track   */
-
-/*  A lost track re-established by a DESCENDING candidate track (sinking faster
- *  than this) is confirmed on the ordinary re-acquire evidence, not the longer
- *  break evidence: it is the approach coming back into range, and at 4000 fpm
- *  every extra poll is tens of feet. 5 ft/s (300 fpm) is far above sensor
- *  noise on a confirmed track and far below any approach.                    */
-#define RANGE_REENTRY_SINK_FPS   5.0f /* min sink for the fast re-entry path   */
+#define RANGE_REACQUIRE_JUMP_CAP_FT   60.0f /* never a continuous jump beyond    */
+#define RF_BREAK_S                    0.30f /* agreement for an unreachable jump */
+#define RANGE_REENTRY_SINK_FPS        5.0f  /* descending re-entry threshold     */
 
 /* ---- Tracking verdict: the box's REAL power/latency signal ---------------- */
 /*  Whether the box may relax (slow the poll, suspend audio, light-sleep) is a
  *  question about the SENSOR — "can we see the ground?" — not about the
- *  aircraft. The old policy slept whenever the ALTITUDE was at/above the
- *  profile's cruise_ft, which is an inference standing in for the real thing,
- *  and it was wrong in both directions: it relaxed while the sensor was still
- *  tracking perfectly well just under its ceiling, and it had nothing to say
- *  about a sensor that went blind at ANY altitude.
- *
- *  It is also a false premise about the hardware. The SF30/C's 328 ft figure is
- *  a best-case, clean-target rating; in practice the returns thin out into a
- *  ragged mixture of real and erroneous values well before it, so there is no
- *  clean altitude at which "the sensor works" becomes "it doesn't". Keying off
- *  tracking removes the guess entirely.
- *
- *  The verdict is ASYMMETRIC, and that asymmetry IS the safety argument: going
- *  dark needs this many consecutive drains with nothing usable in them, while
- *  ONE usable return restores tracking immediately. Being slow to conclude the
- *  sensor is blind costs a little power; being slow to notice it can see again
- *  costs callouts on an approach. Sized so a brief dropout (a dark patch, a
- *  banked turn) never trips it, while a genuine climb out of range does within
- *  a second or so at any cadence.                                              */
+ *  aircraft. Going dark needs this many consecutive drains with nothing usable
+ *  in them, while ONE usable return restores tracking immediately: slow to
+ *  conclude blindness costs a little power; slow to notice recovery costs
+ *  callouts on an approach.                                                    */
 #define RANGE_NOTRACK_POLLS      8u   /* useless drains before "sensor is dark" */
 
-/* ---- Cadence-independent lost-signal vote --------------------------------- */
-/*  A drain that is MAJORITY lost-signal is not trusted, even if a few stray
- *  "returns" survived the gates — when the sensor says "no return" most of the
- *  time, the odd distance in between is far likelier junk than ground. But a
- *  per-DRAIN majority only means something when drains are big: at the slow
- *  CRUISE poll a drain holds ~39 samples; at the fast ARMED/DESCENT polls it
- *  holds 1-2, and a single junk sample IS the majority. Out of range, held
- *  below cruise_ft (so polling fast), that let out-of-range junk walk the
- *  published altitude and speak phantom rungs at pattern altitude.
- *
- *  So the vote is ALSO taken over the last RANGE_LOST_VOTE_SAMPLES raw samples,
- *  whatever the cadence: if most of them were no-return, the drain is treated
- *  as having no usable data. ~0.4 s of stream at 78 Hz — long enough to vote,
- *  short enough that the first clean returns of a descent back into range
- *  flip it within a fraction of a second. Must be <= 32 (one bit per sample). */
+/*  Sliding lost-signal vote over the last RANGE_LOST_VOTE_SAMPLES raw samples
+ *  (~0.4 s at 78 Hz). "The stream is real" — most recent samples are returns —
+ *  gates the fast re-acquire poll, and a lost-dominated stream is evidence of
+ *  flying out the top of the range. Must be <= 32 (one bit per sample).       */
 #define RANGE_LOST_VOTE_SAMPLES  32u  /* sliding sample window for the vote     */
 
-/* ---- Drain coherence (the range-gate test) -------------------------------- */
-/*  A real surface returns a TIGHT cluster: the SF30's own noise is ~+/-5 cm,
- *  plus however far the aircraft moves while the drain is collected. A junk
- *  stream (garbled serial, a sensor emitting erroneous distances while blind)
- *  scatters across the whole 0..343 ft window — and ~64% of uniform 14-bit
- *  garbage lands inside it, so junk is MAJORITY "valid" and passes every
- *  lost-signal vote. Its median still looked like an altitude (~170 ft) and
- *  walked the published value into phantom rungs.
- *
- *  So a drain whose robust spread (1.4826 x MAD about its median) exceeds
- *      RANGE_DRAIN_SPREAD_FT + RANGE_SPREAD_MOTION_K * RANGE_MAX_SLEW_FPS * dt
- *  is INCOHERENT and counts as no usable return. The motion term is the MAD
- *  scale of a uniform sweep across the distance the airframe can cover in one
- *  poll (sigma ~= 0.37 x span), so even a 6000 fpm descent sampled at the slow
- *  CRUISE poll stays coherent. The MAD has a 50% breakdown point: a MINORITY
- *  of junk (bit flips, lens glints) cannot make a real drain incoherent.     */
-#define RANGE_DRAIN_SPREAD_FT    8.0f  /* spread allowance at zero motion       */
-#define RANGE_SPREAD_MOTION_K    0.37f /* MAD-sigma of a uniform sweep per span */
-
-/* ---- Track re-establishment after a blind stretch ------------------------- */
-/*  Once the sensor has had nothing usable for this many consecutive drains, or
- *  the filter has pinned itself at the ceiling, the published value is an
- *  INFERENCE (a hold or a pin), not a measurement. The track is lost. Radar
- *  altimeters treat reacquisition as a new track that must be CONFIRMED
- *  (M-of-N detections), never continued from a single detection.
- *
- *  The Hampel gate is a continuity test: it accepts a lone drain within ~61 ft
- *  of the window at the slow polls. Against an inferred window that let a rare
- *  junk drain (one whose valid samples happened to outvote the sentinels) be
- *  believed on its own, walk the "altitude" off the pin and speak a phantom
- *  "300" at pattern altitude. While the track is lost, EVERY drain therefore
- *  goes through the re-acquire path instead: RANGE_REACQUIRE_N agreeing polls
- *  backed by RANGE_REACQUIRE_MIN_SAMPLES raw samples. That costs a genuine
- *  re-entry ~1.5 s at the 500 ms CRUISE poll (~0.1 s at the fast polls), and
- *  makes junk need several CONSECUTIVE, mutually agreeing drains.            */
-#define RANGE_RECONFIRM_POLLS    4u   /* blind drains before the track is "lost" */
-
-
-/*  Ceiling on the elapsed time handed to the range filter. dt drives the
- *  Hampel slew allowance and the EMA bandwidth; a value far larger than any
- *  real poll gap is a timekeeping artefact (a stalled task, a long sleep, a
- *  torn clock read), not information about the aircraft. Clamping keeps the
- *  arithmetic meaningful while still being loose enough that a genuinely long
- *  gap collapses the EMA to a passthrough — the right answer, since state that
- *  old deserves no weight against a fresh reading.                             */
+/*  Ceiling on the elapsed time handed to the filter: a gap far larger than any
+ *  real poll interval is a timekeeping artefact (a stalled task, a torn clock
+ *  read), not information about the aircraft.                                 */
 #define SENSOR_MAX_DT_S          5.0f /* clamp on the filter's elapsed-time input*/
 
 /*  Sensor-ceiling sanity: a return farther than the active profile's
  *  max_range_ft plus this margin is physically impossible (the SF30/C cannot
- *  see 400 ft) and is treated as lost-signal junk at the gate.                 */
+ *  see 400 ft) and is treated as a no-return sample at the gate.             */
 #define RANGE_MAX_MARGIN_FT    15.0f
 
 /* ---- Out-of-range-ABOVE detection (the "silent descent" fix) ------------- */
-/*  The SF30 emits its lost-signal sentinel for TWO physically opposite reasons:
- *  the target is BEYOND the sensor's range (we climbed out of its ~328 ft
- *  reach), or the surface returns nothing (water, a dark wet runway). The old
- *  filter collapsed both into "hold the last good value", and that hold is what
- *  silenced a real approach:
- *
- *    Climb above 328 ft -> every drain is majority-lost -> the EMA freezes at
- *    ~318 ft and is republished forever. A frozen value has ZERO trend, so the
- *    state machine sees "level at 318 ft", parks in ST_CRUISE (audio suspended,
- *    500 ms poll, light sleep) and NEVER leaves — because leaving requires a
- *    descending trend that a frozen input can never produce. On the way back
- *    down the Hampel gate then has to re-acquire from a 318 ft anchor, burning
- *    several polls, and by the time it snaps prev_agl is already below the top
- *    rungs. A rung with no DOWNWARD crossing on the books cannot speak, and it
- *    is one-shot disarmed, so the whole ladder is lost for that approach.
- *
- *  We disambiguate on the evidence we actually have: if the last GOOD reading
- *  was already within CEILING_NEAR_FT of the sensor's ceiling and the drains
- *  then went lost, the aircraft climbed out of range — nothing else explains a
- *  reading that walked UP to the ceiling and off the end of it. A lost-signal
- *  stretch that begins from 50 ft over water fails that test and is still HELD
- *  exactly as before. CEILING_CONFIRM_POLLS keeps a single ragged drain at the
- *  noisy top of the range from flipping the verdict.                          */
-#define RANGE_CEILING_NEAR_FT      40.0f  /* last-good within this of the ceiling */
+/*  The SF30 reports no return for TWO opposite reasons: the ground is BEYOND its
+ *  reach (we climbed out of range), or the surface returns nothing (water, a
+ *  dark wet runway). Holding is right only for the second. If the track was
+ *  already within RANGE_CEILING_NEAR_FT of the ceiling when it was lost and the
+ *  stream then went lost-signal, the aircraft flew out the TOP: the output is
+ *  PINNED at the ceiling, so the descent back into range reads as downward
+ *  motion rather than a frozen mid-air value (a frozen 318 ft once kept the box
+ *  in ST_CRUISE with no exit). RANGE_CEILING_CONFIRM_POLLS keeps one ragged
+ *  drain at the noisy top of the range from flipping the verdict.            */
+#define RANGE_CEILING_NEAR_FT      40.0f  /* last track within this of the ceiling*/
 #define RANGE_CEILING_CONFIRM_POLLS 2u    /* consecutive lost drains to confirm   */
-
-/*  Final smoothing: a TIME-CORRECTED one-pole EMA, alpha = 1 - exp(-dt/tau).
- *  The retired fixed-alpha-per-poll EMA had a 30x effective-bandwidth swing
- *  between the 750 ms GROUND and 25 ms DESCENT cadences; this keeps ONE
- *  wall-clock bandwidth everywhere. Tau matches the old filter's feel at the
- *  fast (ARMED/DESCENT) cadences where callout timing lives.                   */
-#define RANGE_EMA_TAU_S        0.12f  /* one-pole time constant, all cadences   */
-
-/*  ...and the final smoother is now an ALPHA-BETA (position + velocity) tracker
- *  whose position gain is exactly that time-corrected alpha, with the
- *  Benedict-Bordner velocity gain beta = alpha^2 / (2 - alpha). Why: a plain
- *  EMA lags a steady descent by rate x tau - 8 ft at a 4000 fpm gear-down
- *  Glasair approach, so every callout came ~8 ft late - while an alpha-beta
- *  tracker has ZERO steady-state lag on a constant sink rate and a fraction of
- *  a foot of error through a flare (Kalata 1984; Painter et al. 1990). It also
- *  yields a clean sink rate, which drives the callout lead.
- *
- *  Prediction is only trusted across short gaps: after more than
- *  RANGE_AB_MAX_PREDICT_S without an accepted update (a hold, a dropout) the
- *  tracker re-seeds on the next measurement instead of extrapolating a stale
- *  velocity across the gap - coasting blind is how a tracker invents motion.  */
-#define RANGE_AB_MAX_PREDICT_S 1.0f   /* longest gap the tracker extrapolates   */
 
 /*  Tone-path EMA (audio side, unchanged by the robust-filter work).            */
 #define TONE_EMA_ALPHA    0.12f       /* tone path (smoother, a little laggy)   */
@@ -480,6 +364,23 @@
  *  real end-to-end latency can be measured and this constant tuned.         */
 #define CALLOUT_LEAD_S       0.20f     /* measured-latency target (s)            */
 #define CALLOUT_LEAD_MAX_FT  20.0f     /* never anticipate a rung by more       */
+
+/*  Late-rung window (Everett, 2026-09-22). When the laser comes back into
+ *  range on a DESCENDING approach — grass returning from ~250 ft, a dark wet
+ *  patch ending — the range filter re-establishes the track as a break, and
+ *  the rungs between the held value and the new level were passed while
+ *  blind. EGPWS practice is "bypassed thresholds are not announced"; a number
+ *  heard only slightly late is still useful, so the LOWEST passed rung is
+ *  spoken if the word would be heard no more than this far below it:
+ *    - rungs at/above CALLOUT_LATE_TOL_SPLIT_FT (100/200/300): 25 ft,
+ *    - the closely spaced low rungs (50..10): 5 ft, half their spacing, so a
+ *      late number can never be mistaken for the next one down.
+ *  Farther below, the rungs are skipped (and spent). Never applied to a break
+ *  that is not a physically flyable descending re-entry (a stuck pattern, a
+ *  teleport): those re-anchor silently and leave the ladder untouched.       */
+#define CALLOUT_LATE_TOL_HI_FT     25.0f  /* window for the 100+ rungs (ft)      */
+#define CALLOUT_LATE_TOL_LO_FT      5.0f  /* window for the 10-50 rungs (ft)     */
+#define CALLOUT_LATE_TOL_SPLIT_FT 100.0f  /* rungs >= this use the HI window     */
 #define REARM_SUSTAIN_MS  400u         /* above h+margin this long -> re-armed   */
 
 /*  The "on the ground" AGL band shared by the pre-arm GROUND classification and

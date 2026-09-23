@@ -64,10 +64,77 @@ void sm_init(sm_ctx_t *c, sm_state_t initial)
     }
 }
 
-void sm_reanchor(sm_ctx_t *c, float agl_ft)
+/* ---------------------------------------------------------------------------
+ *  The callout lead for the caller-supplied tracker rate (see CALLOUT_LEAD_S):
+ *  how far the aircraft will descend between a rung firing and the word being
+ *  heard. Descents only, capped at CALLOUT_LEAD_MAX_FT; a non-finite rate
+ *  simply means no lead. Shared by sm_step() and sm_reanchor() so the crossing
+ *  test and the late-rung window judge lateness identically.
+ * ------------------------------------------------------------------------- */
+static float callout_lead_ft(const sm_ctx_t *c)
 {
-    if (agl_ft < 0.0f) {
-        agl_ft = 0.0f;
+    float rate = c->lead_rate_fps;
+    if (!isfinite(rate) || !(rate < -TREND_DEADBAND_FPS)) {
+        return 0.0f;
+    }
+    float lead = -rate * CALLOUT_LEAD_S;
+    return (lead > CALLOUT_LEAD_MAX_FT) ? CALLOUT_LEAD_MAX_FT : lead;
+}
+
+int sm_reanchor(sm_ctx_t *c, float agl_ft, const sensor_profile_t *p,
+                bool reentry, uint32_t *crossed_mask)
+{
+    if (crossed_mask != NULL) {
+        *crossed_mask = 0u;
+    }
+    if (c == NULL) {
+        return -1;
+    }
+    if (!(agl_ft >= 0.0f)) {
+        agl_ft = 0.0f;                   /* negative or NaN: clamp, like sm_step */
+    }
+
+    /* --- Late-rung window: rungs genuinely passed while the laser was blind --
+     *  Only for a flyable DESCENDING re-entry (the filter's verdict), only
+     *  once armed, and only against a real previous anchor. Evaluated BEFORE
+     *  the anchor moves: a rung was "passed" when it lies strictly below the
+     *  old anchor and at/above the new level — the same edge
+     *  fire_descent_callout() uses (prev > rung >= agl).                      */
+    int speak = -1;
+    if (reentry && p != NULL && c->armed && c->have_prev) {
+        size_t n = p->n_callouts;
+        if (n > SM_MAX_CALLOUTS) {
+            n = SM_MAX_CALLOUTS;          /* defensive: profiles are far smaller */
+        }
+        uint32_t passed = 0u;
+        int      lowest = -1;
+        for (size_t i = 0; i < n; ++i) {
+            bool armed = (c->armed_mask & (1u << i)) != 0u;
+            float h    = p->callouts[i];
+            if (armed && c->prev_agl > h && agl_ft <= h) {
+                passed |= (1u << i);
+                lowest  = (int)i;        /* ladders descend: last hit = lowest  */
+            }
+        }
+        if (lowest >= 0) {
+            /*  Every passed rung is spent — exactly as a multi-rung crossing
+             *  spends them — so jitter around the new level can never speak a
+             *  stale number later. Go-around re-arming works as always.     */
+            c->armed_mask &= ~passed;
+            if (crossed_mask != NULL) {
+                *crossed_mask = passed;
+            }
+
+            /*  Where the word would be HEARD: the aircraft keeps sinking
+             *  through the audio latency, the same lead sm_step() applies.   */
+            float h    = p->callouts[lowest];
+            float late = h - (agl_ft - callout_lead_ft(c));
+            float tol  = (h >= CALLOUT_LATE_TOL_SPLIT_FT) ? CALLOUT_LATE_TOL_HI_FT
+                                                          : CALLOUT_LATE_TOL_LO_FT;
+            if (late <= tol) {
+                speak = lowest;
+            }
+        }
     }
 
     /*  Move the crossing anchor to the new level WITHOUT letting the move look
@@ -102,10 +169,12 @@ void sm_reanchor(sm_ctx_t *c, float agl_ft)
     }
 
     /*  Arming, the per-rung one-shot mask and the arm/re-arm dwells are
-     *  deliberately LEFT ALONE. The rungs already spoken were genuinely passed
-     *  and must stay spent; the rungs ahead must stay available; and the arming
-     *  dwells are about time spent in a band, which the re-anchor does not
-     *  invalidate. (The PARKED dwell is the one exception, handled above.)      */
+     *  otherwise deliberately LEFT ALONE. The rungs already spoken were
+     *  genuinely passed and must stay spent; the rungs ahead must stay
+     *  available; and the arming dwells are about time spent in a band, which
+     *  the re-anchor does not invalidate. (The PARKED dwell is the one
+     *  exception, handled above; the late-rung window above is the other.)     */
+    return speak;
 }
 
 sm_state_t sm_initial_state(float boot_agl, bool ok, const sensor_profile_t *p)
@@ -333,16 +402,7 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
     /* --- Callout lead for this step (see CALLOUT_LEAD_S) ------------------
      *  Computed every step, armed or not, so the anchor carried into the next
      *  step is always the lead that was actually in force. Descents only.    */
-    float lead = 0.0f;
-    {
-        float rate = c->lead_rate_fps;
-        if (isfinite(rate) && rate < -TREND_DEADBAND_FPS) {
-            lead = -rate * CALLOUT_LEAD_S;
-            if (lead > CALLOUT_LEAD_MAX_FT) {
-                lead = CALLOUT_LEAD_MAX_FT;
-            }
-        }
-    }
+    float lead = callout_lead_ft(c);
 
     /* --- Arming: the silent climb-out ------------------------------------- */
     /*  Until the aircraft has climbed through ARM_FT for the first time, NO

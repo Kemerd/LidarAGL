@@ -52,6 +52,10 @@ typedef struct {
                          /**< confirmation (rf_reacquiring()): poll fast.        */
     float    rate_fps;   /**< Tracker range rate, ft/s (+ climbing), for the     */
                          /**< callout lead (rf_rate_fps()).                      */
+    bool     break_reentry;/**< With track_break: the break is a flyable         */
+                         /**< DESCENDING re-entry (rf_break_reentry()), so the   */
+                         /**< late-rung window may speak a rung passed blind.    */
+    uint8_t  track_state;/**< rf_state_t: SEARCH/TRACK/COAST/LOST (recorder).    */
 } range_sample_t;
 
 /** Tone parameters the logic task publishes for the audio task. */

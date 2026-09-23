@@ -191,10 +191,32 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
  *          deliberately preserved: the rungs the aircraft genuinely passed
  *          earlier stay spent, and the rungs still ahead of it stay available.
  *
+ *          LATE-RUNG WINDOW (@p reentry). When the break is a genuine re-entry
+ *          (rf_break_reentry(): a DESCENDING track re-established after the
+ *          laser was blind, at a level the aircraft could physically have
+ *          flown to), the armed rungs between the old anchor and the new level
+ *          WERE passed while blind. They are all disarmed (spent, exactly like
+ *          a multi-rung crossing), and the LOWEST of them is returned for
+ *          announcement if the word would be heard no more than the window
+ *          below it: lateness = rung - (agl - lead) <= CALLOUT_LATE_TOL_HI_FT
+ *          for rungs at/above CALLOUT_LATE_TOL_SPLIT_FT, CALLOUT_LATE_TOL_LO_FT
+ *          below. Farther than that it is skipped — "bypassed thresholds are
+ *          not announced" (EGPWS). Without @p reentry nothing is disarmed and
+ *          nothing is returned: a stuck pattern or a teleport must never
+ *          spend a rung the aircraft may still be above.
+ *
  * @param c       Carried context (updated in place).
  * @param agl_ft  The new, trustworthy AGL to anchor on.
+ * @param p       Active sensor profile (the callout ladder); NULL disables the
+ *                late-rung window.
+ * @param reentry True for a flyable descending re-entry (rf_break_reentry()).
+ * @param[out] crossed_mask  Optional: the rungs disarmed as passed (bit i =
+ *                profile callout i), so a consumer pairing a side-effect to a
+ *                height (the gear-check reminder) sees a skipped rung too.
+ * @return The profile callout index to announce, or -1 for none.
  */
-void sm_reanchor(sm_ctx_t *c, float agl_ft);
+int sm_reanchor(sm_ctx_t *c, float agl_ft, const sensor_profile_t *p,
+                bool reentry, uint32_t *crossed_mask);
 
 /**
  * @brief Map a poll profile to a concrete period in milliseconds (config.h).

@@ -533,9 +533,15 @@ void sensor_task(void *arg)
                  *  in this window so an approach re-entering range is believed
                  *  within a fraction of a second (see sm_poll_period_ms).     */
                 .reacquiring = rf_reacquiring(&s_rf),
-                /*  Lag-free sink rate from the alpha-beta tracker: the logic
-                 *  task leads each callout by rate x CALLOUT_LEAD_S.          */
+                /*  Lag-free sink rate from the Kalman tracker: the logic task
+                 *  leads each callout by rate x CALLOUT_LEAD_S.               */
                 .rate_fps    = rf_rate_fps(&s_rf),
+                /*  A break that is a flyable descending re-entry opens the
+                 *  late-rung window in sm_reanchor(); any other break
+                 *  re-anchors silently.                                        */
+                .break_reentry = rf_break_reentry(&s_rf),
+                /*  SEARCH/TRACK/COAST/LOST, for the flight recorder.           */
+                .track_state = (uint8_t)rf_track_state(&s_rf),
             };
             /* Overwrite so the logic task always sees the freshest sample with
              * no backlog lag — essential for on-time callouts.                */
