@@ -383,7 +383,7 @@ static void test_callout_lead(const sensor_profile_t *p)
             c.lead_rate_fps = 0.0f;
             sm_step(&c, 300.0f, DT, p, &out);
         }
-        sm_reanchor(&c, 58.0f);
+        (void)sm_reanchor(&c, 58.0f, p, false, NULL);
         c.lead_rate_fps = -60.0f;
         sm_step(&c, 58.0f, DT, p, &out);
         bool said50 = out.fired_callout >= 0 &&
@@ -406,7 +406,7 @@ static void test_callout_lead(const sensor_profile_t *p)
             c.lead_rate_fps = -60.0f;
             sm_step(&c, 250.0f - 60.0f * DT * (float)i, DT, p, &out);
         }
-        sm_reanchor(&c, 70.0f);
+        (void)sm_reanchor(&c, 70.0f, p, false, NULL);
         int spoke = 0;
         float agl = 70.0f;
         for (int i = 0; i < 400 && agl > 0.0f; ++i) {
@@ -444,7 +444,7 @@ static void test_reanchor_to_ground_does_not_disarm(const sensor_profile_t *p)
     }
 
     /* Filter breaks track onto a "0 ft" level and sits there for 60 s. */
-    sm_reanchor(&c, 0.0f);
+    (void)sm_reanchor(&c, 0.0f, p, false, NULL);
     int ticks = (int)(2.0f * GROUND_RESET_MS / (DT * 1000.0f));
     for (int i = 0; i < ticks; ++i) {
         sm_step(&c, 0.0f, DT, p, &out);
@@ -463,6 +463,146 @@ static void test_reanchor_to_ground_does_not_disarm(const sensor_profile_t *p)
     }
     snprintf(msg, sizeof msg, "[%s] flown descent into the band still parks + disarms", p->name);
     ASSERT_TRUE(!c.armed && out.state == ST_GROUND, msg);
+}
+
+/* ---------------------------------------------------------------------------
+ *  The late-rung window (Everett's rule, 2026-09-22).
+ *
+ *  When the laser comes back into range on a DESCENDING approach (the range
+ *  filter's rf_break_reentry()), the rungs between the held altitude and the
+ *  new level were genuinely passed while blind. The LOWEST of them is spoken
+ *  if the word would be heard at most 25 ft below it (100 ft and up) or 5 ft
+ *  below it (the 10-50 rungs); farther below it is skipped. Every passed rung
+ *  is spent either way. A break that is NOT a re-entry (a stuck byte pattern,
+ *  a teleport out of a live track) must leave the ladder exactly as it was.
+ * ------------------------------------------------------------------------- */
+
+/*  Index of the profile rung at @p ft, or -1. */
+static int rung_index(const sensor_profile_t *p, float ft)
+{
+    for (size_t i = 0; i < p->n_callouts; ++i) {
+        if (fabsf(p->callouts[i] - ft) < 0.5f) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/*  An armed machine that has been established at @p from_ft, then re-anchored
+ *  onto @p to_ft with the given re-entry verdict and sink rate. Returns the
+ *  announced rung index; @p crossed receives the passed mask.                  */
+static int reanchor_from(const sensor_profile_t *p, sm_ctx_t *c, float from_ft,
+                         float to_ft, bool reentry, float rate_fps,
+                         uint32_t *crossed)
+{
+    sm_init(c, ST_ARMED);
+    sm_out_t out;
+    for (int i = 0; i < 10; ++i) {
+        c->lead_rate_fps = 0.0f;
+        sm_step(c, from_ft, DT, p, &out);
+    }
+    c->lead_rate_fps = rate_fps;
+    return sm_reanchor(c, to_ft, p, reentry, crossed);
+}
+
+static void test_late_rung_window(const sensor_profile_t *p)
+{
+    char msg[128];
+    sm_ctx_t c;
+    uint32_t crossed = 0u;
+    int i300 = rung_index(p, 300.0f);
+    int i200 = rung_index(p, 200.0f);
+    int i50  = rung_index(p, 50.0f);
+    int i40  = rung_index(p, 40.0f);
+    ASSERT_TRUE(i300 >= 0 && i200 >= 0 && i50 >= 0 && i40 >= 0,
+                "late-rung fixture: the ladder has 300/200/50/40");
+
+    /* --- A top rung passed blind, heard 15 ft late: spoken ----------------- */
+    int got = reanchor_from(p, &c, 350.0f, 285.0f, true, 0.0f, &crossed);
+    snprintf(msg, sizeof msg, "[%s] re-entry at 285: 300 (15 ft late) is spoken", p->name);
+    ASSERT_TRUE(got == i300, msg);
+    snprintf(msg, sizeof msg, "[%s] re-entry at 285: 300 reported passed + spent", p->name);
+    ASSERT_TRUE(crossed == (1u << i300) && (c.armed_mask & (1u << i300)) == 0u, msg);
+
+    /* --- ...40 ft late: skipped, but still spent (never spoken later) ------ */
+    got = reanchor_from(p, &c, 350.0f, 260.0f, true, 0.0f, &crossed);
+    snprintf(msg, sizeof msg, "[%s] re-entry at 260: 300 (40 ft late) is skipped", p->name);
+    ASSERT_TRUE(got == -1, msg);
+    snprintf(msg, sizeof msg, "[%s] re-entry at 260: the skipped 300 is spent", p->name);
+    ASSERT_TRUE(crossed == (1u << i300) && (c.armed_mask & (1u << i300)) == 0u, msg);
+    {
+        /* Jitter back up across the rung and down again: silence (a spent
+         * rung re-arms only through the sustained go-around climb).          */
+        sm_out_t out;
+        int fired = 0;
+        for (int k = 0; k < 6; ++k) {
+            c.lead_rate_fps = 0.0f;
+            sm_step(&c, (k % 2) ? 299.0f : 301.0f, DT, p, &out);
+            fired += (out.fired_callout == i300);
+        }
+        snprintf(msg, sizeof msg, "[%s] a skipped rung never speaks late on jitter", p->name);
+        ASSERT_TRUE(fired == 0, msg);
+    }
+
+    /* --- The lead counts: where the word is HEARD ---------------------------- *
+     *  Sinking 60 ft/s the lead is 12 ft: 10 ft below 300 is heard 22 ft late
+     *  (spoken), 15 ft below is heard 27 ft late (skipped).                     */
+    got = reanchor_from(p, &c, 350.0f, 290.0f, true, -60.0f, &crossed);
+    snprintf(msg, sizeof msg, "[%s] 60 ft/s re-entry at 290: heard 22 ft late -> spoken", p->name);
+    ASSERT_TRUE(got == i300, msg);
+    got = reanchor_from(p, &c, 350.0f, 285.0f, true, -60.0f, &crossed);
+    snprintf(msg, sizeof msg, "[%s] 60 ft/s re-entry at 285: heard 27 ft late -> skipped", p->name);
+    ASSERT_TRUE(got == -1, msg);
+
+    /* --- Several passed: only the LOWEST may speak, all are spent ----------- */
+    got = reanchor_from(p, &c, 350.0f, 185.0f, true, 0.0f, &crossed);
+    snprintf(msg, sizeof msg, "[%s] 350 -> 185: 200 spoken (the lowest passed)", p->name);
+    ASSERT_TRUE(got == i200, msg);
+    snprintf(msg, sizeof msg, "[%s] 350 -> 185: 300 and 200 both spent", p->name);
+    ASSERT_TRUE(crossed == ((1u << i300) | (1u << i200)), msg);
+
+    /* --- The low rungs use the tight 5 ft window ----------------------------- */
+    got = reanchor_from(p, &c, 60.0f, 47.0f, true, 0.0f, &crossed);
+    snprintf(msg, sizeof msg, "[%s] 60 -> 47: 50 (3 ft late) is spoken", p->name);
+    ASSERT_TRUE(got == i50, msg);
+    got = reanchor_from(p, &c, 60.0f, 43.0f, true, 0.0f, &crossed);
+    snprintf(msg, sizeof msg, "[%s] 60 -> 43: 50 (7 ft late) is skipped", p->name);
+    ASSERT_TRUE(got == -1, msg);
+    got = reanchor_from(p, &c, 60.0f, 40.0f, true, 0.0f, &crossed);
+    snprintf(msg, sizeof msg, "[%s] 60 -> 40: 40 (on the rung) is spoken, not 50", p->name);
+    ASSERT_TRUE(got == i40, msg);
+
+    /* --- NOT a re-entry: nothing spoken, nothing spent ----------------------- *
+     *  The stuck-pattern teleport: 186 ft -> "76 ft". The 100 rung must stay
+     *  armed for the real descent that follows.                                 */
+    got = reanchor_from(p, &c, 186.0f, 76.0f, false, 0.0f, &crossed);
+    int i100 = rung_index(p, 100.0f);
+    snprintf(msg, sizeof msg, "[%s] non-re-entry break: nothing spoken", p->name);
+    ASSERT_TRUE(got == -1 && crossed == 0u, msg);
+    snprintf(msg, sizeof msg, "[%s] non-re-entry break: 100 still armed", p->name);
+    ASSERT_TRUE(i100 >= 0 && (c.armed_mask & (1u << i100)) != 0u, msg);
+
+    /* --- Never before the ladder is armed ------------------------------------ */
+    {
+        sm_init(&c, ST_GROUND);
+        sm_out_t out;
+        for (int k = 0; k < 10; ++k) {
+            sm_step(&c, 60.0f, DT, p, &out);
+        }
+        got = sm_reanchor(&c, 47.0f, p, true, &crossed);
+        snprintf(msg, sizeof msg, "[%s] unarmed: the window never speaks", p->name);
+        ASSERT_TRUE(got == -1 && crossed == 0u, msg);
+    }
+
+    /* --- Defensive inputs ------------------------------------------------------ */
+    got = reanchor_from(p, &c, 350.0f, 285.0f, true, 0.0f, NULL);
+    snprintf(msg, sizeof msg, "[%s] NULL crossed_mask is fine", p->name);
+    ASSERT_TRUE(got == i300, msg);
+    got = reanchor_from(p, &c, 350.0f, NAN, true, 0.0f, &crossed);
+    snprintf(msg, sizeof msg, "[%s] NaN altitude clamps to 0: nothing within 5 ft", p->name);
+    ASSERT_TRUE(got == -1 || p->callouts[got] <= CALLOUT_LATE_TOL_LO_FT, msg);
+    ASSERT_TRUE(sm_reanchor(NULL, 10.0f, p, true, &crossed) == -1 && crossed == 0u,
+                "NULL context: -1 and an empty mask");
 }
 
 static void test_ground_dwell_disarm(const sensor_profile_t *p)
@@ -977,6 +1117,7 @@ int main(void)
         test_ground_dwell_disarm(p);
         test_reanchor_to_ground_does_not_disarm(p);
         test_callout_lead(p);
+        test_late_rung_window(p);
         test_arm_requires_dwell(p);
         test_arm_dwell_slow_cadence(p);
         test_spike_decay_regression(p);

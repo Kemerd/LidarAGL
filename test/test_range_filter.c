@@ -1,15 +1,26 @@
 /**
  * @file    test_range_filter.c
- * @brief   Host unit tests for the robust runtime range pipeline.
+ * @brief   Host unit tests for the range tracker (range_filter.c).
  *
- * @details Exercises every stage of range_filter.c — the 2-byte wire decoder,
- *          the validity gates, the median-of-drain vote, the Hampel outlier
- *          gate, re-acquisition, and the time-corrected EMA — plus an
- *          end-to-end regression of the real-world taxi incident: a garbage
- *          sample once armed the state machine and spoke a phantom
- *          "50 40 30 20 10" descent while the aircraft taxied. These tests
- *          pin the whole chain (filter -> state machine) silent under that
- *          exact stimulus, while proving legitimate descents still call out.
+ * @details Exercises every stage of the per-sample tracker — the 2-byte wire
+ *          decoder, the validity gates, the Kalman track's innovation gate,
+ *          COAST / LOST, M-of-N candidate confirmation, track breaks, the
+ *          re-entry verdict and sample-and-hold repeats — plus end-to-end
+ *          regressions through the state machine: the real-world taxi
+ *          incident (a garbage sample once armed the ladder and spoke a
+ *          phantom "50 40 30 20 10" while taxiing), the silent approaches, and
+ *          the stuck-pattern teleport.
+ *
+ *          INPUTS ARE PHYSICAL. The tracker timestamps every raw sample (a
+ *          drain's samples are spread uniformly across its interval), so a
+ *          moving aircraft must be fed as the continuous RAMP a real sensor
+ *          produces (push_ramp), at a physical rate. The v1.63 tests fed each
+ *          poll as identical samples followed by a jump — a staircase whose
+ *          "rate" changed with the poll cadence — which a per-poll median never
+ *          noticed but which a per-sample tracker correctly reads as a
+ *          teleport. Tests whose assertions named a v1.63 MECHANISM (median,
+ *          Hampel window, poll counts) now assert the equivalent BEHAVIOUR;
+ *          each says what changed and why.
  */
 
 #include "test_util.h"
@@ -38,12 +49,39 @@ static void push_n(range_filter_t *f, float cm, int n)
     }
 }
 
+/*  Feed a drain that RAMPS linearly from the previous poll's value to this
+ *  one's: sample j of n reads cm_from + (cm_to - cm_from) * (j+1)/n, so the
+ *  last sample is "now". This is the continuous stream a moving aircraft
+ *  produces — see the file header for why staircases are not.               */
+static void push_ramp(range_filter_t *f, float cm_from, float cm_to, int n)
+{
+    for (int i = 0; i < n; ++i) {
+        rf_push_cm(f, cm_from + (cm_to - cm_from) * (float)(i + 1) / (float)n);
+    }
+}
+
+/*  Feet (range) -> cm, the wire unit. */
+static float ft_cm(float ft)
+{
+    return ft / CM_TO_FT;
+}
+
 /* Feed a clean ground drain (n samples with ±1 cm deterministic jitter). */
 static void push_ground_drain(range_filter_t *f, int n)
 {
     for (int i = 0; i < n; ++i) {
         rf_push_cm(f, CM_GROUND + (float)(i % 3) - 1.0f);   /* 90/91/92 cm */
     }
+}
+
+/*  The logic task's contract on a broken track (app_main.c): re-anchor the
+ *  state machine, with the late-rung window open only for a flyable
+ *  descending re-entry. Returns the rung the window announced, or -1 — a
+ *  caller counting "what the box said" must count it like a fired callout.   */
+static int reanchor_like_logic_task(sm_ctx_t *sm, const range_filter_t *f,
+                                    float agl, const sensor_profile_t *p)
+{
+    return sm_reanchor(sm, agl, p, rf_break_reentry(f), NULL);
 }
 
 /* Finalize and return the published range; copies out the fresh flag. */
@@ -128,9 +166,12 @@ static void test_validity_gates(void)
 }
 
 /* ---------------------------------------------------------------------------
- *  Stage 2: median-of-drain — the exact old failure (last pair wins) is dead.
+ *  A minority of garbage cannot move the output — the exact old failure (the
+ *  LAST pair of a drain won) is dead. v1.63 proved this with a per-drain
+ *  median; the tracker proves it per sample: every garbage sample fails the
+ *  innovation gate on its own.
  * ------------------------------------------------------------------------- */
-static void test_median_of_drain(void)
+static void test_minority_garbage(void)
 {
     range_filter_t f;
     rf_init(&f, SF30C_PROFILE.max_range_ft);
@@ -138,32 +179,55 @@ static void test_median_of_drain(void)
 
     /* 57 good samples + ONE trailing garbage pair (the incident's shape: the
      * freshest bytes of a wake-edge drain are the corrupt ones). The old code
-     * published 295 ft; the median doesn't move.                               */
+     * published 295 ft; the tracker rejects the sample.                        */
     push_ground_drain(&f, 57);
     rf_push_cm(&f, CM_SPIKE);
     bool fresh;
     float ft = fin(&f, 0.75f, &fresh);
-    ASSERT_TRUE(fresh,               "median drain with one bad pair is fresh");
-    ASSERT_NEAR(ft, 3.0f, 0.4f,      "one trailing garbage pair cannot move the median");
+    ASSERT_TRUE(fresh,               "drain with one bad pair is still fresh");
+    ASSERT_NEAR(ft, 3.0f, 0.4f,      "one trailing garbage pair cannot move the output");
 
-    /* Even a 40% garbage burst loses the vote. */
+    /* 40% garbage INTERLEAVED through the drain: each junk sample fails the
+     * gate, and junk can never gather the majority a candidate needs.       */
+    for (int i = 0; i < 58; ++i) {
+        if (i % 5 < 2) {
+            rf_push_cm(&f, CM_SPIKE - (float)(i % 7) * 900.0f);
+        } else {
+            rf_push_cm(&f, CM_GROUND + (float)(i % 3) - 1.0f);
+        }
+    }
+    ft = fin(&f, 0.75f, &fresh);
+    ASSERT_TRUE(fresh,               "40% interleaved garbage: still fresh");
+    ASSERT_NEAR(ft, 3.0f, 0.4f,      "40% interleaved garbage cannot move the output");
+
+    /* A 23-sample (0.3 s) garbage BURST at the end of the drain: the track
+     * coasts through it on its own prediction.                              */
     push_ground_drain(&f, 35);
     push_n(&f, CM_SPIKE, 23);
     ft = fin(&f, 0.75f, &fresh);
-    ASSERT_NEAR(ft, 3.0f, 0.4f,      "a 40% garbage burst loses the median vote");
+    ASSERT_NEAR(ft, 3.0f, 0.4f,      "a 0.3 s garbage burst is coasted through");
+    push_ground_drain(&f, 58);
+    ft = fin(&f, 0.75f, &fresh);
+    ASSERT_TRUE(fresh && !rf_track_broken(&f),
+                "after the burst the SAME track resumes (no break)");
+    ASSERT_NEAR(ft, 3.0f, 0.4f,      "after the burst: still on the ground");
 }
 
 /* ---------------------------------------------------------------------------
- *  Stage 3: Hampel gate — a fully-garbled drain (DFS/sleep corruption) holds.
+ *  A fully-garbled drain (DFS/sleep corruption) holds. v1.63 needed a
+ *  cross-poll Hampel window for this; here the whole drain fails the gate,
+ *  the track coasts then goes LOST (held), and a stationary level that far
+ *  from the hold would need RF_BREAK_S of persistence to be adopted.
  * ------------------------------------------------------------------------- */
-static void test_hampel_rejects_garbage_drain(void)
+static void test_rejects_garbage_drain(void)
 {
     range_filter_t f;
     rf_init(&f, SF30C_PROFILE.max_range_ft);
     settle_on_ground(&f, 6);
 
-    /* An ENTIRE drain of plausible-band garbage: the median is garbage too, so
-     * only the cross-poll Hampel gate can save us — and it must.               */
+    /* An ENTIRE drain of plausible-band garbage — here the worst case, a
+     * perfectly self-consistent value: nothing in the drain can outvote it,
+     * so only the track's own gate and the break rules can save us.         */
     push_n(&f, CM_SPIKE, 58);
     bool fresh;
     float ft = fin(&f, 0.75f, &fresh);
@@ -187,7 +251,14 @@ static void test_hampel_rejects_garbage_drain(void)
 }
 
 /* ---------------------------------------------------------------------------
- *  Stage 4: re-acquisition — a REAL level step gets through in N polls.
+ *  A REAL level step far beyond physical reach is adopted — as a flagged
+ *  TRACK BREAK, after RF_BREAK_S of persistence.
+ *
+ *  v1.63 took any step after 3 agreeing polls (2.25 s at this cadence, 75 ms at
+ *  the fastest) and let UPWARD steps through as continuous motion. Now every
+ *  step beyond the continuous reach needs the same wall-clock persistence at
+ *  every cadence and is reported as a break, so the ladder re-anchors on it
+ *  instead of reading it as flown motion.
  * ------------------------------------------------------------------------- */
 static void test_reacquire_real_step(void)
 {
@@ -195,69 +266,76 @@ static void test_reacquire_real_step(void)
     rf_init(&f, SF30C_PROFILE.max_range_ft);
     settle_on_ground(&f, 6);
 
-    /* The level genuinely steps to 150 ft — far beyond the bounded slew
-     * allowance, so the Hampel gate rejects it — yet consistent drains must be
-     * accepted after exactly RANGE_REACQUIRE_N polls. (A smaller step, inside
-     * the physical allowance, is simply accepted on the first poll.)           */
     const float cm150 = 150.0f / CM_TO_FT;
-    bool fresh = false;
-    float ft = 0.0f;
-    int polls_to_accept = 0;
+    bool  fresh = false;
+    bool  broke = false;
+    float ft    = 0.0f;
+    float t     = 0.0f;
     for (int i = 0; i < 8 && !fresh; ++i) {
         push_n(&f, cm150, 58);
         ft = fin(&f, 0.75f, &fresh);
-        ++polls_to_accept;
+        broke = rf_track_broken(&f);
+        t += 0.75f;
     }
     ASSERT_TRUE(fresh, "consistent new level is re-acquired");
-    ASSERT_TRUE(polls_to_accept == RANGE_REACQUIRE_N,
-                "re-acquire takes exactly RANGE_REACQUIRE_N polls");
-    ASSERT_NEAR(ft, 150.0f, 1.5f, "re-acquired output snaps to the new level");
+    ASSERT_TRUE(t >= RF_BREAK_S && t <= RF_COAST_MAX_S + RF_BREAK_S + 0.75f,
+                "an unreachable step needs ~RF_BREAK_S of persistence, no more");
+    ASSERT_TRUE(broke,              "...and is reported as a TRACK BREAK");
+    ASSERT_TRUE(!rf_break_reentry(&f),
+                "...never as a re-entry (the returns never stopped)");
+    ASSERT_NEAR(ft, 150.0f, 1.5f,   "re-acquired output is the new level");
 }
 
 /* ---------------------------------------------------------------------------
- *  Stage 4b: re-acquisition needs sample MASS, not just polls (fast cadence).
+ *  Re-acquisition needs TIME-SPANNED evidence, not polls (fast cadence).
+ *
+ *  At the 25 ms DESCENT poll a drain is ~2 raw samples. v1.63 counted polls
+ *  and then had to add a raw-sample "mass" rule after 75 ms of a stuck,
+ *  cleanly-framed byte pattern forced a false snap and a phantom low callout
+ *  on final. The tracker's M-of-N rule is per sample by construction:
+ *  RF_CONFIRM_SAMPLES members spanning RF_CONFIRM_MIN_S, however the polls
+ *  fall. Here a reachable level (+27 ft of range) must stay held for the
+ *  first 75 ms, then confirm continuously (no break) within ~150 ms.
  * ------------------------------------------------------------------------- */
-static void test_reacquire_needs_sample_mass(void)
+static void test_reacquire_needs_timed_evidence(void)
 {
     range_filter_t f;
     rf_init(&f, SF30C_PROFILE.max_range_ft);
     settle_on_ground(&f, 6);
 
-    /*  DESCENT cadence: a 25 ms poll catches only ~2 raw samples, so a drain
-     *  "median" there is really a mean-of-2 with zero minority immunity. Three
-     *  agreeing polls (the old, poll-count-only rule) are just ~6 samples of a
-     *  self-consistent burst — 75 ms of a stuck, cleanly-framed byte pattern
-     *  once forced a false snap and a phantom low callout on final. The
-     *  cluster must now ALSO bank RANGE_REACQUIRE_MIN_SAMPLES raw samples:
-     *  the first three 2-sample polls stay HELD, the fourth (8 banked)
-     *  re-acquires — a genuine terrain step still lands in ~100 ms, which
-     *  remains invisible in the flare.                                        */
-    const float cm150 = 150.0f / CM_TO_FT;
-    bool fresh = false;
-    float ft;
+    bool  fresh = false;
+    float ft    = 0.0f;
+    int   polls = 0;
     for (int i = 0; i < 3; ++i) {
-        push_n(&f, cm150, 2);
+        rf_push_cm(&f, ft_cm(30.0f) + 1.0f);          /* +-1 cm real jitter   */
+        rf_push_cm(&f, ft_cm(30.0f) - 1.0f);
         ft = fin(&f, 0.025f, &fresh);
-        ASSERT_TRUE(!fresh,          "2-sample drains: poll count alone can't snap");
-        ASSERT_NEAR(ft, 3.0f, 0.4f,  "still holding last-good through the burst");
+        ++polls;
+        ASSERT_TRUE(!fresh,          "75 ms of a new level: poll count alone can't snap");
+        ASSERT_NEAR(ft, 3.0f, 0.6f,  "still on the old level through it");
     }
-    push_n(&f, cm150, 2);
-    ft = fin(&f, 0.025f, &fresh);
-    ASSERT_TRUE(fresh,               "4th agreeing poll banks the mass -> re-acquire");
-    ASSERT_NEAR(ft, 150.0f, 1.5f,    "fast-cadence re-acquire snaps to the level");
+    while (!fresh && polls < 12) {
+        rf_push_cm(&f, ft_cm(30.0f) + 1.0f);
+        rf_push_cm(&f, ft_cm(30.0f) - 1.0f);
+        ft = fin(&f, 0.025f, &fresh);
+        ++polls;
+    }
+    ASSERT_TRUE(fresh && polls <= 6, "confirmed once the evidence spans ~0.1 s");
+    ASSERT_TRUE(!rf_track_broken(&f),"a reachable level hands over continuously");
+    ASSERT_NEAR(ft, 30.0f, 1.0f,     "fast-cadence re-acquire lands on the level");
 }
 
 /* ---------------------------------------------------------------------------
  *  Stage 4c: the Hampel gate is LIVE on the very next poll after a re-acquire.
  * ------------------------------------------------------------------------- */
-static void test_hampel_live_after_reacquire(void)
+static void test_gate_live_after_reacquire(void)
 {
     range_filter_t f;
     rf_init(&f, SF30C_PROFILE.max_range_ft);
     settle_on_ground(&f, 6);
 
-    /* Force a legitimate re-acquire onto a 150 ft level (GROUND-size drains
-     * bank the sample mass instantly, so this snaps in RANGE_REACQUIRE_N).    */
+    /* Force a legitimate re-acquire onto a 150 ft level (a flagged break
+     * after RF_BREAK_S, see test_reacquire_real_step).                      */
     const float cm150 = 150.0f / CM_TO_FT;
     bool fresh = false;
     float ft = 0.0f;
@@ -267,12 +345,11 @@ static void test_hampel_live_after_reacquire(void)
     }
     ASSERT_TRUE(fresh, "precondition: level re-acquired at 150 ft");
 
-    /*  The window used to be re-seeded with a SINGLE value, leaving the gate
-     *  bypassed (win_n < HAMPEL_SEED_N) for the next two polls — a lone
-     *  corrupted pair in a 1-2 sample fast drain rode ungated straight into
-     *  the EMA right after the snap, exactly when corruption is most likely
-     *  still in progress. The window is now pre-filled at the new level, so a
-     *  garbage drain on the VERY next poll must be rejected and held.          */
+    /*  v1.63 once re-seeded its Hampel window with a SINGLE value, leaving the
+     *  gate bypassed for two polls right after a snap — a lone corrupted pair
+     *  rode ungated into the output exactly when corruption is most likely
+     *  still in progress. The adopted candidate carries its own converged
+     *  covariance, so the innovation gate is live from the very next sample.  */
     push_n(&f, CM_GROUND, 1);            /* one corrupt pair: ~3 ft vs 150 ft   */
     ft = fin(&f, 0.025f, &fresh);
     ASSERT_TRUE(!fresh,              "garbage right after re-acquire is gated (held)");
@@ -296,26 +373,40 @@ static void test_legit_descent_passes(void)
     /* Establish level flight at 200 ft (ARMED cadence, 50 ms polls). */
     const float cm200 = 200.0f / CM_TO_FT;
     for (int i = 0; i < 8; ++i) {
-        push_n(&f, cm200, 4);
+        push_ground_drain(&f, 0);                    /* (no-op: keeps the idiom) */
+        for (int k = 0; k < 4; ++k) {
+            rf_push_cm(&f, cm200 + (float)(k % 3) - 1.0f);
+        }
         (void)fin(&f, 0.05f, NULL);
     }
 
-    /* Descend at 25 ft/s (1500 fpm) on the 25 ms DESCENT cadence: every poll
-     * must be accepted fresh and the filter must track within a couple feet.   */
-    int rejected = 0;
-    float ft = 200.0f;
-    float true_ft = 200.0f;
-    for (int i = 0; i < 300 && true_ft > 5.0f; ++i) {
-        true_ft -= 25.0f * 0.025f;
-        push_n(&f, true_ft / CM_TO_FT, 2);
+    /* Push over into a 25 ft/s (1500 fpm) descent the way an aircraft does —
+     * the sink builds over ~1 s (~0.8 g), it does not appear instantly — then
+     * hold it on the 25 ms DESCENT cadence. Every poll must be accepted fresh
+     * and the filter must track within a foot. (v1.63's version stepped the
+     * rate instantly on a staircase; see the file header.)                    */
+    int   rejected = 0;
+    float ft       = 200.0f;
+    float true_ft  = 200.0f;
+    float rate     = 0.0f;
+    float worst    = 0.0f;
+    for (int i = 0; i < 400 && true_ft > 5.0f; ++i) {
+        float from = true_ft;
+        rate = (rate < 25.0f) ? rate + 25.0f * 0.025f : 25.0f;
+        true_ft -= rate * 0.025f;
+        push_ramp(&f, ft_cm(from), ft_cm(true_ft), 2);
         bool fresh;
         ft = fin(&f, 0.025f, &fresh);
         if (!fresh) {
             ++rejected;
         }
+        if (fabsf(ft - true_ft) > worst) {
+            worst = fabsf(ft - true_ft);
+        }
     }
-    ASSERT_TRUE(rejected == 0,        "1500 fpm descent: zero samples rejected");
-    ASSERT_NEAR(ft, true_ft, 3.0f,    "1500 fpm descent: filter tracks within 3 ft");
+    ASSERT_TRUE(rejected == 0,        "1500 fpm descent: zero polls rejected");
+    ASSERT_TRUE(worst < 1.0f,         "1500 fpm descent: tracked within 1 ft throughout");
+    ASSERT_NEAR(rf_rate_fps(&f), -25.0f, 1.0f, "1500 fpm descent: rate ~ -25 ft/s");
 }
 
 /* ---------------------------------------------------------------------------
@@ -453,11 +544,13 @@ static void test_out_of_range_climb_then_descent(void)
     /* --- Parked, then the climb-out ------------------------------------ */
     for (int i = 0; i < 10; ++i) FLY_POLL(push_ground_drain(&f, 58));
 
-    /*  Climb 3 ft -> 340 ft at a realistic Glasair rate. Feeding real returns
-     *  the whole way arms the ladder exactly as a genuine climb-out does.      */
-    for (float ft = 5.0f; ft <= 340.0f; ft += 5.0f) {
-        float cm = (ft + GROUND_REF) / CM_TO_FT;
-        FLY_POLL(push_n(&f, cm, 12));
+    /*  Climb 3 ft -> 340 ft at a realistic Glasair rate (1500 fpm), as the
+     *  continuous stream a real sensor sees. Feeding real returns the whole
+     *  way arms the ladder exactly as a genuine climb-out does.              */
+    for (float ft = 0.0f; ft < 340.0f; ) {
+        float from = ft;
+        ft += 25.0f * dt;
+        FLY_POLL(push_ramp(&f, ft_cm(from + GROUND_REF), ft_cm(ft + GROUND_REF), 12));
     }
 
     ASSERT_TRUE(sm.armed, "out-of-range flight: climb-out armed the ladder");
@@ -471,9 +564,16 @@ static void test_out_of_range_climb_then_descent(void)
     ASSERT_TRUE(saw_cruise, "out-of-range flight: reached CRUISE while high");
 
     /* --- Descend back through the ceiling and fly it down to the flare --- */
-    for (float ft = 325.0f; ft >= 0.0f; ft -= 2.0f) {
-        float cm = (ft + GROUND_REF) / CM_TO_FT;
-        FLY_POLL(push_n(&f, cm, 12));
+    /*  1200 fpm, continuous. Above the reach the sensor still says nothing.  */
+    for (float ft = 360.0f; ft > 0.0f; ) {
+        float from = ft;
+        ft -= 20.0f * dt;
+        if (ft < 0.0f) ft = 0.0f;
+        if (from + GROUND_REF > p->max_range_ft) {
+            FLY_POLL(push_n(&f, CM_SENTINEL, 12));
+        } else {
+            FLY_POLL(push_ramp(&f, ft_cm(from + GROUND_REF), ft_cm(ft + GROUND_REF), 12));
+        }
     }
 
     /*  Rollout. The filter's EMA lags the true trajectory by a few feet, so the
@@ -546,11 +646,22 @@ static void test_out_of_range_climb_then_descent(void)
  *  demands the ladder still speak the low rungs in the right order.
  * ========================================================================= */
 
-/*  Shared descent driver. Flies AGL from @p from_ft down to @p to_ft in 2 ft
- *  steps, calling @p shape_fn to build each poll's drain, and records which
- *  callout heights spoke. Returns the count; @p out_spoken receives the list.  */
-typedef void (*drain_shape_fn)(range_filter_t *f, float true_cm, int poll_idx,
-                               unsigned *seed);
+/*  Shared descent driver. Flies AGL from @p from_ft down to @p to_ft at a
+ *  steady 25 ft/s (1500 fpm), calling @p shape_fn to build each poll's drain
+ *  from the continuous true range (it ramps cm_from -> cm_to across the poll),
+ *  and records which callout heights spoke. Returns the count; @p out_spoken
+ *  receives the list. (v1.63 stepped 2 ft per POLL, so the "descent rate"
+ *  changed with the cadence; see the file header.)                            */
+typedef void (*drain_shape_fn)(range_filter_t *f, float cm_from, float cm_to,
+                               int poll_idx, unsigned *seed);
+
+/*  The true (uncorrupted) value of sample @p j of @p n in a ramped poll. */
+static float ramp_at(float cm_from, float cm_to, int j, int n)
+{
+    return cm_from + (cm_to - cm_from) * (float)(j + 1) / (float)n;
+}
+
+#define DESCENT_FPS 25.0f
 
 static int fly_descent_with(drain_shape_fn shape, float from_ft, float to_ft,
                             float ground_ref, float spoken_out[SM_MAX_CALLOUTS],
@@ -592,9 +703,12 @@ static int fly_descent_with(drain_shape_fn shape, float from_ft, float to_ft,
      *  threshold altitude would leave the lowest rung un-crossed on paper. A
      *  real approach flares and rolls out, which is exactly this hold — and it
      *  is where the last rung's downward crossing actually lands.              */
-    for (float ft = from_ft; ft >= to_ft; ft -= 2.0f) {
-        float true_cm = (ft + ground_ref) / CM_TO_FT;
-        shape(&f, true_cm, poll_idx++, &seed);
+    for (float ft = from_ft; ft > to_ft; ) {
+        float prev = ft;
+        ft -= DESCENT_FPS * dt;
+        if (ft < to_ft) ft = to_ft;
+        shape(&f, (prev + ground_ref) / CM_TO_FT, (ft + ground_ref) / CM_TO_FT,
+              poll_idx++, &seed);
 
         bool  fresh_;
         float ft_ = fin(&f, dt, &fresh_);
@@ -613,7 +727,7 @@ static int fly_descent_with(drain_shape_fn shape, float from_ft, float to_ft,
      *  settle, still running the SAME corruption shape (a wet runway does not
      *  become clean just because the wheels are down).                         */
     for (int i = 0; i < 60; ++i) {
-        shape(&f, ground_ref / CM_TO_FT, poll_idx++, &seed);
+        shape(&f, ground_ref / CM_TO_FT, ground_ref / CM_TO_FT, poll_idx++, &seed);
 
         bool  fresh_;
         float ft_ = fin(&f, dt, &fresh_);
@@ -682,11 +796,12 @@ static void assert_ladder_ok(const float *spoken, int n, const char *label)
  *      descent. This is the single most common real corruption: one byte of a
  *      high/low pair flips and decodes to a plausible distance. The median of
  *      the drain must absorb it entirely — a minority can never outvote.       */
-static void shape_bitflip_minority(range_filter_t *f, float true_cm,
+static void shape_bitflip_minority(range_filter_t *f, float cm_from, float cm_to,
                                    int poll_idx, unsigned *seed)
 {
     (void)poll_idx;
     for (int j = 0; j < 12; ++j) {
+        float true_cm = ramp_at(cm_from, cm_to, j, 12);
         *seed = *seed * 1103515245u + 12345u;
         if (((*seed >> 16) & 0x7fff) % 11 == 0) {
             /*  A flipped bit high in the value: decodes to a wildly different
@@ -710,7 +825,7 @@ static void test_descent_with_bitflips(void)
  *      a time (a dark, wet runway is the documented case). The filter HOLDS,
  *      which is correct — but the held value must not cost us a rung once real
  *      data returns.                                                           */
-static void shape_intermittent_lost(range_filter_t *f, float true_cm,
+static void shape_intermittent_lost(range_filter_t *f, float cm_from, float cm_to,
                                     int poll_idx, unsigned *seed)
 {
     (void)seed;
@@ -718,7 +833,7 @@ static void shape_intermittent_lost(range_filter_t *f, float true_cm,
     if (poll_idx % 3 == 2) {
         push_n(f, CM_SENTINEL, 12);
     } else {
-        push_n(f, true_cm, 12);
+        push_ramp(f, cm_from, cm_to, 12);
     }
 }
 
@@ -735,8 +850,8 @@ static void test_descent_with_dropouts(void)
  *      repeats cleanly for several polls, so the median AGREES with itself and
  *      cannot be voted down. The filter must not adopt it as a new level (that
  *      would fire phantom rungs), and must recover once real data resumes.     */
-static void shape_stuck_burst(range_filter_t *f, float true_cm, int poll_idx,
-                              unsigned *seed)
+static void shape_stuck_burst(range_filter_t *f, float cm_from, float cm_to,
+                              int poll_idx, unsigned *seed)
 {
     (void)seed;
     /*  Two separate bursts during the descent, each a few polls long. */
@@ -745,7 +860,7 @@ static void shape_stuck_burst(range_filter_t *f, float true_cm, int poll_idx,
     if (in_burst) {
         push_n(f, 2400.0f, 12);      /* a stuck ~79 ft pattern */
     } else {
-        push_n(f, true_cm, 12);
+        push_ramp(f, cm_from, cm_to, 12);
     }
 }
 
@@ -761,7 +876,7 @@ static void test_descent_with_stuck_burst(void)
  *      16001..16383, all of which decode to 525..537 ft — beyond any real
  *      return. These must die at the absolute gate, not sail through as a
  *      "530 ft" reading that would re-arm rungs mid-approach.                   */
-static void shape_flipped_sentinels(range_filter_t *f, float true_cm,
+static void shape_flipped_sentinels(range_filter_t *f, float cm_from, float cm_to,
                                     int poll_idx, unsigned *seed)
 {
     (void)poll_idx;
@@ -770,7 +885,7 @@ static void shape_flipped_sentinels(range_filter_t *f, float true_cm,
         if (((*seed >> 16) & 0x7fff) % 9 == 0) {
             rf_push_cm(f, CM_SENT_FLIP);
         } else {
-            rf_push_cm(f, true_cm);
+            rf_push_cm(f, ramp_at(cm_from, cm_to, j, 12));
         }
     }
 }
@@ -790,11 +905,11 @@ static void test_descent_with_flipped_sentinels(void)
  *      are untrustworthy and rf_drain_abort() throws the WHOLE drain away. That
  *      is the right call, but repeated aborts must degrade to a HOLD (a missed
  *      poll), never to a wrong altitude or a lost rung.                         */
-static void shape_framing_aborts(range_filter_t *f, float true_cm, int poll_idx,
-                                 unsigned *seed)
+static void shape_framing_aborts(range_filter_t *f, float cm_from, float cm_to,
+                                 int poll_idx, unsigned *seed)
 {
     (void)seed;
-    push_n(f, true_cm, 12);
+    push_ramp(f, cm_from, cm_to, 12);
     /*  Every fourth poll the UART reports framing/parity errors. */
     if (poll_idx % 4 == 3) {
         rf_drain_abort(f);
@@ -812,8 +927,8 @@ static void test_descent_with_framing_aborts(void)
 /*  (6) Everything at once — flips, dropouts, a stuck burst and framing aborts
  *      on the same approach. The individual tests prove each mechanism; this
  *      proves they compose, which is the only thing the aircraft cares about.  */
-static void shape_kitchen_sink(range_filter_t *f, float true_cm, int poll_idx,
-                               unsigned *seed)
+static void shape_kitchen_sink(range_filter_t *f, float cm_from, float cm_to,
+                               int poll_idx, unsigned *seed)
 {
     if (poll_idx % 7 == 6) {                       /* whole-poll dropout       */
         push_n(f, CM_SENTINEL, 12);
@@ -824,6 +939,7 @@ static void shape_kitchen_sink(range_filter_t *f, float true_cm, int poll_idx,
         return;
     }
     for (int j = 0; j < 12; ++j) {                 /* scattered corruption     */
+        float true_cm = ramp_at(cm_from, cm_to, j, 12);
         *seed = *seed * 1103515245u + 12345u;
         unsigned r = (*seed >> 16) & 0x7fff;
         if (r % 13 == 0) {
@@ -940,7 +1056,9 @@ static void test_garbage_cannot_teleport_across_rungs(void)
 
         if (fresh_ && rf_track_broken(&f)) {
             broke = true;
-            sm_reanchor(&sm, agl_);
+            if (reanchor_like_logic_task(&sm, &f, agl_, p) >= 0) {
+                ++fires;
+            }
         }
 
         sm_out_t out_;
@@ -961,11 +1079,17 @@ static void test_garbage_cannot_teleport_across_rungs(void)
      *  have wedged the filter into permanently refusing to move.                */
     int spoke_100 = 0;
     for (float ft = 186.0f; ft >= 60.0f; ft -= 1.0f) {
-        push_n(&f, (ft + G) / CM_TO_FT, 12);
+        push_ramp(&f, (ft + 1.0f + G) / CM_TO_FT, (ft + G) / CM_TO_FT, 12);
         bool  fresh_;
         float ft_  = fin(&f, dt, &fresh_);
         float agl_ = ft_ - G;
         if (agl_ < 0.0f) agl_ = 0.0f;
+        if (fresh_ && rf_track_broken(&f)) {
+            int late = reanchor_like_logic_task(&sm, &f, agl_, p);
+            if (late >= 0 && fabsf(p->callouts[late] - 100.0f) < 0.5f) {
+                ++spoke_100;
+            }
+        }
         sm_out_t out_;
         sm_step(&sm, agl_, dt, p, &out_);
         if (out_.fired_callout >= 0 &&
@@ -1054,8 +1178,9 @@ static void test_out_of_range_erroneous_no_phantom(void)
             float agl_ = ft_ - G;                                             \
             if (agl_ < 0.0f) agl_ = 0.0f;                                     \
             /* The logic task's real contract: re-anchor on a broken track. */ \
-            if (fresh_ && rf_track_broken(&f)) {                              \
-                sm_reanchor(&sm, agl_);                                       \
+            if (fresh_ && rf_track_broken(&f) &&                              \
+                reanchor_like_logic_task(&sm, &f, agl_, p) >= 0) {            \
+                ++fires;                                                      \
             }                                                                 \
             sm_out_t out_;                                                    \
             sm_step(&sm, agl_, dt, p, &out_);                                 \
@@ -1063,10 +1188,12 @@ static void test_out_of_range_erroneous_no_phantom(void)
             dt = (float)poll_profile_to_ms(out_.poll) / 1000.0f;              \
         } while (0)
 
-    /* Parked, then a genuine climb-out that arms the ladder. */
+    /* Parked, then a genuine climb-out (1500 fpm, continuous) that arms. */
     for (int i = 0; i < 10; ++i) ERR_POLL(push_ground_drain(&f, 58));
-    for (float ft = 5.0f; ft <= 340.0f; ft += 5.0f) {
-        ERR_POLL(push_n(&f, (ft + G) / CM_TO_FT, 12));
+    for (float ft = 0.0f; ft < 340.0f; ) {
+        float from = ft;
+        ft += 25.0f * dt;
+        ERR_POLL(push_ramp(&f, ft_cm(from + G), ft_cm(ft + G), 12));
     }
     ASSERT_TRUE(sm.armed, "erroneous out-of-range: climb-out armed the ladder");
 
@@ -1082,8 +1209,11 @@ static void test_out_of_range_erroneous_no_phantom(void)
 
     /*  Now genuinely descend back into range: the ladder must still work.     */
     int fires_at_descent = fires;
-    for (float ft = 325.0f; ft >= 0.0f; ft -= 2.0f) {
-        ERR_POLL(push_n(&f, (ft + G) / CM_TO_FT, 12));
+    for (float ft = 325.0f; ft > 0.0f; ) {
+        float from = ft;
+        ft -= 20.0f * dt;
+        if (ft < 0.0f) ft = 0.0f;
+        ERR_POLL(push_ramp(&f, ft_cm(from + G), ft_cm(ft + G), 12));
     }
     for (int i = 0; i < 60; ++i) {
         ERR_POLL(push_n(&f, G / CM_TO_FT, 12));
@@ -1240,74 +1370,85 @@ static void test_tracking_counts_rejected_returns(void)
 }
 
 /* ---------------------------------------------------------------------------
- *  A candidate track needs CONSECUTIVE usable drains.
+ *  A candidate track needs CONSECUTIVE members.
  *
- *  While blind, a junk stream can produce the occasional coherent-looking drain
- *  with no-return drains in between. If a candidate track survived those gaps,
- *  scattered junk could collect "members" for as long as it liked and, with
- *  the time-based break rule, re-acquire a phantom level. Here the scattered
- *  drains even lie on a perfect straight line (the worst case for the track
- *  gate), and must still never be believed; the same line flown as a CONTIGUOUS
- *  run of drains must be.
+ *  While blind, a junk stream can produce the occasional coherent-looking
+ *  run with no-return stretches in between. If a candidate survived those
+ *  gaps, scattered junk could collect "members" for as long as it liked and
+ *  re-acquire a phantom level (a phantom "100" at 450 ft, found in the v1.63
+ *  sweep). Here short bursts — each too little evidence on its own — lie on a
+ *  PERFECT straight descending line (the worst case: they agree with the
+ *  candidate's prediction across every gap), separated by no-return gaps
+ *  longer than RF_CANDIDATE_GAP_S. They must never be believed; the same line
+ *  flown as a CONTIGUOUS run must be, as a descending re-entry.
+ *  (v1.63 expressed this in whole drains; the per-sample rule is the gap.)
  * ------------------------------------------------------------------------- */
-static void test_track_needs_consecutive_drains(void)
+static void test_track_needs_consecutive_members(void)
 {
-    printf("\n-- re-acquire track needs consecutive usable drains --\n");
+    printf("\n-- re-acquire track needs consecutive members --\n");
     range_filter_t f;
     rf_init(&f, 328.0f);
-    const float dt = 0.5f;                      /* CRUISE cadence            */
+    const float hz   = 78.0f;
+    const float step = 1.0f / hz;                /* one sample period         */
+    const float sink = 20.0f;                    /* the line: 20 ft/s down    */
 
     /* Established at 100 ft of range, then blind long enough to lose track. */
     for (int i = 0; i < 6; ++i) {
         push_n(&f, 100.0f / CM_TO_FT, 30);
-        (void)fin(&f, dt, NULL);
+        (void)fin(&f, 0.5f, NULL);
     }
     for (int i = 0; i < 10; ++i) {
         push_n(&f, (float)SF30_LOST_SIGNAL_CM, 30);
-        (void)fin(&f, dt, NULL);
+        (void)fin(&f, 0.5f, NULL);
     }
-    ASSERT_TRUE(f.track_lost, "setup: track lost after blind drains");
+    ASSERT_TRUE(rf_track_state(&f) == RF_LOST, "setup: track lost after blind drains");
 
-    /* Coherent drains on a straight descending line, each separated by two
-     * no-return drains: never a contiguous run.                              */
-    bool believed = false;
-    float level_ft = 300.0f;
-    for (int k = 0; k < 15; ++k) {
-        bool fresh = false;
-        push_n(&f, level_ft / CM_TO_FT, 30);
-        (void)fin(&f, dt, &fresh);
-        believed |= fresh;
-        for (int g = 0; g < 2; ++g) {
-            push_n(&f, (float)SF30_LOST_SIGNAL_CM, 30);
-            (void)fin(&f, dt, NULL);
+    /*  Bursts of 5 samples ON the line (65 ms: short of the evidence), each
+     *  followed by 16 no-return samples (0.2 s > RF_CANDIDATE_GAP_S). One
+     *  poll per sample so nothing depends on drain grouping.              */
+    bool  believed = false;
+    float t        = 0.0f;
+    for (int k = 0; k < 40; ++k) {
+        for (int j = 0; j < 5; ++j) {
+            bool fresh = false;
+            rf_push_cm(&f, (300.0f - sink * t) / CM_TO_FT);
+            (void)fin(&f, step, &fresh);
+            believed |= fresh;
+            t += step;
         }
-        level_ft -= 3.0f * 3.0f;                /* same line across the gaps */
+        for (int g = 0; g < 16; ++g) {
+            rf_push_cm(&f, (float)SF30_LOST_SIGNAL_CM);
+            (void)fin(&f, step, NULL);
+            t += step;
+        }
     }
-    ASSERT_TRUE(!believed, "scattered drains on a straight line never re-acquire");
+    ASSERT_TRUE(!believed, "gapped bursts on a straight line never re-acquire");
 
-    /* The same kind of line as a CONTIGUOUS run is a real re-entry. */
+    /* The same line as a CONTIGUOUS run is a real (descending) re-entry. */
     believed = false;
-    for (int k = 0; k < 6 && !believed; ++k) {
+    for (int k = 0; k < 40 && !believed; ++k) {
         bool fresh = false;
-        push_n(&f, level_ft / CM_TO_FT, 30);
-        (void)fin(&f, dt, &fresh);
+        rf_push_cm(&f, (300.0f - sink * t) / CM_TO_FT);
+        (void)fin(&f, step, &fresh);
         believed |= fresh;
-        level_ft -= 3.0f;
+        t += step;
     }
-    ASSERT_TRUE(believed, "a contiguous run of the same track re-acquires");
+    ASSERT_TRUE(believed, "a contiguous run of the same line re-acquires");
+    ASSERT_TRUE(rf_track_broken(&f) && rf_break_reentry(&f),
+                "...as a descending RE-ENTRY after blindness");
 }
 
 int main(void)
 {
     printf("== range_filter ==\n");
-    test_track_needs_consecutive_drains();
+    test_track_needs_consecutive_members();
     test_ascii_decoder();
     test_validity_gates();
-    test_median_of_drain();
-    test_hampel_rejects_garbage_drain();
+    test_minority_garbage();
+    test_rejects_garbage_drain();
     test_reacquire_real_step();
-    test_reacquire_needs_sample_mass();
-    test_hampel_live_after_reacquire();
+    test_reacquire_needs_timed_evidence();
+    test_gate_live_after_reacquire();
     test_legit_descent_passes();
     test_taxi_incident_end_to_end(false);
     test_taxi_incident_end_to_end(true);

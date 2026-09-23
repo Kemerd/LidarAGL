@@ -152,6 +152,14 @@ typedef struct {
     rf_state_t state;       /**< SEARCH / TRACK / COAST / LOST.                */
     rf_kf_t  trk;           /**< The main track's estimate.                    */
     float    since_accept_s;/**< Time since the last accepted sample (s).      */
+    uint32_t unacc_void;    /**< No-return samples since the last accept.      */
+    uint32_t unacc_real;    /**< Real returns since the last accept (rejected). */
+    bool     lost_blind;    /**< The track was LOST to no-returns (blindness), */
+                            /**< not to rejected returns (see rf_break_reentry).*/
+
+    /* --- Sample-and-hold repeat detection (see RF_REPEAT_HOLD_S). ----------- */
+    float    last_z;        /**< Previous raw sample (ft), NaN after a no-return.*/
+    float    repeat_s;      /**< How long the current value has repeated (s).  */
 
     /* --- Published output. -------------------------------------------------- */
     bool     have_out;      /**< False until the first lock.                   */

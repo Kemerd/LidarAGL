@@ -27,6 +27,7 @@
 #include "shared.h"
 #include "sensor_profile.h"
 #include "sf30c.h"
+#include "range_filter.h"    /* rf_state_t, for the flight recorder's flags2      */
 #include "boot_buffer.h"
 #include "robust.h"          /* boot-reading sanity: robust_estimate/robust_mean */
 #include "state_machine.h"
@@ -745,6 +746,89 @@ static void run_config_menu(void)
 }
 
 /* ---------------------------------------------------------------------------
+ *  Voice one descent-callout decision.
+ * ------------------------------------------------------------------------- */
+/**
+ * @brief Queue the audio for one descent-callout decision: the number (subject
+ *        to the start-altitude cap) and, when any rung passed this tick is the
+ *        pilot's gear-check altitude, the "check gear" reminder.
+ *
+ * @details One path for BOTH sources of a callout, so the cap and the gear
+ *          pairing can never drift apart between them:
+ *            - sm_step()'s ordinary crossing (out.fired_callout/crossed_mask);
+ *            - sm_reanchor()'s late-rung window, when the range filter
+ *              re-establishes a descending track after the laser was blind.
+ *
+ *          The "check gear" reminder rides on the fire: when a crossed height
+ *          is the pilot's gear-check altitude we (a) let the number through
+ *          even if the start-altitude cap would have suppressed it — the
+ *          reminder is a deliberate, independent safety call — and (b) queue
+ *          the "check gear" clip right after the number so it speaks
+ *          "<height> ... check gear". The pairing covers ANY rung crossed this
+ *          tick, not just the (lowest) number spoken: a terrain drop or a
+ *          re-acquire can pass several thresholds in one step, and a SKIPPED
+ *          gear-check rung must still deliver its safety call, because its
+ *          armed bit is already cleared and it cannot recover during the same
+ *          approach. That includes a rung passed while blind whose NUMBER was
+ *          too late to speak: the reminder is a checklist prompt, not an
+ *          altitude claim, so it still plays on its own.
+ *
+ *          Must be called only AFTER the audio resume edge has been published
+ *          (see the light-sleep block in logic_task): while the channel is
+ *          suspended the audio task discards the callout queue.
+ *
+ * @param fired    Profile callout index to speak, or -1 for none.
+ * @param crossed  Every rung passed this tick (bit i = profile callout i).
+ * @param state    State-machine state, for the log line only.
+ */
+static void speak_descent_callout(int fired, uint32_t crossed, sm_state_t state)
+{
+    if (g_profile == NULL) {
+        return;                          /* defensive: set once at boot         */
+    }
+    size_t n = g_profile->n_callouts;
+    if (n > SM_MAX_CALLOUTS) {
+        n = SM_MAX_CALLOUTS;
+    }
+
+    /* Is the pilot's gear-check rung among the ones passed this tick? */
+    bool is_gear_check = false;
+    if (s_gear_check_ft > 0.0f) {
+        for (size_t i = 0; i < n; ++i) {
+            if ((crossed & (1u << i)) != 0u &&
+                fabsf(g_profile->callouts[i] - s_gear_check_ft) < 0.5f) {
+                is_gear_check = true;
+                break;
+            }
+        }
+    }
+
+    if (fired >= 0 && (size_t)fired < n) {
+        float ft = g_profile->callouts[fired];
+        if (ft <= s_start_alt_ft || is_gear_check) {
+            callout_id_t cid = callout_id_for_ft(ft);
+            if (cid != CO_COUNT) {
+                audio_request_callout(cid);           /* the altitude number */
+            }
+            if (is_gear_check) {
+                audio_request_callout(CO_CHECK_GEAR); /* "... check gear"     */
+            }
+            ESP_LOGI(TAG, "callout %.0f ft%s (state=%d)",
+                     ft, is_gear_check ? " + check gear" : "", state);
+        } else {
+            ESP_LOGI(TAG, "callout %.0f ft suppressed (cap %.0f ft)",
+                     ft, s_start_alt_ft);
+        }
+    } else if (is_gear_check) {
+        /*  The gear-check rung was passed while the laser was blind and its
+         *  number was too late to announce: still remind the pilot.         */
+        audio_request_callout(CO_CHECK_GEAR);
+        ESP_LOGI(TAG, "check gear (%.0f ft rung passed blind; number skipped, "
+                      "state=%d)", s_gear_check_ft, state);
+    }
+}
+
+/* ---------------------------------------------------------------------------
  *  Logic task (core 1): the decision loop.
  * ------------------------------------------------------------------------- */
 static void logic_task(void *arg)
@@ -1002,22 +1086,39 @@ static void logic_task(void *arg)
          *  spans. That phantom is the worst thing this box can say: an out-of-
          *  range stretch that settled on a low erroneous cluster once snapped
          *  335 ft -> 12 ft in one poll and called "twenty" at altitude.          */
-        if (fresh && s.track_break) {
-            sm_reanchor(&sm, agl);
-            ESP_LOGW(TAG, "range track BROKEN -> re-anchored at %.1f ft AGL "
-                          "(gap is not flown motion; no rungs spoken across it)",
-                     (double)agl);
-        }
-
         /*  Callout lead input: the tracker's lag-free sink rate, in the same
          *  units as agl (scaled like it on bench/demo boots). Guarded: a
-         *  non-finite rate simply means no lead.                               */
+         *  non-finite rate simply means no lead. Set BEFORE the re-anchor
+         *  below: the late-rung window judges lateness where the word will be
+         *  HEARD, which needs this tick's lead.                                */
         {
             float rate = s.rate_fps;
             if (s_bench_scale) {
                 rate *= s_bench_scale_gain;
             }
             sm.lead_rate_fps = isfinite(rate) ? rate : 0.0f;
+        }
+
+        /*  A rung announced by the late-rung window (see below). Voiced after
+         *  the audio resume edge, together with sm_step()'s own callout.     */
+        int      late_fired   = -1;
+        uint32_t late_crossed = 0u;
+        bool     reentry      = fresh && s.track_break && s.break_reentry;
+        if (fresh && s.track_break) {
+            late_fired = sm_reanchor(&sm, agl, g_profile, reentry, &late_crossed);
+            if (reentry) {
+                /*  The laser came back on a DESCENDING approach: the rungs
+                 *  between were genuinely passed while blind. The lowest is
+                 *  spoken if only slightly late (CALLOUT_LATE_TOL_*), the rest
+                 *  are spent, exactly like EGPWS "bypassed thresholds".      */
+                ESP_LOGW(TAG, "range RE-ENTRY -> re-anchored at %.1f ft AGL "
+                              "(late rung: %d, passed mask 0x%04x)",
+                         (double)agl, late_fired, (unsigned)late_crossed);
+            } else {
+                ESP_LOGW(TAG, "range track BROKEN -> re-anchored at %.1f ft AGL "
+                              "(gap is not flown motion; no rungs spoken across it)",
+                         (double)agl);
+            }
         }
 
         sm_out_t out;
@@ -1091,50 +1192,14 @@ static void logic_task(void *arg)
             audio_resume();
         }
 
-        /* Fire the callout, if any, mapping the profile height -> clip id.
+        /* Fire the callouts, if any, mapping the profile height -> clip id.
          * Suppress any callout ABOVE the configured start-altitude cap so the
          * pilot only hears numbers from their chosen ceiling down (the tone is
          * unaffected). With the cap at the profile top this never suppresses.
-         *
-         * The "check gear" reminder rides on this fire: when the crossed height
-         * is the pilot's gear-check altitude we (a) let the number through even
-         * if the start-altitude cap would have suppressed it — the reminder is a
-         * deliberate, independent safety call — and (b) queue the "check gear"
-         * clip right after the number so it speaks "<height> ... check gear".    */
-        if (out.fired_callout >= 0) {
-            float ft = g_profile->callouts[out.fired_callout];
-            /* The gear reminder pairs with ANY rung crossed this tick, not just
-             * the one (lowest) number spoken: a terrain drop or a re-acquire
-             * snap can cross several thresholds in one step, and the state
-             * machine deliberately speaks only the lowest — but a SKIPPED
-             * gear-check rung must still deliver its safety call, because its
-             * armed bit is already cleared and it cannot recover during the
-             * same approach. crossed_mask reports the full crossed set.         */
-            bool is_gear_check = false;
-            if (s_gear_check_ft > 0.0f) {
-                for (size_t i = 0; i < g_profile->n_callouts; ++i) {
-                    if ((out.crossed_mask & (1u << i)) != 0u &&
-                        fabsf(g_profile->callouts[i] - s_gear_check_ft) < 0.5f) {
-                        is_gear_check = true;
-                        break;
-                    }
-                }
-            }
-            if (ft <= s_start_alt_ft || is_gear_check) {
-                callout_id_t cid = callout_id_for_ft(ft);
-                if (cid != CO_COUNT) {
-                    audio_request_callout(cid);           /* the altitude number */
-                }
-                if (is_gear_check) {
-                    audio_request_callout(CO_CHECK_GEAR); /* "... check gear"     */
-                }
-                ESP_LOGI(TAG, "callout %.0f ft%s (state=%d)",
-                         ft, is_gear_check ? " + check gear" : "", out.state);
-            } else {
-                ESP_LOGI(TAG, "callout %.0f ft suppressed (cap %.0f ft)",
-                         ft, s_start_alt_ft);
-            }
-        }
+         * The late-rung window's number (if any) is the HIGHER of the two and
+         * goes first; sm_step() then speaks any genuine crossing below it.    */
+        speak_descent_callout(late_fired, late_crossed, out.state);
+        speak_descent_callout(out.fired_callout, out.crossed_mask, out.state);
 
         /* "Positive rate" climb callout: the state machine confirms a sustained
          * post-liftoff climb (see sm_step); we only voice it when the pilot has
@@ -1217,9 +1282,28 @@ static void logic_task(void *arg)
                                       (out.tone_active ? FLOG_F_TONE_ACTIVE : 0u) |
                                       (tone_on         ? FLOG_F_TONE_ON     : 0u) |
                                       (sleep_allowed   ? FLOG_F_SLEEP       : 0u));
-            uint8_t flg2  = (uint8_t)((data_stale               ? FLOG_F2_STALE      : 0u) |
-                                      (out.fired_positive_rate  ? FLOG_F2_POSRATE    : 0u) |
-                                      (!fresh && stale_kick     ? FLOG_F2_STALE_KICK : 0u));
+            /*  The tracker state rides in flags2 bits 3-4. For CHANGE detection
+             *  COAST reads as TRACK: like FRESH/VALID it flips on single
+             *  rejected samples in a noisy stream, and logging every flip
+             *  would spend the ring on noise (the periodic record still
+             *  carries it).                                                   */
+            uint8_t trk     = (uint8_t)(s.track_state & 0x03u);
+            uint8_t trk_cmp = (trk == (uint8_t)RF_COAST) ? (uint8_t)RF_TRACK : trk;
+            uint8_t flg2_common =
+                (uint8_t)((data_stale               ? FLOG_F2_STALE      : 0u) |
+                          (out.fired_positive_rate  ? FLOG_F2_POSRATE    : 0u) |
+                          (!fresh && stale_kick     ? FLOG_F2_STALE_KICK : 0u) |
+                          (reentry                  ? FLOG_F2_REENTRY    : 0u) |
+                          (late_fired >= 0          ? FLOG_F2_LATE_RUNG  : 0u));
+            uint8_t flg2     = (uint8_t)(flg2_common |
+                                         ((uint8_t)(trk << FLOG_F2_TRK_SHIFT) & FLOG_F2_TRK_MASK));
+            uint8_t flg2_cmp = (uint8_t)(flg2_common |
+                                         ((uint8_t)(trk_cmp << FLOG_F2_TRK_SHIFT) & FLOG_F2_TRK_MASK));
+            /*  The logged rung: the late-rung window's if it spoke, else the
+             *  ordinary crossing's (both in one tick is vanishingly rare; the
+             *  LATE_RUNG flag says which one this is).                       */
+            int8_t fired_log = (int8_t)((late_fired >= 0) ? late_fired
+                                                          : out.fired_callout);
             uint16_t mask = (uint16_t)(sm.armed_mask & 0xFFFFu);
 
             /*  FRESH and VALID flip every other poll on a noisy drain, so they
@@ -1228,8 +1312,8 @@ static void logic_task(void *arg)
             bool changed = ((uint8_t)out.state != flog_prev_state) ||
                            (mask != flog_prev_mask) ||
                            (((flags ^ flog_prev_flags) & CHANGE_BITS) != 0u) ||
-                           (flg2 != flog_prev_flg2) ||
-                           (out.fired_callout >= 0);
+                           (flg2_cmp != flog_prev_flg2) ||
+                           (out.fired_callout >= 0) || (late_fired >= 0);
             if (changed || now_us - flog_last_us >= (int64_t)FLOG_DECISION_MIN_MS * 1000) {
                 /* Clamp the rate into the i16 field; the sm already bounds it. */
                 float tr = sm.trend_fps * 10.0f;
@@ -1247,7 +1331,7 @@ static void logic_task(void *arg)
                     .armed_mask = mask,
                     .dt_ms      = (uint16_t)dtm,
                     .state      = (uint8_t)out.state,
-                    .fired      = (int8_t)out.fired_callout,
+                    .fired      = fired_log,
                     .flags      = flags,
                     .flags2     = flg2,
                 };
@@ -1256,7 +1340,7 @@ static void logic_task(void *arg)
                 flog_prev_state = (uint8_t)out.state;
                 flog_prev_mask  = mask;
                 flog_prev_flags = flags;
-                flog_prev_flg2  = flg2;
+                flog_prev_flg2  = flg2_cmp;
             }
         }
 

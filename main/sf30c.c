@@ -31,9 +31,10 @@ static const char *TAG = "sf30c";
 
 /* ---- Module state -------------------------------------------------------- */
 
-/*  The robust range pipeline (median-of-drain -> Hampel gate -> re-acquire ->
- *  time-corrected EMA; see range_filter.c). It replaces the old bare EMA +
- *  hold-last-good pair, both of which live inside it now.                      */
+/*  The range tracker (validity gates -> per-sample Kalman track behind an
+ *  innovation gate -> M-of-N candidate tracks -> SEARCH/TRACK/COAST/LOST; see
+ *  range_filter.c). It replaces the old bare EMA + hold-last-good pair, both
+ *  of which live inside it now.                                                */
 static range_filter_t   s_rf;
 
 /*  Carried pairing state of the legacy 2-byte decoder (pure, range_filter.c).  */
@@ -113,8 +114,8 @@ void sf30c_init(void)
      * Depth 64: the 78 Hz stream can post an RX-timeout UART_DATA event per
      * 2-byte burst (~58 per 750 ms GROUND poll), and a full queue silently
      * drops later events — including the error flags this sweep exists to see.
-     * (Even a dropped error is not fatal: the median/Hampel layers downstream
-     * still gate whatever the corrupt bytes decode to — defence in depth.)     */
+     * (Even a dropped error is not fatal: the tracker's innovation gate still
+     * judges whatever the corrupt bytes decode to — defence in depth.)         */
     ESP_ERROR_CHECK(uart_driver_install(SF30C_UART_NUM,
                                         SF30C_UART_RX_BUF, SF30C_UART_TX_BUF,
                                         64, &s_uart_evq, 0));
@@ -241,15 +242,15 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
                  : 0.02f;
     s_last_fin_us = now_us;
 
-    /*  Bound the elapsed time before it reaches the filter. dt_s drives the
-     *  Hampel slew allowance and the EMA bandwidth, and both misbehave on a
-     *  degenerate value: a non-positive dt (a clock that did not advance, or a
-     *  64-bit read torn across a wrap) makes alpha zero or negative, and an
-     *  unboundedly large one is harmless to the capped gate but meaningless as
-     *  a rate. Neither is data — they are timekeeping artefacts — so clamp to
-     *  the range the poll cadences can actually produce. The generous ceiling
-     *  still lets a genuinely long gap collapse the EMA to a passthrough, which
-     *  is the correct behaviour: state that old deserves no weight.            */
+    /*  Bound the elapsed time before it reaches the filter. dt_s timestamps
+     *  every sample of the drain (they are spread uniformly across it) and so
+     *  drives the Kalman prediction, the coast limit and every candidate clock.
+     *  A non-positive dt (a clock that did not advance, or a 64-bit read torn
+     *  across a wrap) or an unboundedly large one is a timekeeping artefact,
+     *  not data, so clamp to the range the poll cadences can actually produce.
+     *  The generous ceiling still lets a genuinely long gap expire the track
+     *  (COAST -> LOST), which is the correct behaviour: state that old deserves
+     *  no weight. (range_filter.c applies the same guard defensively.)        */
     if (!(dt_s > 0.0f)) {
         dt_s = 0.001f;
     } else if (dt_s > SENSOR_MAX_DT_S) {
@@ -305,11 +306,11 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
         }
     }
 
-    /* EVERY decoded sample of the drain is pushed into the robust filter —
-     * the old code kept only the LAST pair, which let a single trailing
-     * garbage pair outvote ~57 good samples at the GROUND cadence. Validity
-     * (lost-signal band, negatives, beyond-ceiling junk) is judged inside
-     * rf_push_cm(); the median vote + Hampel gate happen at rf_finalize().     */
+    /* EVERY decoded sample of the drain is pushed into the tracker — the old
+     * code kept only the LAST pair, which let a single trailing garbage pair
+     * outvote ~57 good samples at the GROUND cadence. Validity (lost-signal
+     * band, negatives, beyond-ceiling junk, the lens floor) is judged inside
+     * rf_push_cm(); each sample is then tracked, in order, at rf_finalize().   */
     for (int i = 0; i < n; ++i) {
         /* SIM mode always carries the LWNX framed stream from the bench tool —
          * regardless of the real-sensor parse mode below — so decode it as LWNX
@@ -356,10 +357,10 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
 #endif
     }
 
-    /* Close the drain: the samples vote, the Hampel gate judges the winner,
-     * and the published value is either the fresh smoothed range or the held
-     * last-good (empty drain / majority-lost drain / rejected outlier). The
-     * *valid contract is unchanged: false whenever nothing fresh landed.        */
+    /* Close the drain: every sample is tracked with its own timestamp, and
+     * the published value is the track predicted to now (TRACK / COAST) or
+     * the held / ceiling-pinned value (LOST). The *valid contract is
+     * unchanged: false whenever no sample was accepted this drain.             */
     bool have = rf_finalize(&s_rf, dt_s, range_ft_out, valid);
 
     /* Black box: mark the drain boundary so a replay feeds range_filter.c the

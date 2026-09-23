@@ -74,6 +74,14 @@ assert struct.calcsize(AUDIO_FMT) == 12
 F_VALID, F_FRESH, F_TRACK_BREAK, F_TRACKING = 0x01, 0x02, 0x04, 0x08
 F_ARMED, F_TONE_ACTIVE, F_TONE_ON, F_SLEEP = 0x10, 0x20, 0x40, 0x80
 F2_STALE, F2_POSRATE, F2_STALE_KICK = 0x01, 0x02, 0x04
+F2_TRK_SHIFT, F2_TRK_MASK = 3, 0x18          # range tracker state, 2 bits
+F2_REENTRY, F2_LATE_RUNG = 0x20, 0x40
+TRK_STATES = ["SEARCH", "TRACK", "COAST", "LOST"]   # rf_state_t order
+
+
+def trk_state(f2):
+    """The range tracker's state (rf_state_t) carried in flags2 bits 3-4."""
+    return TRK_STATES[(f2 & F2_TRK_MASK) >> F2_TRK_SHIFT]
 
 A_RUNNING, A_CLIP, A_CALLOUTS_EN, A_TONE_EN = 0x01, 0x02, 0x04, 0x08
 A_TONE_REQ, A_SUSPEND_REQ, A_ALERT = 0x10, 0x20, 0x40
@@ -137,6 +145,11 @@ def flags_str(f, f2):
         out.append("STALE")
     if f2 & F2_POSRATE:
         out.append("POSRATE")
+    out.append("trk:" + trk_state(f2))
+    if f2 & F2_REENTRY:
+        out.append("RE-ENTRY")
+    if f2 & F2_LATE_RUNG:
+        out.append("LATE-RUNG")
     return " ".join(out)
 
 
@@ -241,7 +254,7 @@ def decode(bin_path, sessions_wanted):
     dcsv.writerow(["session", "t_ms", "seq", "range_ft", "agl_ft", "trend_fps", "state",
                    "armed_mask", "fired_idx", "fired_ft", "dt_ms", "valid", "fresh",
                    "track_break", "tracking", "armed", "tone_active", "tone_on", "sleep",
-                   "stale", "posrate", "stale_kick"])
+                   "stale", "posrate", "stale_kick", "trk_state", "reentry", "late_rung"])
     rcsv.writerow(["session", "t_ms", "kind", "cm", "aborted"])
     acsv.writerow(["session", "t_ms", "running", "clip", "callouts_en", "tone_en",
                    "tone_req", "suspend_req", "alert", "queue", "tone_agl_ft",
@@ -292,7 +305,8 @@ def decode(bin_path, sessions_wanted):
                                int(bool(fl & F_ARMED)), int(bool(fl & F_TONE_ACTIVE)),
                                int(bool(fl & F_TONE_ON)), int(bool(fl & F_SLEEP)),
                                int(bool(f2 & F2_STALE)), int(bool(f2 & F2_POSRATE)),
-                               int(bool(f2 & F2_STALE_KICK))])
+                               int(bool(f2 & F2_STALE_KICK)), trk_state(f2),
+                               int(bool(f2 & F2_REENTRY)), int(bool(f2 & F2_LATE_RUNG))])
                 armed_ever |= bool(fl & F_ARMED)
                 tone_ever |= bool(fl & F_TONE_ON)
                 if fi >= 0:

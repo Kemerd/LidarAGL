@@ -121,6 +121,11 @@ typedef struct FLOG_PACKED {
 #define FLOG_F2_STALE       0x01u  /**< Data older than LOST_SIGNAL_MUTE_MS.     */
 #define FLOG_F2_POSRATE     0x02u  /**< "Positive rate" fired this tick.        */
 #define FLOG_F2_STALE_KICK  0x04u  /**< Decision forced by the stale watchdog.  */
+#define FLOG_F2_TRK_SHIFT   3u     /**< Bits 3-4: the range tracker's state:     */
+#define FLOG_F2_TRK_MASK    0x18u  /**< rf_state_t SEARCH/TRACK/COAST/LOST 0..3. */
+#define FLOG_F2_REENTRY     0x20u  /**< The break was a flyable re-entry.       */
+#define FLOG_F2_LATE_RUNG   0x40u  /**< The fired rung came from the late-rung  */
+                                   /**< window (sm_reanchor), not a crossing.   */
 
 /**
  * @brief One logic-task decision tick, exactly as it was taken.
@@ -200,9 +205,10 @@ typedef struct FLOG_PACKED {
  *                                     finalize time's t_ms modulo 16384.
  *
  *  REPEAT keeps a blind cruise (thousands of identical lost-signal sentinels)
- *  nearly free. MARKER keeps the drain boundaries, which the median vote and
- *  the Hampel gate depend on, so a log can be replayed through range_filter.c
- *  and reproduce the firmware's decisions exactly. Its time is recovered by
+ *  nearly free. MARKER keeps the drain boundaries, from which the tracker
+ *  derives every sample's timestamp (a drain's samples are spread uniformly
+ *  across its interval), so a log can be replayed through range_filter.c and
+ *  reproduce the firmware's decisions to the millisecond. Its time is recovered by
  *  unwrapping against the record's own t_ms (records are emitted well inside
  *  the 16.4 s window). Each record is self-contained: the first sample after a
  *  record boundary is always a literal SAMPLE, never a REPEAT.                 */

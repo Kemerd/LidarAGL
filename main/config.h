@@ -136,6 +136,22 @@
 #define RF_R_ADAPT_ALPHA       0.02f  /* innovation-variance follower gain      */
 #define RF_GATE_SIGMA          5.0f   /* innovation gate, in sigmas (PX4: 5)    */
 
+/*  Sample-and-hold repeats. The SF30/C's measurement rate (#R) and serial
+ *  output rate (#U) are SEPARATE settings (LightWare Studio): with the output
+ *  faster than the measurement, the wire repeats each reading until the next
+ *  one — a staircase. A per-sample tracker that believed every repeat would
+ *  see "no motion" for the whole plateau and then a jump, and at a 4000 fpm
+ *  approach with 4x repeats (3.4 ft steps) the innovation gate rejects the
+ *  jumps and the track is lost. An EXACT repeat of the previous raw sample
+ *  carries no new information about a moving target, so within
+ *  RF_REPEAT_HOLD_S of the value first appearing it only lets time pass; each
+ *  new value is then tracked at its true arrival time. After that a repeat is
+ *  a genuinely steady reading and counts normally, so a parked aircraft with
+ *  a noiseless return still locks and stays locked. 0.1 s covers any
+ *  plausible hold (an internal rate down to 10 Hz) and is a third of the
+ *  coast limit, so skipping can never expire a live track.                   */
+#define RF_REPEAT_HOLD_S       0.10f  /* repeats within this are time only (s)  */
+
 /*  COAST: no accepted sample for up to this long (a dark patch, a wet spot) and
  *  the track keeps predicting from its measured rate, so the tone and callouts
  *  keep moving on time — at 4000 fpm a 0.3 s freeze would be ~20 ft of callout
@@ -168,31 +184,45 @@
 #define RF_CANDIDATE_GAP_S     0.15f  /* no-member gap that ends a candidate    */
 
 /*  Switching onto a confirmed candidate while the main track is alive:
- *    - A level the aircraft could physically have reached from the main
- *      track's prediction — |jump| <= RANGE_MAX_SLEW_FPS * span +
- *      RANGE_REACQUIRE_JUMP_SLACK_FT, capped at RANGE_REACQUIRE_JUMP_CAP_FT —
+ *    - A level within RANGE_MAX_SLEW_FPS * span + RANGE_REACQUIRE_JUMP_SLACK_FT
+ *      of the main track's prediction, capped at RANGE_REACQUIRE_JUMP_CAP_FT,
  *      switches CONTINUOUSLY on the ordinary evidence (a manoeuvre the model
- *      lagged, a small terrain step).
+ *      lagged, a small terrain step). With confirmation needing >= 0.1 s the
+ *      cap is what binds: 35 ft, whatever the wait.
  *    - Anything else needs RF_BREAK_S of agreement and switches as a TRACK
- *      BREAK (the consumer re-anchors instead of walking the ladder across the
- *      gap). A self-consistent stuck byte pattern satisfies every consistency
- *      test for free; physical reachability is the one thing it cannot fake (a
- *      110 ft teleport on final once spoke "one hundred" at 186 ft). A cap, not
- *      a time-grown allowance: an allowance that grows with waiting lets
- *      patience substitute for evidence. v1.63 let UPWARD jumps through
- *      unrestricted; they now need the same persistence, so a 0.1-0.3 s junk
- *      burst is coasted through instead of yanking the tone up and back.
- *  From LOST every new track is a TRACK BREAK (a re-established track is a new
- *  track — the radar-altimeter convention). A DESCENDING candidate (sinking
- *  faster than RANGE_REENTRY_SINK_FPS) is the approach coming back into range
- *  and confirms on the ordinary evidence; a STATIONARY one — the shape of a
- *  stuck byte pattern — needs RF_BREAK_S. Only a descending re-entry that the
- *  aircraft could physically have flown from its last tracked position is a
- *  RE-ENTRY for the late-rung window (see CALLOUT_LATE_TOL_*): the rungs in
- *  the gap were genuinely passed while the laser was blind.                   */
+ *      BREAK (the consumer re-anchors silently instead of walking the ladder
+ *      across the gap). A self-consistent stuck byte pattern satisfies every
+ *      consistency test for free; physical reachability is the one thing it
+ *      cannot fake (a 110 ft teleport on final once spoke "one hundred" at
+ *      186 ft). A fixed cap, not a time-grown allowance: an allowance that
+ *      grows with waiting lets patience substitute for evidence (v1.63 let a
+ *      continuous jump grow to 60 ft; UPWARD jumps were unrestricted — both
+ *      now need the same persistence, so a junk burst is coasted through
+ *      instead of yanking the tone up and back).
+ *  From LOST:
+ *    - A DESCENDING candidate (sinking faster than RANGE_REENTRY_SINK_FPS) is
+ *      the approach coming back into range: confirmed on the ordinary
+ *      evidence, always as a break (a re-established track is a new track —
+ *      the radar-altimeter convention).
+ *    - A stationary candidate within the continuous reach of the HELD value is
+ *      the same surface coming back (a dropout, a garbage burst ending while
+ *      parked): resumed continuously on the ordinary evidence.
+ *    - Any other stationary candidate — the shape of a stuck byte pattern —
+ *      needs RF_BREAK_S. Breaks are silent, so this latency costs nothing
+ *      audible, while every stuck pattern shorter than coast + RF_BREAK_S
+ *      (1.3 s) never moves the output at all. (v1.63 needed 1.5 s at the slow
+ *      cadences but only 12 polls = 0.3 s at the fast one; the time rule is
+ *      now the same at every cadence.)
+ *  A break is a RE-ENTRY for the late-rung window (see CALLOUT_LATE_TOL_*)
+ *  only when the candidate is descending, the aircraft could physically have
+ *  flown from its last MEASURED position to the new level in the elapsed time,
+ *  and the old track was lost to BLINDNESS — no-return samples, not rejected
+ *  returns. Only then were the rungs in the gap genuinely passed while the
+ *  laser saw nothing; tree tops, a building or a stuck pattern on final are
+ *  rejected returns, and must never spend a rung the aircraft is still above. */
 #define RANGE_REACQUIRE_JUMP_SLACK_FT 25.0f /* headroom over the physical reach  */
-#define RANGE_REACQUIRE_JUMP_CAP_FT   60.0f /* never a continuous jump beyond    */
-#define RF_BREAK_S                    0.30f /* agreement for an unreachable jump */
+#define RANGE_REACQUIRE_JUMP_CAP_FT   35.0f /* never a continuous jump beyond    */
+#define RF_BREAK_S                    1.00f /* agreement for an unreachable jump */
 #define RANGE_REENTRY_SINK_FPS        5.0f  /* descending re-entry threshold     */
 
 /* ---- Tracking verdict: the box's REAL power/latency signal ---------------- */
@@ -353,9 +383,9 @@
  *  time ahead (AGL + sink x CALLOUT_LEAD_S) crosses it, the way 1970s
  *  altitude-callout annunciators did (US4093938 anticipates up to 24 ft to
  *  cover message start-up) and the way Airbus trigger heights sit above their
- *  nominal values. The sink rate is the range filter's alpha-beta velocity:
- *  lag-free at a steady descent, and seeded from the confirmed track after a
- *  re-acquire, so a re-entry snap cannot spike it.
+ *  nominal values. The sink rate is the range tracker's Kalman velocity:
+ *  lag-free at a steady descent, and carried over from the confirmed
+ *  candidate after a re-acquire, so a re-entry snap cannot spike it.
  *
  *  Only a DESCENT leads; the lead is capped at CALLOUT_LEAD_MAX_FT; and the
  *  go-around re-arm hysteresis stays on the MEASURED altitude, so a lead can

@@ -318,6 +318,12 @@ static void cand_seed(range_filter_t *f, float z)
  *  prediction at the coast limit), and carries no motion from here on.        */
 static void rf_go_lost(range_filter_t *f)
 {
+    /*  Why was it lost? Blindness (the coast window was mostly no-returns: the
+     *  surface went dark, or we flew out of range) or rejection (returns kept
+     *  arriving but none fit: a terrain step, tree tops, a stuck pattern).
+     *  Only blindness can hide rungs the aircraft genuinely passed.         */
+    f->lost_blind = (f->unacc_void >= f->unacc_real);
+
     float coast = f->since_accept_s;
     if (coast > RF_COAST_MAX_S) {
         coast = RF_COAST_MAX_S;
@@ -348,6 +354,8 @@ static void rf_adopt(range_filter_t *f, bool brk, bool reentry,
     f->trk            = f->cand;               /* incl. its noise estimate     */
     f->trk.v          = clamp_rate(f->trk.v);
     f->since_accept_s = f->c_age_s;            /* 0: confirmed on a member     */
+    f->unacc_void     = 0;
+    f->unacc_real     = 0;
     f->state          = RF_TRACK;
     f->have_out       = true;
 
@@ -397,27 +405,40 @@ static void rf_try_confirm(range_filter_t *f, rf_drain_stats_t *st)
             break;
 
         case RF_LOST: {
-            /*  A re-established track is a NEW track: always a break. A
-             *  DESCENDING candidate is the approach coming back into range and
-             *  is taken on the ordinary evidence; a stationary (or climbing)
-             *  one — the shape of a stuck byte pattern — needs RF_BREAK_S.    */
             bool descending = f->cand.v < -RANGE_REENTRY_SINK_FPS;
-            if (!descending && f->c_span_s < RF_BREAK_S) {
-                return;
-            }
-            brk = true;
-
-            /*  Re-entry (the late-rung window may speak a passed rung) only if
-             *  the aircraft could physically have flown from its last MEASURED
-             *  position to the new level in the time that passed. A long blind
-             *  stretch makes almost anything reachable — that is the genuine
-             *  approach — while a 110 ft "descent" 0.3 s after tracking at
-             *  186 ft is not, and stays silent.                              */
             if (descending) {
+                /*  The approach coming back into range: a NEW track (always a
+                 *  break), taken on the ordinary evidence.                   */
+                brk = true;
+
+                /*  Re-entry (the late-rung window may speak a passed rung)
+                 *  only if the track was lost to BLINDNESS and the aircraft
+                 *  could physically have flown from its last MEASURED
+                 *  position to the new level in the time that passed. A long
+                 *  blind stretch makes almost anything reachable — that is the
+                 *  genuine approach — while a 110 ft "descent" 0.3 s after
+                 *  tracking at 186 ft is not, and stays silent.             */
                 float drop  = f->trk.x - f->cand.x;         /* >0: closer now  */
                 float reach = RANGE_MAX_SLEW_FPS * f->since_accept_s +
                               RANGE_REACQUIRE_JUMP_SLACK_FT;
-                reentry = (drop <= reach);                  /* NaN -> false    */
+                reentry = f->lost_blind && (drop <= reach); /* NaN -> false    */
+            } else {
+                /*  Stationary (or climbing). Near the HELD value it is the
+                 *  same surface coming back — resume continuously. Anything
+                 *  else is the shape of a stuck byte pattern: it must persist
+                 *  RF_BREAK_S, and then re-anchors silently.                 */
+                float jump  = fabsf(f->out_ft - f->cand.x);
+                float reach = RANGE_MAX_SLEW_FPS * f->c_span_s +
+                              RANGE_REACQUIRE_JUMP_SLACK_FT;
+                if (reach > RANGE_REACQUIRE_JUMP_CAP_FT) {
+                    reach = RANGE_REACQUIRE_JUMP_CAP_FT;
+                }
+                if (!(jump <= reach)) {                      /* NaN -> break   */
+                    if (f->c_span_s < RF_BREAK_S) {
+                        return;
+                    }
+                    brk = true;
+                }
             }
             break;
         }
@@ -485,13 +506,32 @@ static void rf_process_sample(range_filter_t *f, float h, float z,
     bool no_return = !isfinite(z);
     lost_hist_push(f, no_return);
     if (no_return) {
+        /* A no-return ends any repeat run: the next value is a new reading. */
+        f->last_z   = NAN;
+        f->repeat_s = 0.0f;
         count_up(&st->n_void);
+        count_up(&f->unacc_void);
         if (f->c_n > 0) {
             count_up(&f->c_void);
         }
         return;
     }
     count_up(&st->n_real);
+
+    /* --- Sample-and-hold repeats (see RF_REPEAT_HOLD_S) ----------------------
+     *  An EXACT repeat of the previous raw sample, within the hold window of
+     *  the value first appearing, is the sensor re-sending its last reading:
+     *  no new information, so it only lets time pass. (It has already counted
+     *  as a return for the lost vote and the tracking verdict above.)        */
+    if (z == f->last_z) {
+        f->repeat_s = clock_add(f->repeat_s, h);
+        if (f->repeat_s < RF_REPEAT_HOLD_S) {
+            return;
+        }
+    } else {
+        f->last_z   = z;
+        f->repeat_s = 0.0f;
+    }
 
     /* --- Main track: the innovation gate ------------------------------------ */
     if (f->state == RF_TRACK || f->state == RF_COAST) {
@@ -506,6 +546,8 @@ static void rf_process_sample(range_filter_t *f, float h, float z,
                 kf_seed(&f->trk, z, f->trk.r_var, RF_CAND_SIGMA_V);
             }
             f->since_accept_s = 0.0f;
+            f->unacc_void     = 0;
+            f->unacc_real     = 0;
             f->state          = RF_TRACK;
             st->accepted      = true;
 
@@ -523,6 +565,7 @@ static void rf_process_sample(range_filter_t *f, float h, float z,
     }
 
     /* --- Rejected by (or no) main track: offered to the candidate ----------- */
+    count_up(&f->unacc_real);
     if (f->c_n == 0) {
         cand_seed(f, z);
         return;
@@ -565,6 +608,7 @@ void rf_init(range_filter_t *f, float max_range_ft)
     f->state        = RF_SEARCH;
     f->trk.r_var    = RF_R_MIN;
     f->cand.r_var   = RF_R_MIN;
+    f->last_z       = NAN;               /* no previous sample to repeat       */
 }
 
 void rf_set_max_range(range_filter_t *f, float max_range_ft)
