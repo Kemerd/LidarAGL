@@ -482,7 +482,17 @@ void sf30c_configure_stream(uint32_t rate_code)
     uart_write_bytes(SF30C_UART_NUM, r_cmd, 4);
     uart_write_bytes(SF30C_UART_NUM, u_cmd, 4);
     uart_write_bytes(SF30C_UART_NUM, "#Z0:", 4);      /* zero offset = 0 m         */
-    ESP_LOGI(TAG, "ASCII config: #Y + #R%c/#U%c + #Z0 (rate code %u, baud %d)",
+    /* LAST-return mode (#S1), exactly as LightWare's own SF30 serial sample sets
+     * it. The laser looks through the housing's acrylic window, and "last"
+     * reports the FARTHEST target in each pulse: the ground rather than the
+     * window's own reflection, and through rain, fog or dust rather than off it.
+     * The SF30/C guide (Rev 10.3) says first/last selection "can usually
+     * mitigate" window reflections. Below ~5 m the window and ground returns
+     * merge and the mode cannot separate them — the firmware's lens floor
+     * (rf_set_min_range) covers that band.                                    */
+    uart_write_bytes(SF30C_UART_NUM, "#S1:", 4);      /* last-return mode          */
+    ESP_LOGI(TAG, "ASCII config: #Y + #R%c/#U%c + #Z0 + #S1 last-return "
+                  "(rate code %u, baud %d)",
              digit, digit, (unsigned)rate_code, SF30C_BAUD);
 #endif
 }
