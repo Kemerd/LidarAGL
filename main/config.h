@@ -46,9 +46,9 @@
 #define DEMO_MODE 0                 /* compiled OUT unless the build defines it */
 #endif
 #if DEMO_MODE
-#define FIRMWARE_VERSION "v1.62-DEMO"
+#define FIRMWARE_VERSION "v1.63-DEMO"
 #else
-#define FIRMWARE_VERSION "v1.62"
+#define FIRMWARE_VERSION "v1.63"
 #endif
 
 /* ---- Sensor model identifiers ------------------------------------------- */
@@ -115,12 +115,20 @@
 
 /*  Physical slew allowance: the window median lags the true trajectory by
  *  about half the window, so a legitimate climb/descent deviates from it by
- *  rate x lag. RANGE_MAX_SLEW_FPS bounds the airframe (a Glasair III dives
- *  well under 60 ft/s vertically); RANGE_SLEW_HORIZON is the half-window lag
- *  in polls; and RANGE_GATE_CAP_FT hard-caps the allowance so the slow GROUND/
- *  CRUISE cadences (0.5-0.75 s polls) can never open the gate wide enough to
- *  admit an arming-sized (>100 ft) spike in one poll.                          */
-#define RANGE_MAX_SLEW_FPS     60.0f  /* physical |d(range)/dt| bound           */
+ *  rate x lag. RANGE_MAX_SLEW_FPS bounds the airframe; RANGE_SLEW_HORIZON is
+ *  the half-window lag in polls; and RANGE_GATE_CAP_FT hard-caps the allowance
+ *  so the slow GROUND/CRUISE cadences (0.5-0.75 s polls) can never open the
+ *  gate wide enough to admit an arming-sized (>100 ft) spike in one poll.
+ *
+ *  The bound used to be 60 ft/s on the belief that "a Glasair III dives well
+ *  under 60 ft/s vertically". It does not: gear down at idle and ~120 kt it
+ *  sinks 3500-4000 fpm (58-67 ft/s), and ~2000 fpm approaches trip the panel's
+ *  TAWS "SINK RATE" routinely. A bound the aircraft can exceed makes the filter
+ *  reject the real descent as physically impossible. 100 ft/s (6000 fpm) sits
+ *  well above anything flown; the same bound sizes the re-acquire track gate's
+ *  first step and the downward-snap reachability test, so the whole filter
+ *  shares ONE statement of what the airframe can physically do.               */
+#define RANGE_MAX_SLEW_FPS     100.0f /* physical |d(range)/dt| bound (6000 fpm)*/
 #define RANGE_SLEW_HORIZON     4.5f   /* half Hampel window + 1, in polls       */
 #define RANGE_GATE_CAP_FT      60.0f  /* absolute ceiling on the slew allowance */
 
@@ -182,6 +190,23 @@
  *  breaking is reserved for evidence that is both sustained AND self-agreeing.  */
 #define RANGE_TRACK_BREAK_POLLS  12u  /* agreeing polls to accept a broken track */
 
+/*  ...or, at the slow polls, this much agreeing wall-clock time (still at least
+ *  RANGE_REACQUIRE_N polls). A poll COUNT is cadence-dependent evidence: 12
+ *  polls is 0.3 s at DESCENT but 6 s at the 500 ms CRUISE poll, and a CRUISE
+ *  poll carries ~39 raw samples, so each one is already a strong vote. Six
+ *  seconds of descent is ~50-100 ft on an approach: over a surface that only
+ *  returns from ~230 ft, the 200 ft rung was re-anchored past and never spoke.
+ *  Evidence is judged in time as well, so a slow-cadence break lands in ~1.5 s
+ *  while the fast cadences keep the 12-poll rule unchanged.                  */
+#define RANGE_TRACK_BREAK_S      1.5f /* agreeing time that also breaks track   */
+
+/*  A lost track re-established by a DESCENDING candidate track (sinking faster
+ *  than this) is confirmed on the ordinary re-acquire evidence, not the longer
+ *  break evidence: it is the approach coming back into range, and at 4000 fpm
+ *  every extra poll is tens of feet. 5 ft/s (300 fpm) is far above sensor
+ *  noise on a confirmed track and far below any approach.                    */
+#define RANGE_REENTRY_SINK_FPS   5.0f /* min sink for the fast re-entry path   */
+
 /* ---- Tracking verdict: the box's REAL power/latency signal ---------------- */
 /*  Whether the box may relax (slow the poll, suspend audio, light-sleep) is a
  *  question about the SENSOR — "can we see the ground?" — not about the
@@ -205,6 +230,61 @@
  *  banked turn) never trips it, while a genuine climb out of range does within
  *  a second or so at any cadence.                                              */
 #define RANGE_NOTRACK_POLLS      8u   /* useless drains before "sensor is dark" */
+
+/* ---- Cadence-independent lost-signal vote --------------------------------- */
+/*  A drain that is MAJORITY lost-signal is not trusted, even if a few stray
+ *  "returns" survived the gates — when the sensor says "no return" most of the
+ *  time, the odd distance in between is far likelier junk than ground. But a
+ *  per-DRAIN majority only means something when drains are big: at the slow
+ *  CRUISE poll a drain holds ~39 samples; at the fast ARMED/DESCENT polls it
+ *  holds 1-2, and a single junk sample IS the majority. Out of range, held
+ *  below cruise_ft (so polling fast), that let out-of-range junk walk the
+ *  published altitude and speak phantom rungs at pattern altitude.
+ *
+ *  So the vote is ALSO taken over the last RANGE_LOST_VOTE_SAMPLES raw samples,
+ *  whatever the cadence: if most of them were no-return, the drain is treated
+ *  as having no usable data. ~0.4 s of stream at 78 Hz — long enough to vote,
+ *  short enough that the first clean returns of a descent back into range
+ *  flip it within a fraction of a second. Must be <= 32 (one bit per sample). */
+#define RANGE_LOST_VOTE_SAMPLES  32u  /* sliding sample window for the vote     */
+
+/* ---- Drain coherence (the range-gate test) -------------------------------- */
+/*  A real surface returns a TIGHT cluster: the SF30's own noise is ~+/-5 cm,
+ *  plus however far the aircraft moves while the drain is collected. A junk
+ *  stream (garbled serial, a sensor emitting erroneous distances while blind)
+ *  scatters across the whole 0..343 ft window — and ~64% of uniform 14-bit
+ *  garbage lands inside it, so junk is MAJORITY "valid" and passes every
+ *  lost-signal vote. Its median still looked like an altitude (~170 ft) and
+ *  walked the published value into phantom rungs.
+ *
+ *  So a drain whose robust spread (1.4826 x MAD about its median) exceeds
+ *      RANGE_DRAIN_SPREAD_FT + RANGE_SPREAD_MOTION_K * RANGE_MAX_SLEW_FPS * dt
+ *  is INCOHERENT and counts as no usable return. The motion term is the MAD
+ *  scale of a uniform sweep across the distance the airframe can cover in one
+ *  poll (sigma ~= 0.37 x span), so even a 6000 fpm descent sampled at the slow
+ *  CRUISE poll stays coherent. The MAD has a 50% breakdown point: a MINORITY
+ *  of junk (bit flips, lens glints) cannot make a real drain incoherent.     */
+#define RANGE_DRAIN_SPREAD_FT    8.0f  /* spread allowance at zero motion       */
+#define RANGE_SPREAD_MOTION_K    0.37f /* MAD-sigma of a uniform sweep per span */
+
+/* ---- Track re-establishment after a blind stretch ------------------------- */
+/*  Once the sensor has had nothing usable for this many consecutive drains, or
+ *  the filter has pinned itself at the ceiling, the published value is an
+ *  INFERENCE (a hold or a pin), not a measurement. The track is lost. Radar
+ *  altimeters treat reacquisition as a new track that must be CONFIRMED
+ *  (M-of-N detections), never continued from a single detection.
+ *
+ *  The Hampel gate is a continuity test: it accepts a lone drain within ~61 ft
+ *  of the window at the slow polls. Against an inferred window that let a rare
+ *  junk drain (one whose valid samples happened to outvote the sentinels) be
+ *  believed on its own, walk the "altitude" off the pin and speak a phantom
+ *  "300" at pattern altitude. While the track is lost, EVERY drain therefore
+ *  goes through the re-acquire path instead: RANGE_REACQUIRE_N agreeing polls
+ *  backed by RANGE_REACQUIRE_MIN_SAMPLES raw samples. That costs a genuine
+ *  re-entry ~1.5 s at the 500 ms CRUISE poll (~0.1 s at the fast polls), and
+ *  makes junk need several CONSECUTIVE, mutually agreeing drains.            */
+#define RANGE_RECONFIRM_POLLS    4u   /* blind drains before the track is "lost" */
+
 
 /*  Ceiling on the elapsed time handed to the range filter. dt drives the
  *  Hampel slew allowance and the EMA bandwidth; a value far larger than any
@@ -897,8 +977,39 @@
  *  samples; too-small clusters instead keep the previous (known-good) ground.  */
 #define DEMO_REANCHOR_MIN_N  50u     /* ~1 s of cluster samples to move ground    */
 
+/* ---- Flight recorder (black box — see flightlog.h) ----------------------- */
+/*  Two flights came back silent and neither could be diagnosed from evidence,
+ *  only reconstructed. The recorder writes every raw SF30 sample, the logic
+ *  task's decisions, audio-path events and every console line into the
+ *  'flightlog' partition (partitions.csv) as a ring that keeps the most recent
+ *  session(s). Pull it with tools/flightlog/flightlog.py.
+ *
+ *  Budget: ~2.2 MB partition. Typical rates are ~150-250 B/s parked or cruising
+ *  (the RLE makes a blind sensor almost free) and ~550 B/s on an approach, so
+ *  the ring holds on the order of 1.5-3 hours of powered time.               */
+#define FLOG_PARTITION_LABEL   "flightlog" /* must match partitions.csv        */
+#define FLOG_RING_BYTES        16384u  /* RAM buffer (power of two): ~30 s of  */
+                                       /* approach data if flash must wait     */
+#define FLOG_STAGE_BYTES       1024u   /* batched page write: a few ms freeze  */
+#define FLOG_WRITER_PERIOD_MS  100u    /* writer wake cadence                  */
+#define FLOG_FLUSH_MS          1000u   /* max age of unwritten bytes: at most  */
+                                       /* ~1 s is lost when the master goes off*/
+#define FLOG_RUNWAY_SECTORS    48u     /* pre-erased sectors kept ready (~6 min*/
+                                       /* of approach) so no erase under audio */
+#define FLOG_TEXT_MAX          200u    /* longest captured console line        */
+#define FLOG_RAW_EMIT_MS       500u    /* RAW record cadence (on a drain edge) */
+#define FLOG_DECISION_MIN_MS   100u    /* decision-record floor: 10 Hz, plus   */
+                                       /* every tick where anything discrete   */
+                                       /* changed (state, arming, fire, tone)  */
+#define FLOG_TASK_STACK        4096
+#define FLOG_TASK_PRIO         1       /* below every flight task              */
+#define FLOG_TASK_CORE         0       /* with sensor/logic; audio keeps core 1*/
+
 /* ---- FreeRTOS task stacks (BYTES in ESP-IDF) & priorities ---------------- */
-#define SENSOR_TASK_STACK 3072
+/*  The sensor task grew from 3072: the flight recorder now frames RAW records
+ *  (~0.5 KB of stack) on this task, and the ESP_LOG capture hook formats a
+ *  private copy of each console line on whichever task logs it.               */
+#define SENSOR_TASK_STACK 4096
 #define LOGIC_TASK_STACK  4096
 #define AUDIO_TASK_STACK  4096
 #define SENSOR_TASK_PRIO  6

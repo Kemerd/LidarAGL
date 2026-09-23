@@ -95,6 +95,18 @@ bool sf30c_sim_active(void);
 void sf30c_enable_raw_debug(void);
 
 /**
+ * @brief Set the range filter's physical floor (see rf_set_min_range()).
+ *
+ * @details Called once the boot has resolved the ground reference: anything the
+ *          sensor reports closer than the parked ground (less a margin) is a
+ *          lens reflection, not terrain, and is treated as no return. A single
+ *          float store; safe to call while the sensor task runs.
+ *
+ * @param min_range_ft  Floor in feet of range (<= 0 disables).
+ */
+void sf30c_set_min_range(float min_range_ft);
+
+/**
  * @brief Callback invoked when a BENCH_CTRL frame is decoded on the sim stream.
  *
  * @param opcode  OP_* control opcode (payload byte 0).

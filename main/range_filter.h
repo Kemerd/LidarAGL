@@ -38,8 +38,9 @@
  *
  *            4. RE-ACQUISITION — a genuine level step (terrain edge on final,
  *               in-flight power-up) must not be held forever: when
- *               RANGE_REACQUIRE_N consecutive rejected values AGREE with each
- *               other AND the agreeing cluster was backed by at least
+ *               RANGE_REACQUIRE_N consecutive rejected values form a consistent
+ *               constant-velocity TRACK (any descent rate the airframe can fly)
+ *               AND that track was backed by at least
  *               RANGE_REACQUIRE_MIN_SAMPLES raw samples, the filter accepts
  *               the new level and re-seeds (the window is pre-filled to
  *               HAMPEL_SEED_N at the new level so the gate is live again on
@@ -113,7 +114,16 @@ typedef struct {
     size_t   win_head;     /**< Ring write index.                              */
 
     /* --- Re-acquisition tracker (stage 4).                                   */
-    float    pend_mean;    /**< Running mean of the agreeing rejected values.  */
+    float    pend_mean;    /**< Running mean of the agreeing rejected values — */
+                           /**< the level a re-acquire snaps to (its lag keeps */
+                           /**< each snap small enough to cross rungs singly).  */
+    float    pend_vel_fps; /**< Velocity of the candidate track (ft/s), from  */
+                           /**< its last two members: the next member must    */
+                           /**< land where it PREDICTS (any descent rate).     */
+    float    pend_last;    /**< Most recent member of the candidate track.    */
+                           /**< Members must follow a consistent constant-    */
+                           /**< velocity track, not sit near their own mean — */
+                           /**< see the stage-4 note in range_filter.c.       */
     uint32_t pend_n;       /**< How many consecutive rejects agreed so far.    */
     uint32_t pend_samples; /**< RAW samples backing those agreeing rejects —   */
                            /**< the snap needs sample MASS, not just polls, so */
@@ -125,6 +135,9 @@ typedef struct {
 
     /* --- Validity gate configuration.                                        */
     float    max_range_ft; /**< Active sensor ceiling; beyond +margin = junk.  */
+    float    min_range_ft; /**< Physical floor: anything CLOSER is not ground  */
+                           /**< (lens reflection) and counts as no return.    */
+                           /**< 0 until the ground reference is known.        */
 
     /* --- Out-of-range (above the ceiling) verdict, stage 1b.                 *
      *  A lost-signal drain is ambiguous on its own: the SF30 reports "no
@@ -134,6 +147,15 @@ typedef struct {
      *  see", the second means "we know nothing" — so the filter records which
      *  case the evidence supports rather than collapsing both into a hold.
      *  See rf_finalize()'s ceiling test for how the verdict is reached.        */
+    uint32_t nouse_run;       /**< Consecutive drains with nothing usable.      */
+    bool     stream_real;     /**< Last finalize: the sliding lost-signal vote */
+                              /**< said most recent samples were REAL returns. */
+    bool     track_lost;      /**< Output is a hold/pin INFERENCE: the next     */
+                              /**< level must be confirmed by re-acquire, never */
+                              /**< accepted on a single drain by the gate.      */
+    uint32_t lost_bits;       /**< Last RANGE_LOST_VOTE_SAMPLES raw samples,    */
+                              /**< newest in bit 0: 1 = no return, 0 = usable.  */
+    uint32_t lost_bits_n;     /**< How many samples the history holds so far.   */
     bool     above_ceiling;   /**< Last drain read as out-of-range ABOVE.       */
     uint32_t ceiling_polls;   /**< Consecutive drains supporting that verdict.  */
 
@@ -173,6 +195,24 @@ void rf_init(range_filter_t *f, float max_range_ft);
  * @brief Update the sensor-ceiling gate (e.g. after profile autodetect).
  */
 void rf_set_max_range(range_filter_t *f, float max_range_ft);
+
+/**
+ * @brief Set the physical floor below which a reading cannot be the ground.
+ *
+ * @details The laser looks through the housing's acrylic lens. When the ground
+ *          return is weak or absent, the lens itself (a few centimetres away)
+ *          can reflect enough to be reported as a distance — a "0 ft" reading
+ *          at any altitude. But nothing real can be closer to the sensor than
+ *          the ground beneath the parked wheels, minus strut compression and
+ *          flare pitch. Readings under this floor are therefore classified as
+ *          NO RETURN (counted with the lost-signal sentinels), never as an
+ *          altitude, so they can neither be accepted nor cluster into a
+ *          re-acquired "we are on the ground" level in flight.
+ *
+ * @param f             Filter.
+ * @param min_range_ft  Floor in feet of RANGE (0 disables). Negative -> 0.
+ */
+void rf_set_min_range(range_filter_t *f, float min_range_ft);
 
 /**
  * @brief Push ONE decoded sample (in cm, as it comes off the wire) into the
@@ -248,5 +288,29 @@ bool rf_track_broken(const range_filter_t *f);
  * @return   True while the sensor is usable; false once it has gone dark.
  */
 bool rf_tracking(const range_filter_t *f);
+
+/**
+ * @brief Whether the filter has LOST its track and is waiting to confirm a new
+ *        one (its output is a hold/pin inference, not a measurement).
+ *
+ * @details While this is true, returns that do arrive are the ground coming
+ *          back into view — typically the descent into range on an approach —
+ *          and they must be confirmed QUICKLY: at 4000 fpm the aircraft falls
+ *          ~33 ft per 500 ms poll. The poll policy (sm_poll_period_ms) uses it
+ *          to poll fast in exactly that window. Safe because nothing is
+ *          accepted on a single drain while the track is lost: the sliding
+ *          lost-signal vote and the constant-velocity track gate must both pass.
+ *
+ *          "Returns are arriving" means the sliding RANGE_LOST_VOTE_SAMPLES
+ *          vote says MOST recent samples are real — not merely that one sample
+ *          got through. A sensor spraying junk while blind (a garbage-level
+ *          stream still passes ~1/3 of samples as plausible distances) would
+ *          otherwise hold the box at the fast rate, where 1-4 sample drains
+ *          give the junk far more chances to line up.
+ *
+ * @param f  Filter state.
+ * @return   True while a lost track awaits confirmation and the stream is real.
+ */
+bool rf_reacquiring(const range_filter_t *f);
 
 #endif /* LIDARAGL_RANGE_FILTER_H */

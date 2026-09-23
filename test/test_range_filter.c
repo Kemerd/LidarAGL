@@ -1239,9 +1239,68 @@ static void test_tracking_counts_rejected_returns(void)
                 "tracking: gate-REJECTED returns still count as tracking");
 }
 
+/* ---------------------------------------------------------------------------
+ *  A candidate track needs CONSECUTIVE usable drains.
+ *
+ *  While blind, a junk stream can produce the occasional coherent-looking drain
+ *  with no-return drains in between. If a candidate track survived those gaps,
+ *  scattered junk could collect "members" for as long as it liked and, with
+ *  the time-based break rule, re-acquire a phantom level. Here the scattered
+ *  drains even lie on a perfect straight line (the worst case for the track
+ *  gate), and must still never be believed; the same line flown as a CONTIGUOUS
+ *  run of drains must be.
+ * ------------------------------------------------------------------------- */
+static void test_track_needs_consecutive_drains(void)
+{
+    printf("\n-- re-acquire track needs consecutive usable drains --\n");
+    range_filter_t f;
+    rf_init(&f, 328.0f);
+    const float dt = 0.5f;                      /* CRUISE cadence            */
+
+    /* Established at 100 ft of range, then blind long enough to lose track. */
+    for (int i = 0; i < 6; ++i) {
+        push_n(&f, 100.0f / CM_TO_FT, 30);
+        (void)fin(&f, dt, NULL);
+    }
+    for (int i = 0; i < 10; ++i) {
+        push_n(&f, (float)SF30_LOST_SIGNAL_CM, 30);
+        (void)fin(&f, dt, NULL);
+    }
+    ASSERT_TRUE(f.track_lost, "setup: track lost after blind drains");
+
+    /* Coherent drains on a straight descending line, each separated by two
+     * no-return drains: never a contiguous run.                              */
+    bool believed = false;
+    float level_ft = 300.0f;
+    for (int k = 0; k < 15; ++k) {
+        bool fresh = false;
+        push_n(&f, level_ft / CM_TO_FT, 30);
+        (void)fin(&f, dt, &fresh);
+        believed |= fresh;
+        for (int g = 0; g < 2; ++g) {
+            push_n(&f, (float)SF30_LOST_SIGNAL_CM, 30);
+            (void)fin(&f, dt, NULL);
+        }
+        level_ft -= 3.0f * 3.0f;                /* same line across the gaps */
+    }
+    ASSERT_TRUE(!believed, "scattered drains on a straight line never re-acquire");
+
+    /* The same kind of line as a CONTIGUOUS run is a real re-entry. */
+    believed = false;
+    for (int k = 0; k < 6 && !believed; ++k) {
+        bool fresh = false;
+        push_n(&f, level_ft / CM_TO_FT, 30);
+        (void)fin(&f, dt, &fresh);
+        believed |= fresh;
+        level_ft -= 3.0f;
+    }
+    ASSERT_TRUE(believed, "a contiguous run of the same track re-acquires");
+}
+
 int main(void)
 {
     printf("== range_filter ==\n");
+    test_track_needs_consecutive_drains();
     test_ascii_decoder();
     test_validity_gates();
     test_median_of_drain();

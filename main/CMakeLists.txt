@@ -45,6 +45,8 @@ idf_component_register(
         "audio_math.c"
         "audio.c"
         "callouts.c"
+        "flightlog_codec.c"
+        "flightlog.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -59,6 +61,7 @@ idf_component_register(
         nvs_flash        # boot-buffer persistence
         esp_pm           # automatic light-sleep
         esp_timer        # microsecond timing for dt / poll cadence
+        esp_partition    # flight recorder: the 'flightlog' flash ring
     EMBED_FILES
         ${CLIP_FILES}
 

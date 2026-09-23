@@ -55,6 +55,24 @@ static inline float cm_to_ft(float cm)
     return cm * CM_TO_FT;
 }
 
+/*  Record one raw sample's verdict in the sliding lost-signal history (bit 0 =
+ *  newest). Feeds the cadence-independent vote in rf_finalize().              */
+static inline void lost_hist_push(range_filter_t *f, bool lost)
+{
+    f->lost_bits = (f->lost_bits << 1) | (lost ? 1u : 0u);
+    if (f->lost_bits_n < RANGE_LOST_VOTE_SAMPLES) {
+        ++f->lost_bits_n;
+    }
+}
+
+/*  A sample that carries no ground return: count it for this drain's vote AND
+ *  the sliding history.                                                        */
+static inline void drain_mark_lost(range_filter_t *f)
+{
+    ++f->drain_lost;
+    lost_hist_push(f, true);
+}
+
 /*  Push one accepted value into the Hampel window ring. */
 static void win_push(range_filter_t *f, float v)
 {
@@ -117,9 +135,23 @@ void rf_set_max_range(range_filter_t *f, float max_range_ft)
     f->max_range_ft = max_range_ft;
 }
 
+void rf_set_min_range(range_filter_t *f, float min_range_ft)
+{
+    if (f == NULL) {
+        return;
+    }
+    /* A non-finite or negative floor disables the gate rather than poisoning it. */
+    f->min_range_ft = (min_range_ft > 0.0f) ? min_range_ft : 0.0f;
+}
+
 bool rf_track_broken(const range_filter_t *f)
 {
     return f->track_break;
+}
+
+bool rf_reacquiring(const range_filter_t *f)
+{
+    return (f != NULL) && f->track_lost && f->stream_real;
 }
 
 bool rf_tracking(const range_filter_t *f)
@@ -137,17 +169,26 @@ void rf_push_cm(range_filter_t *f, float cm)
      *  sentinel is one bit-flip away from 16001..16383 cm (525..537 ft), all of
      *  which are beyond any real return and used to pass as "valid".           */
     if (!(cm >= 0.0f) || cm >= (float)SF30_LOST_SIGNAL_CM) {
-        ++f->drain_lost;                 /* NaN, negative, or sentinel band     */
+        drain_mark_lost(f);              /* NaN, negative, or sentinel band     */
         return;
     }
     float ft = cm_to_ft(cm);
+    /*  Closer than the ground can physically be: the lens (or a raindrop or
+     *  bug on it) reflecting, not terrain. It is evidence of NO ground return,
+     *  so it votes with the sentinels — which routes a lens-dominated drain
+     *  through the out-of-range handling instead of reading it as "0 ft".     */
+    if (ft < f->min_range_ft) {
+        drain_mark_lost(f);
+        return;
+    }
     /*  Beyond the fitted sensor's ceiling (+margin) is physically impossible —
      *  the SF30/C cannot see 400 ft, so such a value is corruption by
      *  definition. (Inert for the SF30/D, whose ceiling exceeds the wire max.) */
     if (f->max_range_ft > 0.0f && ft > f->max_range_ft + RANGE_MAX_MARGIN_FT) {
-        ++f->drain_lost;
+        drain_mark_lost(f);
         return;
     }
+    lost_hist_push(f, false);            /* a usable return                    */
 
     /* --- Accumulate into the drain ring (newest samples win on overflow) --- */
     f->drain[f->drain_head] = ft;
@@ -241,11 +282,50 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
      *  reported as fresh_valid == false either way: this is an INFERENCE about
      *  where we are, not a measurement, so the tone's stale-data mute and the
      *  no-data annunciation upstream still behave exactly as before.           */
-    if (n_valid == 0 || n_lost > n_valid) {
+    /*  The same majority rule over the last RANGE_LOST_VOTE_SAMPLES raw
+     *  samples, so it holds at EVERY cadence. A 1-2 sample drain (the fast
+     *  ARMED/DESCENT polls) has no meaningful per-drain majority — one junk
+     *  sample is the whole vote — so out of range, held below cruise_ft,
+     *  junk used to be accepted poll after poll and walk the altitude into
+     *  phantom rungs. Only a full window votes (boot has no history yet).    */
+    uint32_t win_n      = f->lost_bits_n;
+    uint32_t win_mask   = (win_n >= 32u) ? 0xFFFFFFFFu : ((1u << win_n) - 1u);
+    uint32_t win_lost   = (uint32_t)__builtin_popcount(f->lost_bits & win_mask);
+    bool     window_lost = (win_n >= RANGE_LOST_VOTE_SAMPLES) && (2u * win_lost > win_n);
+
+    /*  Coherence (the range-gate test, see RANGE_DRAIN_SPREAD_FT): a drain of
+     *  scattered distances is junk however many of them passed the gates.
+     *  Judged on a copy — the median below needs the drain intact. A single
+     *  sample has no spread to judge and passes; the Hampel gate and the
+     *  track logic still stand behind it.                                    */
+    bool incoherent = false;
+    if (n_valid >= 2u) {
+        float tmp[RANGE_DRAIN_MEDIAN_N];
+        memcpy(tmp, scratch, n_valid * sizeof(float));
+        float dmed = median_inplace(tmp, n_valid);
+        for (size_t i = 0; i < n_valid; ++i) {
+            tmp[i] = fabsf(scratch[i] - dmed);
+        }
+        float spread = 1.4826f * median_inplace(tmp, n_valid);
+        float limit  = RANGE_DRAIN_SPREAD_FT +
+                       RANGE_SPREAD_MOTION_K * RANGE_MAX_SLEW_FPS * dt_s;
+        incoherent = !(spread <= limit);          /* also rejects a NaN spread */
+    }
+
+    /*  Remembered for rf_reacquiring(): the ground counts as "coming back into
+     *  view" only once most of the recent stream is real, coherent returns.  */
+    f->stream_real = (win_n >= RANGE_LOST_VOTE_SAMPLES) && !window_lost && !incoherent;
+
+    if (n_valid == 0 || n_lost > n_valid || window_lost || incoherent) {
         bool near_ceiling = f->have_out && f->max_range_ft > 0.0f &&
                             f->ema_ft >= f->max_range_ft - RANGE_CEILING_NEAR_FT;
 
-        if (near_ceiling && n_lost > 0) {
+        /*  Evidence of flying out the top: lost-signal returns in THIS drain,
+         *  or a drain of junk inside a lost-dominated stream. A wholly EMPTY
+         *  drain is neither (see below).                                      */
+        bool lost_evidence = (n_lost > 0) ||
+                             ((window_lost || incoherent) && n_valid > 0);
+        if (near_ceiling && lost_evidence) {
             /* Only a drain that actually SAW lost-signal returns is evidence of
              * flying out of range; a wholly EMPTY drain (n_lost == 0) means the
              * sensor said nothing at all — dead, unplugged, or wrong baud — and
@@ -259,6 +339,26 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
         } else {
             f->ceiling_polls = 0;
             f->above_ceiling = false;
+        }
+
+        /*  A sustained blind stretch (or the ceiling pin below) turns the
+         *  published value into an inference: the track is LOST and the next
+         *  level must be confirmed (see RANGE_RECONFIRM_POLLS).               */
+        if (f->nouse_run < UINT32_MAX) {
+            ++f->nouse_run;
+        }
+
+        /*  A drain with nothing usable ENDS any candidate track. Its members
+         *  must be CONSECUTIVE usable drains — that is what makes the track
+         *  evidence. Letting a candidate survive the no-return drains between
+         *  its members let a junk stream (blind, ~1/3 of samples plausible)
+         *  collect three scattered "members" over many seconds, satisfy the
+         *  time rule, break track onto ~170 ft at 450 ft true, and then walk
+         *  phantom "100"s. A real re-entry is a run of usable drains.        */
+        f->pend_n       = 0;
+        f->pend_samples = 0;
+        if (f->nouse_run >= RANGE_RECONFIRM_POLLS || f->above_ceiling) {
+            f->track_lost = true;
         }
 
         if (f->above_ceiling) {
@@ -286,6 +386,7 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
     /* A usable drain arrived: we are back inside the sensor's range. */
     f->ceiling_polls = 0;
     f->above_ceiling = false;
+    f->nouse_run     = 0;
 
     /* --- Stage 2: the drain votes; the median wins -------------------------- */
     float med = median_inplace(scratch, n_valid);
@@ -308,20 +409,56 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
         float thr = HAMPEL_K * sigma + slew;
         float dev = fabsf(med - wmed);
 
-        if (dev > thr) {
-            /* --- Stage 4: outlier. Hold, and track re-acquisition. ---------- */
-            if (f->pend_n > 0 &&
-                fabsf(med - f->pend_mean) <= RANGE_REACQUIRE_BAND_FT) {
-                /* Consecutive reject AGREEING with the previous ones: running
-                 * mean so the accepted level is the cluster's centre. The raw
-                 * sample count rides along — see the MIN_SAMPLES test below.   */
-                f->pend_mean += (med - f->pend_mean) / (float)(f->pend_n + 1u);
+        /*  A lost track is re-established only by confirmation: even a drain
+         *  inside the gate joins the re-acquire cluster rather than being
+         *  believed on its own (see RANGE_RECONFIRM_POLLS).                   */
+        if (dev > thr || f->track_lost) {
+            /* --- Stage 4: outlier. Hold, and track re-acquisition. ----------
+             *
+             *  The rejects must form a physically consistent TRACK before the
+             *  filter believes them — a constant-velocity gate, the standard
+             *  radar track-initiation test:
+             *
+             *    2nd member: within BAND + RANGE_MAX_SLEW_FPS * dt of the 1st
+             *                (any motion the airframe can actually make);
+             *    3rd member on: within BAND of where the track PREDICTS it,
+             *                last + velocity * dt.
+             *
+             *  History, because both simpler rules failed in flight or in the
+             *  sortie rig. Agreement with the cluster's running MEAN assumed a
+             *  stationary level: a descending aircraft drifts away from its own
+             *  mean, the cluster broke up, and after a climb-out over concrete
+             *  an approach over grass stayed frozen at ~325 ft with no tone and
+             *  no callouts (the September 2026 flight). A fixed poll-to-poll
+             *  band then capped the rate it could follow (~1700 fpm at the
+             *  500 ms CRUISE poll) — and a gear-down Glasair III sinks at
+             *  3500-4000 fpm. Predicting the next position supports ANY rate
+             *  up to the airframe bound while staying tight: junk scatters,
+             *  so it cannot land within BAND of a straight-line extrapolation
+             *  three times running. The velocity is re-measured every poll, so
+             *  a round-out or flare (a few ft of deviation per poll at most)
+             *  stays on the track.                                             */
+            bool agrees = false;
+            if (f->pend_n == 1u) {
+                agrees = fabsf(med - f->pend_last) <=
+                         RANGE_REACQUIRE_BAND_FT + RANGE_MAX_SLEW_FPS * dt_s;
+            } else if (f->pend_n >= 2u) {
+                float predicted = f->pend_last + f->pend_vel_fps * dt_s;
+                agrees = fabsf(med - predicted) <= RANGE_REACQUIRE_BAND_FT;
+            }
+            if (agrees) {
+                /* Extend the track: re-measure its velocity from this step, and
+                 * carry the raw sample count (see the MIN_SAMPLES test below). */
+                f->pend_vel_fps  = (med - f->pend_last) / dt_s;
+                f->pend_mean    += (med - f->pend_mean) / (float)(f->pend_n + 1u);
+                f->pend_last     = med;
                 ++f->pend_n;
                 f->pend_samples += (uint32_t)n_valid;
             } else {
-                /* First reject, or it disagrees with the pending cluster:
-                 * start a fresh cluster on this value.                         */
+                /* First reject, or off the predicted track: start a fresh one. */
                 f->pend_mean    = med;
+                f->pend_last    = med;
+                f->pend_vel_fps = 0.0f;
                 f->pend_n       = 1;
                 f->pend_samples = (uint32_t)n_valid;
             }
@@ -396,8 +533,27 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
              *
              *  The extra evidence required scales with how implausible the jump
              *  is, so ordinary noise can never trigger a break.                 */
+            /*  Evidence counted in polls AND in time: 12 polls is 0.3 s at the
+             *  DESCENT cadence but 6 s at CRUISE, where each ~39-sample drain
+             *  is already a strong vote (see RANGE_TRACK_BREAK_S).            */
+            bool  enough_time  = f->pend_n >= (uint32_t)RANGE_REACQUIRE_N &&
+                                 cluster_s >= RANGE_TRACK_BREAK_S;
+            /*  RE-ENTRY. When the track was already lost, the "jump" is
+             *  measured from a hold or a ceiling pin — a guess, not a position
+             *  the aircraft was ever confirmed at — so its size says nothing
+             *  about plausibility. What matters is that the new returns form a
+             *  genuine DESCENT track: an approach coming back into range. That
+             *  is confirmed on the ordinary re-acquire evidence (REACQUIRE_N
+             *  polls + MIN_SAMPLES, enforced below) instead of waiting the
+             *  12-poll / 1.5 s break: at 4000 fpm those extra polls cost 50-100
+             *  ft, and over grass (returns from ~250 ft) the 200 ft rung was
+             *  passed before the track was believed. A STATIONARY cluster — the
+             *  shape of a stuck byte pattern — still needs the full evidence.  */
+            bool  descending_reentry = f->track_lost && f->pend_n >= 2u &&
+                                       f->pend_vel_fps < -RANGE_REENTRY_SINK_FPS;
             bool  breaks_track = !reachable &&
-                                 f->pend_n >= (uint32_t)RANGE_TRACK_BREAK_POLLS;
+                                 (f->pend_n >= (uint32_t)RANGE_TRACK_BREAK_POLLS ||
+                                  enough_time || descending_reentry);
 
             if (f->pend_n >= (uint32_t)RANGE_REACQUIRE_N &&
                 f->pend_samples >= (uint32_t)RANGE_REACQUIRE_MIN_SAMPLES &&
@@ -417,6 +573,12 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
                  *  invisible in the flare).                                    */
                 f->win_n    = 0;
                 f->win_head = 0;
+                /*  Snap to the cluster's CENTRE. For a moving target it lags
+                 *  by half the cluster's travel, which is deliberate: a smaller
+                 *  step crosses the closely spaced low rungs one at a time
+                 *  instead of several at once (only the lowest of a multi-rung
+                 *  step can speak), and the gate — now anchored at the new
+                 *  level — closes the remaining gap within a few polls.       */
                 float level = f->pend_mean;
                 f->have_out = false;         /* seed the EMA at the new level  */
                 accept_value(f, level, dt_s);
@@ -433,6 +595,9 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
                 while (f->win_n < HAMPEL_SEED_N) {
                     win_push(f, level);
                 }
+                /* The new level was CONFIRMED: the track is re-established,
+                 * and the gate may accept single drains again.                */
+                f->track_lost = false;
                 *fresh_valid = true;
                 *range_ft    = f->ema_ft;
                 return true;

@@ -311,6 +311,48 @@ static void test_trend_deadband(const sensor_profile_t *p)
  *  (as if rebooted onto the ground) so the next takeoff is silent until we climb
  *  back through ARM_FT; but a quick touch-and-go inside the window keeps the arm.
  * ------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+ *  A broken track re-anchored INTO the ground band is not a landing.
+ *
+ *  Out of range, a lens-dominated or junk stream can make the filter break
+ *  track onto a ~0 ft level while the aircraft is at pattern altitude. The
+ *  parked detector used to count that as "on the ground" and, after 30 s,
+ *  DISARM the whole ladder in flight — a silent approach. Only an altitude the
+ *  aircraft actually descended into may start the parked dwell.
+ * ------------------------------------------------------------------------- */
+static void test_reanchor_to_ground_does_not_disarm(const sensor_profile_t *p)
+{
+    char msg[112];
+    sm_ctx_t c;
+    sm_init(&c, ST_ARMED);                      /* flying, ladder hot          */
+
+    sm_out_t out;
+    for (int i = 0; i < 20; ++i) {
+        sm_step(&c, 500.0f, DT, p, &out);       /* established at altitude     */
+    }
+
+    /* Filter breaks track onto a "0 ft" level and sits there for 60 s. */
+    sm_reanchor(&c, 0.0f);
+    int ticks = (int)(2.0f * GROUND_RESET_MS / (DT * 1000.0f));
+    for (int i = 0; i < ticks; ++i) {
+        sm_step(&c, 0.0f, DT, p, &out);
+    }
+    snprintf(msg, sizeof msg, "[%s] re-anchored to 0 ft for 60 s: still armed", p->name);
+    ASSERT_TRUE(c.armed, msg);
+
+    /* A real descent INTO the band afterwards does still park and disarm. */
+    for (int i = 0; i < 20; ++i) {
+        sm_step(&c, 40.0f, DT, p, &out);        /* track re-established above  */
+    }
+    float scratch[16];
+    ramp(&c, p, 40.0f, 0.0f, -1.0f, scratch, 16);
+    for (int i = 0; i < ticks; ++i) {
+        sm_step(&c, 0.0f, DT, p, &out);
+    }
+    snprintf(msg, sizeof msg, "[%s] flown descent into the band still parks + disarms", p->name);
+    ASSERT_TRUE(!c.armed && out.state == ST_GROUND, msg);
+}
+
 static void test_ground_dwell_disarm(const sensor_profile_t *p)
 {
     char msg[96];
@@ -821,6 +863,7 @@ int main(void)
         test_initial_state(p);
         test_trend_deadband(p);
         test_ground_dwell_disarm(p);
+        test_reanchor_to_ground_does_not_disarm(p);
         test_arm_requires_dwell(p);
         test_arm_dwell_slow_cadence(p);
         test_spike_decay_regression(p);

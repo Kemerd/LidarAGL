@@ -49,7 +49,7 @@ def main():
 
     print("\n--- checks ---")
     check("did NOT enter bench sim mode", "BENCH SIM" not in txt.upper())
-    check("firmware v1.62", "v1.62" in txt)
+    check("firmware v1.63", "v1.63" in txt)
     check("light-sleep OFF", "SLEEP_MODE_ENABLE=0" in txt or "Light sleep: DISABLED" in txt)
 
     # Calibration: the numbers that decide whether AGL is trustworthy in flight.

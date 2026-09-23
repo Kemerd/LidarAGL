@@ -26,6 +26,7 @@
 #include "config.h"
 #include "shared.h"
 #include "sf30c.h"     /* sf30c_sim_active() — gates the TEMP DEBUG render meter */
+#include "flightlog.h" /* black box: callout start/discard/end + 1 Hz snapshot   */
 
 #include <math.h>
 #include <string.h>
@@ -36,6 +37,7 @@
 #include "esp_err.h"
 #include "esp_pm.h"        /* NO_LIGHT_SLEEP lock — keep the I2S clock alive while playing */
 #include "esp_task_wdt.h"  /* audio_task subscribes to the TWDT                          */
+#include "esp_timer.h"     /* paces the flight recorder's 1 Hz audio snapshot           */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -829,9 +831,28 @@ void audio_request_sensor_alert(void)
     s_alert_req = true;
 }
 
+/*  True for the spoken ALTITUDE numbers (the ids up to CO_SIX_HUNDRED), false
+ *  for the other voice calls, which must never be skipped as "stale".        */
+static inline bool callout_is_altitude(callout_id_t id)
+{
+    return (int)id >= (int)CO_TEN && (int)id <= (int)CO_SIX_HUNDRED;
+}
+
 /* ---------------------------------------------------------------------------
  *  Suspend / resume around light-sleep
  * ------------------------------------------------------------------------- */
+
+bool audio_is_quiet(void)
+{
+    /*  Suspended == silent by construction. Running, it is silent only with no
+     *  clip mid-word, no alert about to arm, and the tone envelope at rest. The
+     *  gain threshold is far below audibility (-60 dB), so a tone that is just
+     *  fading in or out still counts as sounding.                             */
+    if (!s_running) {
+        return true;
+    }
+    return (s_clip_pcm == NULL) && !s_alert_req && (s_gain_cur < 0.001f);
+}
 
 void audio_suspend(void)
 {
@@ -1121,6 +1142,9 @@ void audio_task(void *arg)
                 esp_pm_lock_release(s_pm_freq_lock);
             }
             ESP_LOGD(TAG, "PM locks released (audio suspended)");
+            /* Black box: a suspend discards queued callouts, so its timing
+             * relative to a fired rung is exactly what a silent flight needs. */
+            flightlog_event(FLOG_EV_AUDIO_SUSPEND, 0, 0);
             s_running    = false;
             s_gain_cur   = 0.0f;   /* ramp the tone back up from silence on resume */
             s_duck_cur   = 1.0f;   /* un-duck so the next descent starts full tone  */
@@ -1156,6 +1180,7 @@ void audio_task(void *arg)
             ESP_LOGD(TAG, "PM locks acquired (audio resumed)");
             i2s_channel_enable(s_tx);
             s_running = true;
+            flightlog_event(FLOG_EV_AUDIO_RESUME, 0, 0);
         }
 
         /* Arm the sensor-failure chirp now that the channel is guaranteed up.
@@ -1167,6 +1192,7 @@ void audio_task(void *arg)
             s_alert_req     = false;
             s_alert_playing = true;   /* hold the channel up until it finishes */
             start_clip(callout_chirp());
+            flightlog_event(FLOG_EV_ALERT_START, 0, 0);
         }
 
         /* Pick up a queued callout (non-blocking) and start it if idle. When the
@@ -1183,12 +1209,38 @@ void audio_task(void *arg)
             while (q_callouts && xQueueReceive(q_callouts, &id, 0) == pdTRUE) {
                 /* discarded: a callout requested while silent describes a band
                  * the aircraft has left by the time we can speak again          */
+                flightlog_event(FLOG_EV_CALLOUT_DISCARDED, (int32_t)id, 0);
             }
         } else if (s_clip_pcm == NULL && q_callouts &&
                    xQueueReceive(q_callouts, &id, 0) == pdTRUE) {
+            /*  NEWEST ALTITUDE WINS. The low rungs are 10 ft apart, which is
+             *  0.3 s at a 2000 fpm Glasair III approach, while each word takes
+             *  ~0.5 s to say — so the queue backs up and every number after the
+             *  first is spoken late: "forty" at 25 ft, "ten" after touchdown. A
+             *  stale altitude is worse than none. While another ALTITUDE is
+             *  already waiting directly behind this one, this one has been
+             *  overtaken: skip to the newer (lower) number, as GPWS does.
+             *  Non-altitude calls ("check gear", "positive rate") are never
+             *  skipped and keep their place right after their number.        */
+            callout_id_t newer;
+            while (callout_is_altitude(id) &&
+                   xQueuePeek(q_callouts, &newer, 0) == pdTRUE &&
+                   callout_is_altitude(newer) &&
+                   xQueueReceive(q_callouts, &newer, 0) == pdTRUE) {
+                flightlog_event(FLOG_EV_CALLOUT_STALE, (int32_t)id, (int32_t)newer);
+                id = newer;
+            }
             if (s_cfg.callouts_enabled) {
                 start_clip(callout_clip(id));
+                /* A clip with no audio data leaves s_clip_pcm NULL: record that
+                 * separately so "dequeued but silent" is never ambiguous.      */
+                if (s_clip_pcm == NULL) {
+                    flightlog_event(FLOG_EV_CLIP_MISSING, (int32_t)id, 0);
+                }
             }
+            /* b == 1 only when the mode actually allowed the clip to start. */
+            flightlog_event(FLOG_EV_CALLOUT_DEQUEUED, (int32_t)id,
+                            (s_cfg.callouts_enabled && s_clip_pcm != NULL) ? 1 : 0);
         }
 
         /* Snapshot the tone params under the mutex. CRITICAL: the take uses a ZERO
@@ -1216,6 +1268,36 @@ void audio_task(void *arg)
         /* The tone-disabled modes (callouts-only) silence the tone outright. */
         if (!s_cfg.tone_enabled) {
             tone_active = false;
+        }
+
+        /* Black box: ~1 Hz snapshot of what the engine is actually doing — the
+         * one record that proves whether a callout could have reached the DAC
+         * (mode flags, queue depth, clip in flight, tone gain). Taken before
+         * the suspended-idle early-out so a suspended channel is recorded too.
+         * The stall/short-write counters are cumulative on a flight boot (the
+         * bench meter below only resets them in sim mode).                    */
+        {
+            static int64_t s_flog_audio_us = 0;
+            int64_t t_us = esp_timer_get_time();
+            if (t_us - s_flog_audio_us >= 1000000) {
+                s_flog_audio_us = t_us;
+                flog_audio_t snap = {
+                    .flags = (uint8_t)((s_running             ? FLOG_A_RUNNING     : 0u) |
+                                       (s_clip_pcm != NULL    ? FLOG_A_CLIP        : 0u) |
+                                       (s_cfg.callouts_enabled? FLOG_A_CALLOUTS_EN : 0u) |
+                                       (s_cfg.tone_enabled    ? FLOG_A_TONE_EN     : 0u) |
+                                       (s_snap_active         ? FLOG_A_TONE_REQ    : 0u) |
+                                       (s_suspend_req         ? FLOG_A_SUSPEND_REQ : 0u) |
+                                       (s_alert_playing       ? FLOG_A_ALERT       : 0u)),
+                    .queue_depth      = (uint8_t)(q_callouts ? uxQueueMessagesWaiting(q_callouts) : 0u),
+                    .tone_agl_dft     = (int16_t)(tone_agl * 10.0f),
+                    .tone_gain_milli  = (uint16_t)(s_gain_cur * 1000.0f),
+                    .voice_gain_milli = (uint16_t)(s_voice_gain * 1000.0f),
+                    .write_stalls     = (uint16_t)(dbg_stall > 0xFFFFu ? 0xFFFFu : dbg_stall),
+                    .short_writes     = (uint16_t)(dbg_part  > 0xFFFFu ? 0xFFFFu : dbg_part),
+                };
+                flightlog_audio(&snap);
+            }
         }
 
         /* If the channel is suspended (light-sleep window), idle briefly. */
@@ -1272,6 +1354,8 @@ void audio_task(void *arg)
                 if (++s_clip_pos >= s_clip_len) {
                     /* Clip finished; the follower decays and the tone breathes
                      * back up over DUCK_RELEASE_MS — no hard un-duck step.       */
+                    /* Black box: proof the whole word was rendered.             */
+                    flightlog_event(FLOG_EV_CLIP_END, (int32_t)s_clip_len, 0);
                     s_clip_pcm = NULL;
                     s_clip_len = 0;
                     s_clip_pos = 0;

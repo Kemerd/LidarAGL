@@ -32,6 +32,7 @@
 #include "state_machine.h"
 #include "audio.h"
 #include "callouts.h"
+#include "flightlog.h"       /* black box: decisions + every console line        */
 
 #include <math.h>
 #include <string.h>
@@ -134,6 +135,34 @@ RTC_NOINIT_ATTR static uint32_t s_sim_cfg_boot_flag;
 /*  The binary update-rate code (cmd 76). We keep the sensor at a brisk rate in
  *  flight; on the ASCII path this is a no-op. Code 8 ~= 78 readings/sec.        */
 #define SF30_RATE_CODE_ACTIVE  8u
+
+/* ---------------------------------------------------------------------------
+ *  Lens floor: the closest a real ground return can ever be.
+ *
+ *  The SF30 looks through the housing's acrylic lens, which sits centimetres in
+ *  front of it. When the ground return is weak or gone (out of range, a dark
+ *  surface), the lens's own reflection can be reported as a distance — a
+ *  "0 ft" reading at any altitude. Nothing real is ever closer to the sensor
+ *  than the ground under the parked wheels, less strut compression and flare
+ *  pitch (GROUND_BELOW_DEV_FT — the same margin the boot calibration uses for
+ *  "something is in the beam"). Below that, a reading is the lens, not
+ *  terrain, and the filter counts it as NO RETURN.
+ *
+ *  The floor is capped at the tallest plausible mount (MOUNT_GROUND_MAX_FT)
+ *  less that margin, so a ground reference poisoned HIGH can never push the
+ *  floor up into real landing altitudes and blind the flare.
+ * ------------------------------------------------------------------------- */
+static void apply_lens_floor(void)
+{
+    float floor_ft = s_ground_ref_ft - GROUND_BELOW_DEV_FT;
+    const float cap_ft = MOUNT_GROUND_MAX_FT - GROUND_BELOW_DEV_FT;
+    if (!(floor_ft > 0.0f)) {
+        floor_ft = 0.0f;                 /* also catches a non-finite ground  */
+    } else if (floor_ft > cap_ft) {
+        floor_ft = cap_ft;
+    }
+    sf30c_set_min_range(floor_ft);
+}
 
 /* ---------------------------------------------------------------------------
  *  Boot: capture a ground-fill of BOOT_BUFFER_N readings spread over ~1 s.
@@ -762,6 +791,17 @@ static void logic_task(void *arg)
     int64_t last_good_us = esp_timer_get_time();
     bool    tone_muted   = false;
 
+    /*  Flight-recorder pacing. A decision record is written at most every
+     *  FLOG_DECISION_MIN_MS — EXCEPT that any tick where something discrete
+     *  changed (state, arming, the per-rung mask, a fire, the tone or sleep
+     *  verdicts) is always written, so the log never misses the tick that
+     *  explains a silent approach, however it lines up with the 10 Hz grid.  */
+    int64_t  flog_last_us    = 0;
+    uint8_t  flog_prev_state = 0xFFu;
+    uint16_t flog_prev_mask  = 0u;
+    uint8_t  flog_prev_flags = 0u;
+    uint8_t  flog_prev_flg2  = 0u;
+
     /*  Subscribe to the task watchdog. This loop owns every audible decision the
      *  box makes; if it wedges, the box is silent with no reset and no cue. It
      *  blocks only on bounded waits (a 100 ms queue peek and its own tick delay),
@@ -904,6 +944,7 @@ static void logic_task(void *arg)
                          * moving the ground; the previous reference is kept.      */
                         if (s_park_n >= DEMO_REANCHOR_MIN_N) {
                             s_ground_ref_ft = s_park_sum_ft / (float)s_park_n;
+                            apply_lens_floor();   /* floor follows the ground */
                         }
                         if (sm.armed) {
                             sm_init(&sm, ST_GROUND);
@@ -1126,20 +1167,17 @@ static void logic_task(void *arg)
             }
         }
         audio_set_params(out.tone_agl, tone_on, out.vert_fps);
-        g_poll_period_ms = poll_profile_to_ms(out.poll);
 
-        /*  Cadence follows TRACKING, not just the state. A dark sensor cannot
-         *  produce a callout however fast we ask it, so polling it at the
-         *  DESCENT rate is pure heat — relax to the CRUISE cadence instead.
-         *  The moment ONE usable return arrives, rf_tracking() flips back and
-         *  the next pass restores the state's own (fast) rate: we give up
-         *  responsiveness only while there is demonstrably nothing to respond
-         *  to. Never applied inside the live tone band (guarded above), where a
-         *  dark sensor is a failure to annunciate rather than an idle period.  */
-        if (sensor_dark && !(sm.armed && agl <= sm.tone_start_ft) &&
-            g_poll_period_ms < POLL_MS_CRUISE) {
-            g_poll_period_ms = POLL_MS_CRUISE;
-        }
+        /*  Cadence follows TRACKING, not just the state (sm_poll_period_ms):
+         *  a dark sensor relaxes to the CRUISE rate outside the live tone band,
+         *  and a sensor that IS returning data while armed is never polled
+         *  slower than the ARMED rate — even in ST_CRUISE, whose altitude is a
+         *  frozen ceiling inference after a climb out of range. Polling that
+         *  case at 500 ms is what froze the v1.62 approaches: the filter could
+         *  never confirm the lower level the approach surface returned from.
+         *  The policy is PURE so the sortie tests fly this exact cadence.     */
+        g_poll_period_ms = sm_poll_period_ms(out.poll, sm.armed, !sensor_dark,
+                                             s.reacquiring, agl, sm.tone_start_ft);
 
         /* Bench real-sensor debug: keep the sensor draining briskly. GROUND/CRUISE
          * normally relax the poll to ~750 ms, which makes the live readout look
@@ -1157,6 +1195,59 @@ static void logic_task(void *arg)
             audio_suspend();
         }
         sleep_allowed_prev = sleep_allowed;
+
+        /* --- Black box: this decision, exactly as taken -------------------- */
+        {
+            uint8_t flags = (uint8_t)((s.valid         ? FLOG_F_VALID       : 0u) |
+                                      (fresh           ? FLOG_F_FRESH       : 0u) |
+                                      (s.track_break   ? FLOG_F_TRACK_BREAK : 0u) |
+                                      (s.tracking      ? FLOG_F_TRACKING    : 0u) |
+                                      (sm.armed        ? FLOG_F_ARMED       : 0u) |
+                                      (out.tone_active ? FLOG_F_TONE_ACTIVE : 0u) |
+                                      (tone_on         ? FLOG_F_TONE_ON     : 0u) |
+                                      (sleep_allowed   ? FLOG_F_SLEEP       : 0u));
+            uint8_t flg2  = (uint8_t)((data_stale               ? FLOG_F2_STALE      : 0u) |
+                                      (out.fired_positive_rate  ? FLOG_F2_POSRATE    : 0u) |
+                                      (!fresh && stale_kick     ? FLOG_F2_STALE_KICK : 0u));
+            uint16_t mask = (uint16_t)(sm.armed_mask & 0xFFFFu);
+
+            /*  FRESH and VALID flip every other poll on a noisy drain, so they
+             *  do not count as "discrete changes" — only the verdicts do.    */
+            const uint8_t CHANGE_BITS = (uint8_t)~(FLOG_F_FRESH | FLOG_F_VALID);
+            bool changed = ((uint8_t)out.state != flog_prev_state) ||
+                           (mask != flog_prev_mask) ||
+                           (((flags ^ flog_prev_flags) & CHANGE_BITS) != 0u) ||
+                           (flg2 != flog_prev_flg2) ||
+                           (out.fired_callout >= 0);
+            if (changed || now_us - flog_last_us >= (int64_t)FLOG_DECISION_MIN_MS * 1000) {
+                /* Clamp the rate into the i16 field; the sm already bounds it. */
+                float tr = sm.trend_fps * 10.0f;
+                if (!(tr > -32767.0f)) { tr = -32767.0f; }   /* also catches NaN */
+                if (tr > 32767.0f)     { tr = 32767.0f; }
+                float dtm = dt_dec * 1000.0f;
+                if (!(dtm >= 0.0f))    { dtm = 0.0f; }
+                if (dtm > 65535.0f)    { dtm = 65535.0f; }
+
+                flog_decision_t d = {
+                    .seq        = s.seq,
+                    .range_ft   = s.range_ft,
+                    .agl_ft     = agl,
+                    .trend_dfps = (int16_t)tr,
+                    .armed_mask = mask,
+                    .dt_ms      = (uint16_t)dtm,
+                    .state      = (uint8_t)out.state,
+                    .fired      = (int8_t)out.fired_callout,
+                    .flags      = flags,
+                    .flags2     = flg2,
+                };
+                flightlog_decision(&d);
+                flog_last_us    = now_us;
+                flog_prev_state = (uint8_t)out.state;
+                flog_prev_mask  = mask;
+                flog_prev_flags = flags;
+                flog_prev_flg2  = flg2;
+            }
+        }
 
         /* Decision cadence: fast in active states, relaxed when sleep-friendly
          * (the PM subsystem drops to light-sleep during the idle between ticks). */
@@ -1276,6 +1367,11 @@ static bool bench_attach_detected(void)
  * ------------------------------------------------------------------------- */
 void app_main(void)
 {
+    /* 0. Flight recorder FIRST, so every line from the banner on — the saved
+     * audio mode, the callout cap, the calibration verdict — lands in the black
+     * box. It touches no flash until flightlog_start_writer() below.            */
+    flightlog_init();
+
     ESP_LOGI(TAG, "LidarAGL boot — firmware %s", FIRMWARE_VERSION);
 
     /* WiFi/BT are compiled out (sdkconfig) and never started here — net effect:
@@ -1653,6 +1749,10 @@ void app_main(void)
         }
     }
 
+    /* 7b. Lens floor. The ground reference is final now, so tell the range
+     * filter where physical reality begins (see apply_lens_floor()).         */
+    apply_lens_floor();
+
     /* 8. Seed the state machine from the reconstructed AGL. */
     static sm_state_t initial_state;
     initial_state = sm_initial_state(br.boot_agl_ft, !br.calib_error || br.airborne,
@@ -1691,6 +1791,10 @@ void app_main(void)
 
     /* Enable automatic light-sleep last, once everything is running. */
     enable_power_management();
+
+    /* The blocking boot audio (menu, chirps) is over and the flight tasks are
+     * up: the recorder may now start writing (and pre-erasing) flash.        */
+    flightlog_start_writer();
 
     ESP_LOGI(TAG, "running");
 }

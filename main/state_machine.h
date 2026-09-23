@@ -99,6 +99,14 @@ typedef struct {
     /*  TONE_START_FT; app_main overrides it from NVS so the gate and the audio   */
     /*  engine's fade-in schedule share the SAME start altitude (100 or 200 ft).  */
     float      tone_start_ft;
+
+    /*  Whether the aircraft ARRIVED in the ground band by flown, tracked motion.
+     *  False after sm_reanchor() lands the altitude inside the band: the filter
+     *  broke track onto a low level (lens glare, junk), which is "I lost the
+     *  ground", not "we landed" — and it must never run the 30 s parked-disarm
+     *  that would silence the rest of the flight. Restored the moment the
+     *  altitude is seen above the band; a real landing always descends into it. */
+    bool       park_ok;
 } sm_ctx_t;
 
 /** Result of one sm_step() evaluation. */
@@ -186,5 +194,37 @@ void sm_reanchor(sm_ctx_t *c, float agl_ft);
  * @return    Milliseconds between sensor reads for that profile.
  */
 uint32_t poll_profile_to_ms(poll_profile_t pp);
+
+/**
+ * @brief The poll period the sensor task should actually use this tick.
+ *
+ * @details The state's profile (poll_profile_to_ms) is only the STARTING point:
+ *            - A DARK sensor outside the armed tone band relaxes to the CRUISE
+ *              rate: polling a sensor that returns nothing buys nothing. Inside
+ *              the band a dark sensor keeps the fast rate — there it is a
+ *              failure to annunciate, not an idle period.
+ *            - A REACQUIRING filter (track lost, yet returns are arriving) while
+ *              armed polls at the ARMED rate: that is the ground coming back
+ *              into view on the approach, and at 4000 fpm a 500 ms poll lets
+ *              the aircraft fall ~33 ft between looks — the new track must be
+ *              confirmed in a fraction of a second, not seconds.
+ *
+ *          PURE and shared by the firmware (logic_task) and the host sortie
+ *          tests, so the tests fly exactly the cadence the aircraft does. The
+ *          rig used the bare state profile before, which is how the v1.62
+ *          frozen-approach failure could hide from every sortie test.
+ *
+ * @param pp             Poll profile chosen by sm_step (out.poll).
+ * @param armed          Whether the callout ladder is armed (sm.armed).
+ * @param tracking       Whether the sensor currently sees the ground
+ *                       (rf_tracking(), carried in range_sample_t).
+ * @param reacquiring    Whether the filter's track is lost and awaiting
+ *                       confirmation (rf_reacquiring()).
+ * @param agl_ft         AGL handed to sm_step this tick.
+ * @param tone_start_ft  Top of the live tone band (sm.tone_start_ft).
+ * @return               Milliseconds between sensor reads.
+ */
+uint32_t sm_poll_period_ms(poll_profile_t pp, bool armed, bool tracking,
+                           bool reacquiring, float agl_ft, float tone_start_ft);
 
 #endif /* LIDARAGL_STATE_MACHINE_H */

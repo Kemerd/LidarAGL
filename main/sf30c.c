@@ -12,6 +12,7 @@
 #include "lwnx.h"
 #include "range_filter.h"
 #include "shared.h"
+#include "flightlog.h"   /* black box: every raw sample + drain boundary */
 
 #include <string.h>
 #include <math.h>
@@ -64,6 +65,13 @@ static bool                  s_raw_debug = false;
 void sf30c_enable_raw_debug(void)
 {
     s_raw_debug = true;
+}
+
+void sf30c_set_min_range(float min_range_ft)
+{
+    rf_set_min_range(&s_rf, min_range_ft);
+    ESP_LOGI(TAG, "lens floor: readings under %.2f ft of range count as no return",
+             (double)s_rf.min_range_ft);
 }
 
 /* ---- UART setup ---------------------------------------------------------- */
@@ -262,6 +270,7 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
         rf_drain_abort(&s_rf);
         bool have = rf_finalize(&s_rf, dt_s, range_ft_out, valid);
         *valid = false;                    /* nothing fresh survived this poll  */
+        flightlog_raw_finalize(true);      /* black box: drain discarded here   */
         return have;
     }
 
@@ -313,6 +322,7 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
                     /* firstReturnFiltered is the int16 at payload offset 6. */
                     if (lwnx_read_i16(f.payload, f.plen, 6, &cm)) {
                         rf_push_cm(&s_rf, (float)cm);
+                        flightlog_raw_sample(cm);
                     }
                 } else if (f.cmd == LWNX_CMD_BENCH_CTRL) {
                     sim_dispatch_frame(&f);
@@ -331,6 +341,7 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
                 int16_t cm = 0;
                 if (lwnx_read_i16(f.payload, f.plen, 6, &cm)) {
                     rf_push_cm(&s_rf, (float)cm);
+                    flightlog_raw_sample(cm);
                 }
             } else if (f.cmd == LWNX_CMD_BENCH_CTRL) {
                 sim_dispatch_frame(&f);
@@ -340,6 +351,7 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
         int cm;
         if (sf30_ascii_feed(&s_ascii, rx[i], &cm)) {
             rf_push_cm(&s_rf, (float)cm);
+            flightlog_raw_sample(cm);      /* the exact wire value, pre-filter  */
         }
 #endif
     }
@@ -348,7 +360,12 @@ bool sf30c_read_latest_ft(float *range_ft_out, bool *valid)
      * and the published value is either the fresh smoothed range or the held
      * last-good (empty drain / majority-lost drain / rejected outlier). The
      * *valid contract is unchanged: false whenever nothing fresh landed.        */
-    return rf_finalize(&s_rf, dt_s, range_ft_out, valid);
+    bool have = rf_finalize(&s_rf, dt_s, range_ft_out, valid);
+
+    /* Black box: mark the drain boundary so a replay feeds range_filter.c the
+     * exact same drains, in the same grouping, that the firmware voted on.   */
+    flightlog_raw_finalize(false);
+    return have;
 }
 
 /* ---- Binary helpers: send a command, await a specific reply -------------- */
@@ -502,6 +519,10 @@ void sensor_task(void *arg)
                  *  The logic task's power policy keys off THIS rather than off
                  *  altitude (see rf_tracking / the sleep block in logic_task). */
                 .tracking    = rf_tracking(&s_rf),
+                /*  Track lost, awaiting confirmation: the logic task polls fast
+                 *  in this window so an approach re-entering range is believed
+                 *  within a fraction of a second (see sm_poll_period_ms).     */
+                .reacquiring = rf_reacquiring(&s_rf),
             };
             /* Overwrite so the logic task always sees the freshest sample with
              * no backlog lag — essential for on-time callouts.                */

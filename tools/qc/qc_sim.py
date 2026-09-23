@@ -188,7 +188,7 @@ def main():
         boot = u.snapshot()
         boot_txt = "\n".join(s for _, s in boot)
         check("bench sim mode attached", ok)
-        check("firmware v1.62 booted", "v1.62" in boot_txt)
+        check("firmware v1.63 booted", "v1.63" in boot_txt)
         check("light-sleep compiled OFF",
               "SLEEP_MODE_ENABLE=0" in boot_txt or "Light sleep: DISABLED" in boot_txt)
         check("SF30/C profile active", "SF30/C" in boot_txt)

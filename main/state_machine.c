@@ -29,6 +29,7 @@ void sm_init(sm_ctx_t *c, sm_state_t initial)
     c->armed_mask = 0u;
     c->have_prev  = false;
     c->ground_ms  = 0.0f;   /* fresh ground-dwell timer */
+    c->park_ok    = true;   /* a boot on the ramp IS parked                     */
 
     /* Fresh arming-persistence dwells: nothing is part-way to arming. The
      * observation counters clear alongside their timers so the first in-band
@@ -81,10 +82,19 @@ void sm_reanchor(sm_ctx_t *c, float agl_ft)
      *  several ticks after the re-anchor.                                        */
     c->trend_fps = 0.0f;
 
-    /*  Arming, the per-rung one-shot mask and every dwell timer are deliberately
-     *  LEFT ALONE. The rungs already spoken were genuinely passed and must stay
-     *  spent; the rungs ahead must stay available; and the arm/parked dwells are
-     *  about time spent in a band, which the re-anchor does not invalidate.      */
+    /*  A re-anchor INTO the ground band is a broken track landing on a low
+     *  level, not a landing: it must not start (or continue) the parked-disarm
+     *  dwell. Flying back above the band restores it (see sm_step).           */
+    if (agl_ft <= GROUND_BAND_FT) {
+        c->park_ok   = false;
+        c->ground_ms = 0.0f;
+    }
+
+    /*  Arming, the per-rung one-shot mask and the arm/re-arm dwells are
+     *  deliberately LEFT ALONE. The rungs already spoken were genuinely passed
+     *  and must stay spent; the rungs ahead must stay available; and the arming
+     *  dwells are about time spent in a band, which the re-anchor does not
+     *  invalidate. (The PARKED dwell is the one exception, handled above.)      */
 }
 
 sm_state_t sm_initial_state(float boot_agl, bool ok, const sensor_profile_t *p)
@@ -150,6 +160,38 @@ uint32_t poll_profile_to_ms(poll_profile_t pp)
         case POLL_DESCENT: return POLL_MS_DESCENT;
     }
     return POLL_MS_ARMED;   /* unreachable; safe default */
+}
+
+uint32_t sm_poll_period_ms(poll_profile_t pp, bool armed, bool tracking,
+                           bool reacquiring, float agl_ft, float tone_start_ft)
+{
+    uint32_t ms = poll_profile_to_ms(pp);
+
+    /*  Inside the armed tone band a dark sensor is a FAILURE to annunciate,
+     *  not an idle period, so it keeps the state's own (fast) rate there.     */
+    bool in_live_band = armed && (agl_ft <= tone_start_ft);
+
+    /* --- Dark: relax. Nothing to respond to, however fast we ask. -------- */
+    if (!tracking && !in_live_band && ms < POLL_MS_CRUISE) {
+        ms = POLL_MS_CRUISE;
+    }
+
+    /* --- Reacquiring while armed: look often. ----------------------------
+     *  The ground is coming back into view — almost always the approach
+     *  descending into range — and the new track must be confirmed before the
+     *  aircraft falls past the top rungs (4000 fpm is ~33 ft per 500 ms poll).
+     *
+     *  A blanket "tracking -> poll fast" rule was tried first and REJECTED: at
+     *  25-50 ms a drain holds 1-2 raw samples, the per-drain median vote lost
+     *  its minority immunity, and out-of-range junk walked the altitude into
+     *  phantom rungs at 600 ft. This narrower rule is safe because, while the
+     *  track is lost, NOTHING is accepted on a single drain: the sliding
+     *  RANGE_LOST_VOTE_SAMPLES vote must first say most recent samples are
+     *  real, and then the candidates must form a constant-velocity track.    */
+    if (reacquiring && tracking && armed && ms > POLL_MS_ARMED) {
+        ms = POLL_MS_ARMED;
+    }
+    return ms;
 }
 
 /* Map a state to its poll profile. */
@@ -418,7 +460,13 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
      *  past GROUND_RESET_MS we DISARM as if freshly rebooted onto the ground:
      *  clear the arm latch, every armed bit, and the arming dwells, so the next
      *  takeoff is silent until a sustained climb through ARM_FT re-arms.          */
-    bool parked = (agl_ft <= GROUND_BAND_FT);
+    /*  ...and only when the aircraft got there by tracked motion: a level
+     *  reached through sm_reanchor() (a broken track) never counts, however
+     *  long it sits there — see sm_ctx_t.park_ok.                            */
+    if (agl_ft > GROUND_BAND_FT) {
+        c->park_ok = true;
+    }
+    bool parked = (agl_ft <= GROUND_BAND_FT) && c->park_ok;
     if (parked) {
         c->ground_ms += dt_s * 1000.0f;
         if (c->armed && c->ground_ms >= (float)GROUND_RESET_MS) {

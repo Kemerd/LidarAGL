@@ -195,6 +195,20 @@ void audio_play_tone_blocking(float freq_hz, int ms, float level_db);
 void audio_play_volume_preview_blocking(void);
 
 /**
+ * @brief Whether the audio engine is producing nothing audible right now.
+ *
+ * @details True when the channel is suspended, or when it is running with no
+ *          voice clip, no pending sensor alert, and the tone gain at silence.
+ *          The flight recorder erases flash sectors only while this is true: an
+ *          erase freezes flash-resident code on both cores for tens of ms, and
+ *          although the I2S DMA holds ~90 ms of audio, a callout is never the
+ *          place to spend that margin. A heuristic snapshot read cross-core —
+ *          it may be a few ms stale, which the DMA buffer comfortably covers.
+ * @return True if nothing is sounding.
+ */
+bool audio_is_quiet(void);
+
+/**
  * @brief Pause the I2S channel (before MCU light-sleep in GROUND/CRUISE).
  * @details The tone is silent in those states anyway; pausing lets the channel
  *          clocks gate so light-sleep can take effect without DAC glitches.

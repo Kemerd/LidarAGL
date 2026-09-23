@@ -67,6 +67,18 @@ typedef struct {
     bool     saw_cruise;
     bool     ever_armed;
     float    worst_callout_err;   /* largest |spoken - true| over the sortie   */
+
+    /*  The SURFACE, not just the sensor, sets how far down the laser can see.
+     *  reach_range_ft is the range beyond which the current terrain returns
+     *  nothing; a sortie changes it mid-flight to model a climb-out over bright
+     *  concrete and an approach over darker grass. lens_fraction is the share
+     *  of no-return samples that read the housing's acrylic lens (a few cm)
+     *  instead of the lost-signal sentinel.                                   */
+    float    reach_range_ft;
+    float    lens_fraction;
+    float    junk_fraction;   /* share of no-return samples that are junk      */
+    float    junk_span_cm;    /* junk is uniform over 0..junk_span_cm          */
+    bool     ever_disarmed_airborne;  /* parked-detector fired above 20 ft true */
 } flight_t;
 
 static void flight_init(flight_t *fl, const sensor_profile_t *p, sm_state_t initial)
@@ -76,6 +88,10 @@ static void flight_init(flight_t *fl, const sensor_profile_t *p, sm_state_t init
     fl->dt   = (float)POLL_MS_GROUND / 1000.0f;
     fl->seed = 1234567u;
     fl->worst_callout_err = 0.0f;
+    fl->reach_range_ft    = p->max_range_ft;   /* best case: the rated ceiling */
+    fl->lens_fraction     = 0.0f;
+    fl->junk_fraction     = 0.25f;             /* default mix: 75% sentinel    */
+    fl->junk_span_cm      = 10000.0f;
     rf_init(&fl->f, p->max_range_ft);
     sm_init(&fl->sm, initial);
 }
@@ -108,15 +124,18 @@ static void flight_poll(flight_t *fl, float true_agl_ft, float noise_ft)
 
     for (int i = 0; i < n; ++i) {
         float agl = true_agl_ft;
-        if (agl > fl->p->max_range_ft - GROUND_REF_FT) {
+        if (agl + GROUND_REF_FT > fl->reach_range_ft) {
             /*  Beyond the sensor's reach. The SF30 does NOT jump straight to
              *  its sentinel — "Lost signal confirmations" means it emits real
              *  erroneous distances first — so model a mix, which is what the
              *  hardware genuinely puts on the wire near and above its ceiling. */
-            if (frand(fl) < 0.75f) {
+            if (fl->lens_fraction > 0.0f && frand(fl) < fl->lens_fraction) {
+                /* The acrylic lens reflecting: 5..30 cm, i.e. "0 ft". */
+                rf_push_cm(&fl->f, 5.0f + frand(fl) * 25.0f);
+            } else if (frand(fl) >= fl->junk_fraction) {
                 rf_push_cm(&fl->f, (float)SF30_LOST_SIGNAL_CM);
             } else {
-                rf_push_cm(&fl->f, frand(fl) * 10000.0f);
+                rf_push_cm(&fl->f, frand(fl) * fl->junk_span_cm);
             }
             continue;
         }
@@ -145,8 +164,12 @@ static void flight_poll(flight_t *fl, float true_agl_ft, float noise_ft)
         sm_reanchor(&fl->sm, agl);
     }
 
+    bool was_armed = fl->sm.armed;
     sm_out_t out;
     sm_step(&fl->sm, agl, fl->dt, fl->p, &out);
+    if (was_armed && !fl->sm.armed && true_agl_ft > 20.0f) {
+        fl->ever_disarmed_airborne = true;   /* "parked" while flying: a lie   */
+    }
 
     if (out.state == ST_CRUISE) {
         fl->saw_cruise = true;
@@ -168,8 +191,15 @@ static void flight_poll(flight_t *fl, float true_agl_ft, float noise_ft)
         }
     }
 
+    /*  The NEXT poll interval, chosen exactly as the firmware's logic task
+     *  chooses it (sm_poll_period_ms is shared, not re-implemented here). The
+     *  rig used the bare state profile before, which is how a cadence-driven
+     *  failure — a CRUISE-rate poll freezing the filter on approach — could
+     *  pass every sortie while flying silent in the aircraft.                */
     fl->t += fl->dt;
-    fl->dt = (float)poll_profile_to_ms(out.poll) / 1000.0f;
+    fl->dt = (float)sm_poll_period_ms(out.poll, fl->sm.armed, rf_tracking(&fl->f),
+                                      rf_reacquiring(&fl->f), agl,
+                                      fl->sm.tone_start_ft) / 1000.0f;
 }
 
 /**
@@ -550,9 +580,215 @@ static void test_sortie_inflight_reboot_on_final(void)
                 "in-flight reboot: never speaks a rung it was already below");
 }
 
+/* ===========================================================================
+ *  SORTIE 8 — the September 2026 flight: darker approach surface, two
+ *  go-arounds, then a landing.
+ *
+ *  Climb-out is over the runway (bright concrete) and the laser sees the
+ *  ground to ~325 ft, so the filter pins at the sensor ceiling once it goes
+ *  blind. The approach is over grass and fields, which only return from
+ *  ~250 ft. The first real reading is then a ~75 ft DOWNWARD step from the
+ *  pinned value — beyond the reachability allowance, so the filter must see
+ *  RANGE_TRACK_BREAK_POLLS agreeing polls before it re-anchors.
+ *
+ *  v1.62 polled at the CRUISE rate there (the pinned value sits above
+ *  cruise_ft), a 450 fpm descent moved ~4 ft between polls, the agreeing
+ *  cluster could never form, and the box stayed frozen at ~325 ft the whole
+ *  approach: no tone, no callouts. It unstuck only when the aircraft levelled
+ *  off low, so the pilot heard the tone ONLY on each go-around climb, pitch
+ *  falling. That exact sequence is flown here, and every approach must call.
+ * ========================================================================= */
+static void test_sortie_darker_approach_surface_go_arounds(void)
+{
+    flight_t fl;
+    flight_init(&fl, &SF30C_PROFILE, ST_GROUND);
+    const float NOISE = 0.15f;
+
+    /* --- Ramp, roll, climb-out over concrete (sees to ~325 ft range) ------- */
+    fl.reach_range_ft = 325.0f;
+    fly_level(&fl, 0.0f, 20.0f, NOISE);
+    fly_segment(&fl, 0.0f, 1000.0f, 25.0f, NOISE);
+    fly_level(&fl, 1000.0f, 120.0f, NOISE);
+
+    /* --- Approaches over grass: returns only from ~250 ft of range --------- */
+    fl.reach_range_ft = 250.0f;
+
+    for (int pass = 1; pass <= 3; ++pass) {
+        int before = fl.n_spoken;
+        char msg[128];
+
+        if (pass < 3) {
+            /* Down the glideslope, go around at 40 ft, climb back to pattern. */
+            fly_segment(&fl, 1000.0f, 40.0f, 7.52f, NOISE);
+            fly_segment(&fl, 40.0f, 1000.0f, 20.0f, NOISE);
+            fly_level(&fl, 1000.0f, 90.0f, NOISE);
+        } else {
+            /* The landing. */
+            fly_segment(&fl, 1000.0f, 15.0f, 7.52f, NOISE);
+            fly_segment(&fl, 15.0f, 0.0f, 2.5f, NOISE);
+            fly_level(&fl, 0.0f, 15.0f, NOISE);
+        }
+
+        /* What this approach said. The 300 ft rung is out of the laser's
+         * reach over grass, so it is legitimately skipped; 200 and below are
+         * inside it and must speak on EVERY approach.                         */
+        bool said200 = false, said100 = false, said50 = false;
+        for (int i = before; i < fl.n_spoken; ++i) {
+            if (fabsf(fl.spoken[i] - 200.0f) < 0.5f) said200 = true;
+            if (fabsf(fl.spoken[i] - 100.0f) < 0.5f) said100 = true;
+            if (fabsf(fl.spoken[i] -  50.0f) < 0.5f) said50  = true;
+        }
+        snprintf(msg, sizeof msg, "darker surface, approach %d: called 200 ft", pass);
+        ASSERT_TRUE(said200, msg);
+        snprintf(msg, sizeof msg, "darker surface, approach %d: called 100 ft", pass);
+        ASSERT_TRUE(said100, msg);
+        snprintf(msg, sizeof msg, "darker surface, approach %d: called 50 ft", pass);
+        ASSERT_TRUE(said50, msg);
+    }
+
+    ASSERT_TRUE(spoke(&fl, 10.0f), "darker surface: 10 ft called on the landing");
+    ASSERT_TRUE(fl.worst_callout_err < 10.0f,
+                "darker surface: every callout within 10 ft of the truth");
+}
+
+/* ===========================================================================
+ *  SORTIE 9 — lens reflections out of range, with the lens floor set.
+ *
+ *  Above the laser's reach, half of the no-return samples bounce off the
+ *  housing's acrylic lens and read a few centimetres ("0 ft"). Unfiltered,
+ *  a lens-dominated drain can re-anchor the altitude at zero in the pattern,
+ *  sound the flare tone at 1000 ft, and after 30 s let the parked detector
+ *  DISARM the ladder in flight — a silent approach. With the floor applied
+ *  (as app_main does from the learned ground), lens readings count as no
+ *  return and the flight must be indistinguishable from a clean one.
+ * ========================================================================= */
+static void test_sortie_lens_reflections(void)
+{
+    flight_t fl;
+    flight_init(&fl, &SF30C_PROFILE, ST_GROUND);
+    const float NOISE = 0.15f;
+
+    fl.lens_fraction = 0.5f;
+    rf_set_min_range(&fl.f, GROUND_REF_FT - GROUND_BELOW_DEV_FT);
+
+    fly_level(&fl, 0.0f, 20.0f, NOISE);
+    fly_segment(&fl, 0.0f, 1000.0f, 25.0f, NOISE);
+    fly_level(&fl, 1000.0f, 150.0f, NOISE);
+    ASSERT_TRUE(!fl.ever_disarmed_airborne,
+                "lens: the ladder is never disarmed while flying the pattern");
+    ASSERT_TRUE(fl.n_spoken == 0, "lens: no phantom callouts in the pattern");
+
+    fly_segment(&fl, 1000.0f, 15.0f, 7.52f, NOISE);
+    fly_segment(&fl, 15.0f, 0.0f, 2.5f, NOISE);
+    fly_level(&fl, 0.0f, 15.0f, NOISE);
+    assert_good_landing(&fl, "lens");
+}
+
+/* ===========================================================================
+ *  SORTIE 10 — a real Glasair III approach: ~2000 fpm, darker surface.
+ *
+ *  The earlier sorties assumed a 451 fpm, 3-degree ILS at 85 kt. The Glasair
+ *  III routinely comes down at ~2000 fpm (33 ft/s) — steep enough that the
+ *  panel's TAWS calls "SINK RATE" on normal approaches. At that rate the
+ *  aircraft covers ~17 ft per 500 ms CRUISE poll, so every rule sized in
+ *  "feet per poll" (re-acquire agreement, Hampel lag) is stressed 4x harder,
+ *  and the low rungs arrive 0.3 s apart. Climb out over concrete, approach
+ *  over grass at 2000 fpm, round out from 50 ft, flare, land.
+ * ========================================================================= */
+static void test_sortie_glasair_2000fpm(void)
+{
+    flight_t fl;
+    flight_init(&fl, &SF30C_PROFILE, ST_GROUND);
+    const float NOISE = 0.15f;
+
+    fl.reach_range_ft = 325.0f;                    /* concrete on the climb   */
+    fly_level(&fl, 0.0f, 20.0f, NOISE);
+    fly_segment(&fl, 0.0f, 1000.0f, 25.0f, NOISE);
+    fly_level(&fl, 1000.0f, 120.0f, NOISE);
+
+    fl.reach_range_ft = 250.0f;                    /* grass on the approach   */
+    fly_segment(&fl, 1000.0f, 50.0f, 33.3f, NOISE);  /* 2000 fpm              */
+    fly_segment(&fl, 50.0f, 15.0f, 12.0f, NOISE);    /* round-out             */
+    fly_segment(&fl, 15.0f, 0.0f, 3.0f, NOISE);      /* flare                 */
+    fly_level(&fl, 0.0f, 15.0f, NOISE);
+
+    ASSERT_TRUE(spoke(&fl, 200.0f), "2000 fpm: called 200 ft over the darker surface");
+    assert_good_landing(&fl, "2000 fpm");
+}
+
+/* ===========================================================================
+ *  SORTIE 11 — gear-down idle: ~4000 fpm onto grass, then round-out.
+ *
+ *  Gear down at idle and ~120 kt the Glasair III sinks 3500-4000 fpm
+ *  (58-67 ft/s), faster than the filter's old 60 ft/s "physical bound", which
+ *  made it reject the real descent as impossible. Rates this high only happen
+ *  well above the flare, so the profile rounds out from 60 ft. Every rung the
+ *  laser can reach must still speak, near its true height.
+ * ========================================================================= */
+static void test_sortie_gear_down_idle_4000fpm(void)
+{
+    flight_t fl;
+    flight_init(&fl, &SF30C_PROFILE, ST_GROUND);
+    const float NOISE = 0.15f;
+
+    fl.reach_range_ft = 325.0f;                     /* concrete on the climb  */
+    fly_level(&fl, 0.0f, 20.0f, NOISE);
+    fly_segment(&fl, 0.0f, 1000.0f, 25.0f, NOISE);
+    fly_level(&fl, 1000.0f, 120.0f, NOISE);
+
+    fl.reach_range_ft = 250.0f;                     /* grass on the approach  */
+    fly_segment(&fl, 1000.0f, 60.0f, 66.7f, NOISE); /* 4000 fpm, gear down    */
+    fly_segment(&fl, 60.0f, 15.0f, 15.0f, NOISE);   /* round-out              */
+    fly_segment(&fl, 15.0f, 0.0f, 3.0f, NOISE);     /* flare                  */
+    fly_level(&fl, 0.0f, 15.0f, NOISE);
+
+    ASSERT_TRUE(spoke(&fl, 200.0f), "4000 fpm: called 200 ft over the darker surface");
+    assert_good_landing(&fl, "4000 fpm");
+}
+
+/* ===========================================================================
+ *  SORTIE 12 — a sensor that sprays GARBAGE whenever it is blind.
+ *
+ *  The worst the wire can do: every no-return sample is a uniformly random
+ *  14-bit value (garbled serial, or a sensor emitting erroneous distances while
+ *  blind). ~64% of them land inside the plausible 0..343 ft window, so the
+ *  stream is MAJORITY "valid" and passes every lost-signal vote — but it is
+ *  scattered across hundreds of feet within each drain, which no real surface
+ *  is. The coherence (range-gate) test must reject it: not one phantom rung in
+ *  the blind pattern, and a normal ladder once the ground is really in view.
+ *  Flown at 4000 fpm so the rejection cannot be bought with slow motion.
+ * ========================================================================= */
+static void test_sortie_garbage_while_blind(void)
+{
+    flight_t fl;
+    flight_init(&fl, &SF30C_PROFILE, ST_GROUND);
+    const float NOISE = 0.15f;
+
+    fl.junk_fraction = 1.0f;
+    fl.junk_span_cm  = 16383.0f;
+
+    fly_level(&fl, 0.0f, 20.0f, NOISE);
+    fly_segment(&fl, 0.0f, 1000.0f, 25.0f, NOISE);
+    fly_level(&fl, 1000.0f, 150.0f, NOISE);
+    ASSERT_TRUE(fl.n_spoken == 0,
+                "garbage: no phantom callouts on the climb or in the pattern");
+    ASSERT_TRUE(!fl.ever_disarmed_airborne, "garbage: never disarmed in flight");
+
+    fly_segment(&fl, 1000.0f, 60.0f, 66.7f, NOISE);
+    fly_segment(&fl, 60.0f, 15.0f, 15.0f, NOISE);
+    fly_segment(&fl, 15.0f, 0.0f, 3.0f, NOISE);
+    fly_level(&fl, 0.0f, 15.0f, NOISE);
+    assert_good_landing(&fl, "garbage");
+}
+
 int main(void)
 {
     printf("== full-sortie integration ==\n");
+    test_sortie_garbage_while_blind();
+    test_sortie_gear_down_idle_4000fpm();
+    test_sortie_glasair_2000fpm();
+    test_sortie_darker_approach_surface_go_arounds();
+    test_sortie_lens_reflections();
     test_sortie_full_pattern_and_ils();
     test_sortie_touch_and_go();
     test_sortie_go_around();
