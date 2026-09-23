@@ -533,6 +533,9 @@ void sensor_task(void *arg)
                  *  in this window so an approach re-entering range is believed
                  *  within a fraction of a second (see sm_poll_period_ms).     */
                 .reacquiring = rf_reacquiring(&s_rf),
+                /*  Lag-free sink rate from the alpha-beta tracker: the logic
+                 *  task leads each callout by rate x CALLOUT_LEAD_S.          */
+                .rate_fps    = rf_rate_fps(&s_rf),
             };
             /* Overwrite so the logic task always sees the freshest sample with
              * no backlog lag — essential for on-time callouts.                */

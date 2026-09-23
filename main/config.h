@@ -334,6 +334,21 @@
  *  fast (ARMED/DESCENT) cadences where callout timing lives.                   */
 #define RANGE_EMA_TAU_S        0.12f  /* one-pole time constant, all cadences   */
 
+/*  ...and the final smoother is now an ALPHA-BETA (position + velocity) tracker
+ *  whose position gain is exactly that time-corrected alpha, with the
+ *  Benedict-Bordner velocity gain beta = alpha^2 / (2 - alpha). Why: a plain
+ *  EMA lags a steady descent by rate x tau - 8 ft at a 4000 fpm gear-down
+ *  Glasair approach, so every callout came ~8 ft late - while an alpha-beta
+ *  tracker has ZERO steady-state lag on a constant sink rate and a fraction of
+ *  a foot of error through a flare (Kalata 1984; Painter et al. 1990). It also
+ *  yields a clean sink rate, which drives the callout lead.
+ *
+ *  Prediction is only trusted across short gaps: after more than
+ *  RANGE_AB_MAX_PREDICT_S without an accepted update (a hold, a dropout) the
+ *  tracker re-seeds on the next measurement instead of extrapolating a stale
+ *  velocity across the gap - coasting blind is how a tracker invents motion.  */
+#define RANGE_AB_MAX_PREDICT_S 1.0f   /* longest gap the tracker extrapolates   */
+
 /*  Tone-path EMA (audio side, unchanged by the robust-filter work).            */
 #define TONE_EMA_ALPHA    0.12f       /* tone path (smoother, a little laggy)   */
 
@@ -444,6 +459,27 @@
  *  already-proven callouts on a go-around, where a >=400 ms hold above
  *  height+REARM_MARGIN_FT is trivially true for any genuine climb.             */
 #define ARM_DWELL_MS      1500u        /* AGL > ARM_FT this long -> armed        */
+
+/*  CALLOUT LEAD. A number is only useful if the pilot HEARS it at that height.
+ *  Between the laser crossing a rung and the word being recognisable sit: half
+ *  a poll window, the logic tick, the audio task's pickup, the I2S DMA queue
+ *  (~90 ms: 6 x 240 frames at 16 kHz) and the word's own onset before it is
+ *  intelligible. That is ~0.2 s — 13 ft at a 4000 fpm gear-down Glasair
+ *  approach. Each rung therefore fires when the altitude PREDICTED one lead
+ *  time ahead (AGL + sink x CALLOUT_LEAD_S) crosses it, the way 1970s
+ *  altitude-callout annunciators did (US4093938 anticipates up to 24 ft to
+ *  cover message start-up) and the way Airbus trigger heights sit above their
+ *  nominal values. The sink rate is the range filter's alpha-beta velocity:
+ *  lag-free at a steady descent, and seeded from the confirmed track after a
+ *  re-acquire, so a re-entry snap cannot spike it.
+ *
+ *  Only a DESCENT leads; the lead is capped at CALLOUT_LEAD_MAX_FT; and the
+ *  go-around re-arm hysteresis stays on the MEASURED altitude, so a lead can
+ *  move a callout earlier but can never make one speak twice. The flight
+ *  recorder logs raw sample times and the moment each clip starts, so the
+ *  real end-to-end latency can be measured and this constant tuned.         */
+#define CALLOUT_LEAD_S       0.20f     /* measured-latency target (s)            */
+#define CALLOUT_LEAD_MAX_FT  20.0f     /* never anticipate a rung by more       */
 #define REARM_SUSTAIN_MS  400u         /* above h+margin this long -> re-armed   */
 
 /*  The "on the ground" AGL band shared by the pre-arm GROUND classification and

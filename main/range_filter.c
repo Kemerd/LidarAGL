@@ -102,20 +102,44 @@ static float win_mad_sigma(const range_filter_t *f, float med)
     return 1.4826f * median_inplace(devs, f->win_n);
 }
 
-/*  Accept a value: seed/advance the EMA with the time-corrected alpha and
- *  record it in the Hampel window. Clears any pending re-acquisition.          */
-static void accept_value(range_filter_t *f, float v, float dt_s)
+/*  Accept a measurement: advance the alpha-beta tracker across the time since
+ *  its last update, correct it with this measurement, and record the value in
+ *  the Hampel window. Clears any pending re-acquisition.
+ *
+ *    predict:  x_p = x + v*T
+ *    correct:  r = z - x_p;  x = x_p + alpha*r;  v = v + (beta/T)*r
+ *
+ *  alpha = 1 - exp(-T/tau) keeps ONE wall-clock bandwidth at every cadence;
+ *  beta = alpha^2/(2 - alpha) is the Benedict-Bordner pairing (critically
+ *  damped). A steady descent is tracked with no lag.                          */
+static void accept_value(range_filter_t *f, float z)
 {
-    if (!f->have_out) {
-        f->ema_ft   = v;      /* first lock: seed, don't lag */
+    float T = f->since_update_s;
+    f->since_update_s = 0.0f;
+
+    if (!f->have_out || !(T > 0.0f) || T > RANGE_AB_MAX_PREDICT_S) {
+        /* First lock, or a gap too long to extrapolate across: re-seed on the
+         * measurement with no assumed motion rather than coast a stale
+         * velocity through a stretch nobody observed.                        */
+        f->ema_ft   = z;
+        f->rate_fps = 0.0f;
         f->have_out = true;
     } else {
-        /* alpha = 1 - exp(-dt/tau): one wall-clock bandwidth at EVERY poll
-         * cadence, unlike the retired fixed-alpha-per-poll EMA.               */
-        float alpha = 1.0f - expf(-dt_s / RANGE_EMA_TAU_S);
-        f->ema_ft += alpha * (v - f->ema_ft);
+        float alpha = 1.0f - expf(-T / RANGE_EMA_TAU_S);
+        float beta  = (alpha * alpha) / (2.0f - alpha);
+        float x_p   = f->ema_ft + f->rate_fps * T;
+        float r     = z - x_p;
+        f->ema_ft    = x_p + alpha * r;
+        f->rate_fps += (beta / T) * r;
+        /* The airframe bound applies to the velocity estimate too. */
+        if (f->rate_fps >  RANGE_MAX_SLEW_FPS) f->rate_fps =  RANGE_MAX_SLEW_FPS;
+        if (f->rate_fps < -RANGE_MAX_SLEW_FPS) f->rate_fps = -RANGE_MAX_SLEW_FPS;
+        if (!isfinite(f->ema_ft) || !isfinite(f->rate_fps)) {
+            f->ema_ft   = z;                       /* never carry a NaN on    */
+            f->rate_fps = 0.0f;
+        }
     }
-    win_push(f, v);
+    win_push(f, z);
     f->pend_n       = 0;
     f->pend_samples = 0;
 }
@@ -147,6 +171,11 @@ void rf_set_min_range(range_filter_t *f, float min_range_ft)
 bool rf_track_broken(const range_filter_t *f)
 {
     return f->track_break;
+}
+
+float rf_rate_fps(const range_filter_t *f)
+{
+    return (f != NULL) ? f->rate_fps : 0.0f;
 }
 
 bool rf_reacquiring(const range_filter_t *f)
@@ -220,9 +249,16 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
     f->drain_head = 0;
     f->drain_lost = 0;
 
-    /* Guard the dt used for the slew allowance / EMA against nonsense. */
+    /* Guard the dt used for the slew allowance / tracker against nonsense. */
     if (!(dt_s > 0.0f)) {
         dt_s = 0.001f;
+    }
+
+    /*  The tracker predicts across the WHOLE time since its last accepted
+     *  update, including polls that were held or rejected in between.       */
+    f->since_update_s += dt_s;
+    if (f->since_update_s > 1.0e6f) {
+        f->since_update_s = 1.0e6f;             /* bounded: never overflows   */
     }
 
     /*  The track-break flag describes THIS finalize only; clear it up front so
@@ -368,7 +404,8 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
              * re-anchor the first in-range reading would look like a huge
              * outlier and burn RANGE_REACQUIRE_N polls before it was believed —
              * several hundred feet of descent at the CRUISE cadence.            */
-            f->ema_ft = f->max_range_ft;
+            f->ema_ft   = f->max_range_ft;
+            f->rate_fps = 0.0f;              /* an inference carries no motion */
             f->win_n    = 0;
             f->win_head = 0;
             while (f->win_n < HAMPEL_SEED_N) {
@@ -580,8 +617,15 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
                  *  step can speak), and the gate — now anchored at the new
                  *  level — closes the remaining gap within a few polls.       */
                 float level = f->pend_mean;
-                f->have_out = false;         /* seed the EMA at the new level  */
-                accept_value(f, level, dt_s);
+                f->have_out = false;         /* re-seed the tracker at the level */
+                accept_value(f, level);
+                /* ...moving at the confirmed track's own measured velocity: a
+                 * re-entry on an approach is a DESCENT, and seeding it at rest
+                 * would lag the first seconds of it (and the callout lead).  */
+                f->rate_fps = f->pend_vel_fps;
+                if (f->rate_fps >  RANGE_MAX_SLEW_FPS) f->rate_fps =  RANGE_MAX_SLEW_FPS;
+                if (f->rate_fps < -RANGE_MAX_SLEW_FPS) f->rate_fps = -RANGE_MAX_SLEW_FPS;
+                if (!isfinite(f->rate_fps)) f->rate_fps = 0.0f;
                 /* Pre-fill the Hampel window to HAMPEL_SEED_N with the new
                  *  level so the gate is LIVE again from the very next poll.
                  *  accept_value() pushed one copy; left there, the seed phase
@@ -610,8 +654,8 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
         }
     }
 
-    /* --- Stage 5: accepted -> time-corrected EMA ---------------------------- */
-    accept_value(f, med, dt_s);
+    /* --- Stage 5: accepted -> alpha-beta tracker ---------------------------- */
+    accept_value(f, med);
     *fresh_valid = true;
     *range_ft    = f->ema_ft;
     return true;

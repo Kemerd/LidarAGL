@@ -1009,6 +1009,17 @@ static void logic_task(void *arg)
                      (double)agl);
         }
 
+        /*  Callout lead input: the tracker's lag-free sink rate, in the same
+         *  units as agl (scaled like it on bench/demo boots). Guarded: a
+         *  non-finite rate simply means no lead.                               */
+        {
+            float rate = s.rate_fps;
+            if (s_bench_scale) {
+                rate *= s_bench_scale_gain;
+            }
+            sm.lead_rate_fps = isfinite(rate) ? rate : 0.0f;
+        }
+
         sm_out_t out;
         sm_step(&sm, agl, dt_dec, g_profile, &out);
 

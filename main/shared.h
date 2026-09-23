@@ -50,6 +50,8 @@ typedef struct {
                          /**< number happened to be large. See rf_tracking().    */
     bool     reacquiring;/**< The filter's track is lost and a new one awaits    */
                          /**< confirmation (rf_reacquiring()): poll fast.        */
+    float    rate_fps;   /**< Tracker range rate, ft/s (+ climbing), for the     */
+                         /**< callout lead (rf_rate_fps()).                      */
 } range_sample_t;
 
 /** Tone parameters the logic task publishes for the audio task. */

@@ -48,11 +48,12 @@
  *               short self-consistent burst can't muster the sample mass at
  *               the fast cadences, so garbage can never re-acquire.
  *
- *            5. TIME-CORRECTED EMA — the final smoothing uses
- *               alpha = 1 - exp(-dt / RANGE_EMA_TAU_S), so the filter has ONE
- *               bandwidth in wall-clock terms across every poll cadence
- *               (the old fixed-alpha-per-poll EMA was 30x wider in DESCENT
- *               than GROUND, and a spike's decay swept the callout ladder).
+ *            5. ALPHA-BETA TRACKER — position + velocity, with position gain
+ *               alpha = 1 - exp(-dt / RANGE_EMA_TAU_S) (ONE wall-clock bandwidth
+ *               at every cadence) and velocity gain beta = alpha^2/(2-alpha).
+ *               It replaced a time-corrected EMA that lagged a steady descent
+ *               by rate x tau (8 ft at 4000 fpm); the tracker has no lag on a
+ *               constant sink and reports the sink rate itself.
  *
  *          The SF30 legacy 2-byte pair decoder also lives here (moved out of
  *          the hardware TU) so the wire protocol's desync behaviour is finally
@@ -130,7 +131,11 @@ typedef struct {
                            /**< 1-2-sample fast-cadence drains can't fake it.  */
 
     /* --- Output (stage 5).                                                   */
-    float    ema_ft;       /**< Published smoothed range (ft).                 */
+    float    ema_ft;       /**< Published tracked range (ft): the alpha-beta   */
+                           /**< tracker's position (name kept from the EMA).  */
+    float    rate_fps;     /**< Tracker velocity d(range)/dt in ft/s (+ means */
+                           /**< climbing). Zero on holds and ceiling pins.    */
+    float    since_update_s; /**< Time since the last accepted update.        */
     bool     have_out;     /**< False until the first accepted value seeds it. */
 
     /* --- Validity gate configuration.                                        */
@@ -312,5 +317,17 @@ bool rf_tracking(const range_filter_t *f);
  * @return   True while a lost track awaits confirmation and the stream is real.
  */
 bool rf_reacquiring(const range_filter_t *f);
+
+/**
+ * @brief The tracker's range rate in ft/s (+ climbing / - descending).
+ *
+ * @details From the alpha-beta tracker, so it has no steady-state lag on a
+ *          constant sink. Zero while holding or pinned (an inference carries no
+ *          motion), and seeded from the confirmed track's own velocity after a
+ *          re-acquire. Drives the callout lead (sm_ctx_t.lead_rate_fps).
+ * @param f  Filter state.
+ * @return   Range rate in ft/s.
+ */
+float rf_rate_fps(const range_filter_t *f);
 
 #endif /* LIDARAGL_RANGE_FILTER_H */

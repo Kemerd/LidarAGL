@@ -30,6 +30,8 @@ void sm_init(sm_ctx_t *c, sm_state_t initial)
     c->have_prev  = false;
     c->ground_ms  = 0.0f;   /* fresh ground-dwell timer */
     c->park_ok    = true;   /* a boot on the ramp IS parked                     */
+    c->lead_rate_fps = 0.0f;  /* no callout lead until the caller supplies it   */
+    c->prev_lead_ft  = 0.0f;
 
     /* Fresh arming-persistence dwells: nothing is part-way to arming. The
      * observation counters clear alongside their timers so the first in-band
@@ -75,6 +77,15 @@ void sm_reanchor(sm_ctx_t *c, float agl_ft)
      *  here on can fire a rung.                                                 */
     c->prev_agl  = agl_ft;
     c->have_prev = true;
+
+    /*  The callout lead's anchor becomes the PHYSICAL new level (no lead): the
+     *  next step then compares the new level with where the aircraft will be one
+     *  lead time later, so a rung the descent is about to reach is announced
+     *  now, which is the point of the lead. (Re-basing the anchor on the lead
+     *  instead would have hidden any rung within the lead distance below the new
+     *  level, permanently: in lead-compensated terms the aircraft would already
+     *  be "past" it without ever crossing it.)                                 */
+    c->prev_lead_ft = 0.0f;
 
     /*  A discontinuity carries no velocity information: the jump did not happen
      *  at any particular rate. Leaving the old trend in place would let a stale
@@ -319,6 +330,20 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
     int      fired        = -1;
     uint32_t crossed_mask = 0u;   /* every rung crossed downward this tick */
 
+    /* --- Callout lead for this step (see CALLOUT_LEAD_S) ------------------
+     *  Computed every step, armed or not, so the anchor carried into the next
+     *  step is always the lead that was actually in force. Descents only.    */
+    float lead = 0.0f;
+    {
+        float rate = c->lead_rate_fps;
+        if (isfinite(rate) && rate < -TREND_DEADBAND_FPS) {
+            lead = -rate * CALLOUT_LEAD_S;
+            if (lead > CALLOUT_LEAD_MAX_FT) {
+                lead = CALLOUT_LEAD_MAX_FT;
+            }
+        }
+    }
+
     /* --- Arming: the silent climb-out ------------------------------------- */
     /*  Until the aircraft has climbed through ARM_FT for the first time, NO
      *  callout may fire. HOLDING above ARM_FT for ARM_DWELL_MS latches 'armed'
@@ -435,13 +460,18 @@ void sm_step(sm_ctx_t *c, float agl_ft, float dt_s,
          * reminder) would otherwise silently lose a rung that a terrain drop
          * or re-acquire snap stepped over.                                    */
         if (had_prev) {
+            /*  Lead-compensated crossing (see CALLOUT_LEAD_S): compare where
+             *  the aircraft is PREDICTED to be one lead time ahead, so the word
+             *  is heard at the rung rather than ~0.2 s x sink below it.       */
             uint32_t mask_before = c->armed_mask;
-            fired        = fire_descent_callout(c, prev_agl, agl_ft, p);
+            fired        = fire_descent_callout(c, prev_agl - c->prev_lead_ft,
+                                                agl_ft - lead, p);
             crossed_mask = mask_before & ~c->armed_mask;
         }
     }
 
     c->state = next;
+    c->prev_lead_ft = lead;          /* the anchor for the next step's crossing */
 
     /* --- Ground-dwell disarm (taxi-back / parked reset) ------------------- */
     /*  Accumulate continuous time spent ON THE GROUND. Note we can't key this

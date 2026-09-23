@@ -107,6 +107,14 @@ typedef struct {
      *  that would silence the rest of the flight. Restored the moment the
      *  altitude is seen above the band; a real landing always descends into it. */
     bool       park_ok;
+
+    /*  Vertical rate (ft/s, + climbing) the CALLER supplies before each
+     *  sm_step() — the range filter's alpha-beta velocity (rf_rate_fps). It
+     *  drives the callout lead (CALLOUT_LEAD_S): a descending rung fires when
+     *  AGL + rate x lead crosses it. 0 (the sm_init default) means no lead,
+     *  which is exactly the historical behaviour.                              */
+    float      lead_rate_fps;
+    float      prev_lead_ft;   /**< The lead applied on the previous step.     */
 } sm_ctx_t;
 
 /** Result of one sm_step() evaluation. */

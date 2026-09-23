@@ -312,6 +312,118 @@ static void test_trend_deadband(const sensor_profile_t *p)
  *  back through ARM_FT; but a quick touch-and-go inside the window keeps the arm.
  * ------------------------------------------------------------------------- */
 /* ---------------------------------------------------------------------------
+ *  Callout lead: a rung fires when the altitude PREDICTED one lead time ahead
+ *  crosses it, so the word is heard at the rung at any sink rate.
+ * ------------------------------------------------------------------------- */
+static float fire_height_with_lead(const sensor_profile_t *p, float sink_fps,
+                                   float lead_rate_fps, float rung_ft)
+{
+    /* Descend at sink_fps (> 0) while the caller-supplied lead rate is
+     * lead_rate_fps; return the measured AGL at which rung_ft fired.         */
+    sm_ctx_t c;
+    sm_init(&c, ST_ARMED);
+    sm_out_t out;
+    float agl = rung_ft + 60.0f;
+    for (int i = 0; i < 20000 && agl >= 0.0f; ++i) {
+        c.lead_rate_fps = lead_rate_fps;
+        sm_step(&c, agl, DT, p, &out);
+        if (out.fired_callout >= 0 &&
+            fabsf(p->callouts[out.fired_callout] - rung_ft) < 0.5f) {
+            return agl;
+        }
+        agl -= sink_fps * DT;
+    }
+    return -1.0f;
+}
+
+static void test_callout_lead(const sensor_profile_t *p)
+{
+    char msg[128];
+
+    /* No rate supplied: fires at the rung, exactly as before. */
+    float h0 = fire_height_with_lead(p, 10.0f, 0.0f, 50.0f);
+    snprintf(msg, sizeof msg, "[%s] no lead: 50 fires at ~50 ft (%.1f)", p->name, h0);
+    ASSERT_TRUE(h0 > 49.0f && h0 <= 50.5f, msg);
+
+    /* 2000 fpm: fires lead = 33.3 x CALLOUT_LEAD_S (~6.7 ft) early. */
+    float h2 = fire_height_with_lead(p, 33.3f, -33.3f, 50.0f);
+    float want2 = 50.0f + 33.3f * CALLOUT_LEAD_S;
+    snprintf(msg, sizeof msg, "[%s] 2000 fpm: 50 fires ~%.1f ft (%.1f)", p->name, want2, h2);
+    ASSERT_TRUE(fabsf(h2 - want2) < 1.5f, msg);
+
+    /* 6000 fpm: the lead is capped at CALLOUT_LEAD_MAX_FT. */
+    float h6 = fire_height_with_lead(p, 100.0f, -100.0f, 50.0f);
+    snprintf(msg, sizeof msg, "[%s] lead capped at %.0f ft (%.1f)",
+             p->name, (double)CALLOUT_LEAD_MAX_FT, h6);
+    ASSERT_TRUE(h6 > 0.0f && h6 <= 50.0f + CALLOUT_LEAD_MAX_FT + 3.0f, msg);
+
+    /* A climb never leads and never fires, even passing up through a rung. */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_ARMED);
+        sm_out_t out;
+        int fired = 0;
+        for (int i = 0; i < 200; ++i) {
+            c.lead_rate_fps = +30.0f;
+            sm_step(&c, 45.0f + (float)i * 0.75f, DT, p, &out);
+            fired += (out.fired_callout >= 0);
+        }
+        snprintf(msg, sizeof msg, "[%s] climbing through a rung never fires", p->name);
+        ASSERT_TRUE(fired == 0, msg);
+    }
+
+    /* A re-anchor 8 ft above the 50 rung while sinking at 60 ft/s (lead ~12 ft):
+     * the aircraft will pass 50 within the lead time, so 50 is announced NOW,
+     * and nothing lower (40) is announced early with it.                     */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_ARMED);
+        sm_out_t out;
+        for (int i = 0; i < 10; ++i) {
+            c.lead_rate_fps = 0.0f;
+            sm_step(&c, 300.0f, DT, p, &out);
+        }
+        sm_reanchor(&c, 58.0f);
+        c.lead_rate_fps = -60.0f;
+        sm_step(&c, 58.0f, DT, p, &out);
+        bool said50 = out.fired_callout >= 0 &&
+                      fabsf(p->callouts[out.fired_callout] - 50.0f) < 0.5f;
+        snprintf(msg, sizeof msg, "[%s] re-anchor 8 ft above 50 at 60 ft/s: 50 announced now",
+                 p->name);
+        ASSERT_TRUE(said50, msg);
+        snprintf(msg, sizeof msg, "[%s] re-anchor: 40 not crossed with it", p->name);
+        ASSERT_TRUE((out.crossed_mask & ~(1u << (unsigned)out.fired_callout)) == 0u, msg);
+    }
+
+    /* A re-anchor far below the old level must still leave the rungs beneath
+     * it available: after a 250 -> 70 ft re-anchor at a steady 60 ft/s sink,
+     * 50/40/30/20/10 all still speak.                                         */
+    {
+        sm_ctx_t c;
+        sm_init(&c, ST_ARMED);
+        sm_out_t out;
+        for (int i = 0; i < 40; ++i) {
+            c.lead_rate_fps = -60.0f;
+            sm_step(&c, 250.0f - 60.0f * DT * (float)i, DT, p, &out);
+        }
+        sm_reanchor(&c, 70.0f);
+        int spoke = 0;
+        float agl = 70.0f;
+        for (int i = 0; i < 400 && agl > 0.0f; ++i) {
+            c.lead_rate_fps = -60.0f;
+            sm_step(&c, agl, DT, p, &out);
+            if (out.fired_callout >= 0 && p->callouts[out.fired_callout] <= 50.0f) {
+                ++spoke;
+            }
+            agl -= 60.0f * DT;
+        }
+        snprintf(msg, sizeof msg, "[%s] after a deep re-anchor all 5 low rungs speak (%d)",
+                 p->name, spoke);
+        ASSERT_TRUE(spoke == 5, msg);
+    }
+}
+
+/* ---------------------------------------------------------------------------
  *  A broken track re-anchored INTO the ground band is not a landing.
  *
  *  Out of range, a lens-dominated or junk stream can make the filter break
@@ -864,6 +976,7 @@ int main(void)
         test_trend_deadband(p);
         test_ground_dwell_disarm(p);
         test_reanchor_to_ground_does_not_disarm(p);
+        test_callout_lead(p);
         test_arm_requires_dwell(p);
         test_arm_dwell_slow_cadence(p);
         test_spike_decay_regression(p);
