@@ -128,6 +128,12 @@ typedef struct {
     float p01;              /**< Range/rate covariance (ft^2/s).               */
     float p11;              /**< Rate variance (ft^2/s^2).                     */
     float r_var;            /**< Measurement noise variance (ft^2), adaptive.  */
+    /* The last two accepted raw measurements, for the second-difference noise
+     * estimate (see RF_R_ADAPT_ALPHA).                                        */
+    float z1;               /**< Newest accepted measurement (ft).             */
+    float z2;               /**< The one before it (ft).                       */
+    float h1;               /**< Time between z2 and z1 (s).                   */
+    uint8_t zn;             /**< How many of z1/z2 are valid (0..2).           */
 } rf_kf_t;
 
 /** Carried state of the range tracker. One instance per sensor stream. */
@@ -156,6 +162,8 @@ typedef struct {
     uint32_t unacc_real;    /**< Real returns since the last accept (rejected). */
     bool     lost_blind;    /**< The track was LOST to no-returns (blindness), */
                             /**< not to rejected returns (see rf_break_reentry).*/
+    bool     contradicted;  /**< Since the last accept, rejected returns have  */
+                            /**< formed a candidate: HOLD, don't predict.      */
 
     /* --- Sample-and-hold repeat detection (see RF_REPEAT_HOLD_S). ----------- */
     float    last_z;        /**< Previous raw sample (ft), NaN after a no-return.*/
@@ -289,8 +297,9 @@ bool rf_reacquiring(const range_filter_t *f);
 
 /**
  * @brief The tracked range rate in ft/s (+ climbing / - descending).
- * @details Lag-free at a steady sink; 0 while LOST or SEARCH. Drives the
- *          callout lead (sm_ctx_t.lead_rate_fps).
+ * @details Lag-free at a steady sink. 0 while LOST or SEARCH, and 0 while
+ *          COASTING: it drives the callout lead (sm_ctx_t.lead_rate_fps), which
+ *          may extrapolate only a measured state, never a prediction.
  */
 float rf_rate_fps(const range_filter_t *f);
 

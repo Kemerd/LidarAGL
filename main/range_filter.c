@@ -79,10 +79,10 @@ bool sf30_ascii_feed(sf30_ascii_ctx_t *c, uint8_t b, int *out_cm)
 /*  Squared innovation gate (in units of the innovation variance S). */
 #define RF_GATE_SQ      (RF_GATE_SIGMA * RF_GATE_SIGMA)
 
-/*  Huber clip on the innovation fed to the noise follower: 3 sigma. One
- *  sample at the edge of the 5-sigma gate would otherwise move the estimate
- *  by alpha * 25 S and let a handful of gate-edge junk samples inflate the
- *  gate that admitted them.                                                    */
+/*  Huber clip on each one-sample noise estimate fed to the follower: 3 sigma
+ *  of the current estimate. One junk sample that slipped inside the gate would
+ *  otherwise move the estimate by alpha * (its whole error)^2 and let a handful
+ *  of gate-edge junk samples inflate the gate that admitted them.            */
 #define RF_R_HUBER_SQ   9.0f
 
 /*  A fresh candidate's velocity prior: 1 sigma = RANGE_MAX_SLEW_FPS divided by
@@ -179,6 +179,10 @@ static void kf_seed(rf_kf_t *k, float z, float r_var, float sigma_v)
     k->p01   = 0.0f;
     k->p11   = sigma_v * sigma_v;
     k->r_var = r_var;
+    k->z1    = z;                                   /* noise-estimate history */
+    k->z2    = z;
+    k->h1    = 0.0f;
+    k->zn    = 1u;
 }
 
 /*  Return a copy of @p k predicted @p h seconds ahead. @p k is NOT modified:
@@ -245,21 +249,54 @@ static bool kf_sanitize(rf_kf_t *k)
     return true;
 }
 
-/*  Measurement update of a PREDICTED estimate with innovation @p nu (already
+/*  The measurement-noise follower, fed by the SECOND DIFFERENCE of the last
+ *  three accepted measurements z2, z1, z (spacings h1 = t1 - t2, h = t - t1):
+ *
+ *      d = (z - z1)/h - (z1 - z2)/h1          (a change of measured velocity)
+ *
+ *  With white measurement noise of variance R, E[d^2] = R * k where
+ *      k = 1/h^2 + (1/h + 1/h1)^2 + 1/h1^2,
+ *  so d^2 / k is an unbiased one-sample estimate of R. A constant velocity
+ *  cancels exactly; a constant acceleration a leaves a*(h + h1)/2 in d, which
+ *  against the noise term sqrt(R k) (~50 ft/s at 78 Hz) is negligible. That is
+ *  the point: the innovation, which ALSO carries the model's manoeuvre lag,
+ *  must never drive R (see RF_R_ADAPT_ALPHA in config.h). Each estimate is
+ *  Huber-clipped at 3 sigma of the current value and averaged with gain
+ *  RF_R_ADAPT_ALPHA; kf_sanitize() bounds the result to [sigma_m, sigma_max]. */
+static void kf_noise_follow(rf_kf_t *k, float z, float h)
+{
+    if (k->zn >= 2u && h > 0.0f && k->h1 > 0.0f) {
+        float d     = (z - k->z1) / h - (k->z1 - k->z2) / k->h1;
+        float inv_h  = 1.0f / h;
+        float inv_h1 = 1.0f / k->h1;
+        float kk    = inv_h * inv_h + (inv_h + inv_h1) * (inv_h + inv_h1) +
+                      inv_h1 * inv_h1;
+        float r_hat = (d * d) / kk;
+        float clip  = RF_R_HUBER_SQ * k->r_var;
+        if (!(r_hat <= clip)) {
+            r_hat = clip;                            /* also catches NaN        */
+        }
+        k->r_var += RF_R_ADAPT_ALPHA * (r_hat - k->r_var);
+    }
+    /* Shift the history. */
+    k->z2 = k->z1;
+    k->z1 = z;
+    k->h1 = h;
+    if (k->zn < 2u) {
+        ++k->zn;
+    }
+}
+
+/*  Measurement update of a PREDICTED estimate with measurement @p z taken
+ *  @p h seconds after the estimate's previous one, innovation @p nu (already
  *  gated) and innovation variance @p s, followed by the measurement-noise
  *  follower. Returns false if the result is not a usable estimate.
  *
  *    K   = [P00, P01]' / S
  *    s  += K * nu
  *    P   = (I - K H) P     ->  P00' = P00 R/S,  P01' = P01 R/S,
- *                              P11' = P11 - P01^2/S
- *
- *  Noise follower: E[nu^2] = P00_pred + R, so nu^2 - P00_pred is an unbiased
- *  one-sample estimate of R. It is Huber-clipped at 3 sigma and averaged with
- *  gain RF_R_ADAPT_ALPHA, then bounded to [sigma_m, sigma_max]. This lets the
- *  gate open for genuinely textured surfaces (grass, high speed over terrain)
- *  without ever becoming wide enough to admit junk.                           */
-static bool kf_update(rf_kf_t *kp, float nu, float s)
+ *                              P11' = P11 - P01^2/S                         */
+static bool kf_update(rf_kf_t *kp, float z, float h, float nu, float s)
 {
     float p00 = kp->p00;
     float p01 = kp->p01;
@@ -273,12 +310,7 @@ static bool kf_update(rf_kf_t *kp, float nu, float s)
     kp->p01 = p01 * ros;
     kp->p11 = kp->p11 - (p01 * p01) / s;
 
-    float nu2 = nu * nu;
-    if (nu2 > RF_R_HUBER_SQ * s) {
-        nu2 = RF_R_HUBER_SQ * s;
-    }
-    kp->r_var += RF_R_ADAPT_ALPHA * ((nu2 - p00) - kp->r_var);
-
+    kf_noise_follow(kp, z, h);
     return kf_sanitize(kp);
 }
 
@@ -324,13 +356,19 @@ static void rf_go_lost(range_filter_t *f)
      *  Only blindness can hide rungs the aircraft genuinely passed.         */
     f->lost_blind = (f->unacc_void >= f->unacc_real);
 
-    float coast = f->since_accept_s;
-    if (coast > RF_COAST_MAX_S) {
-        coast = RF_COAST_MAX_S;
-    }
-    float held = f->trk.x + f->trk.v * coast;
-    if (isfinite(held)) {
-        f->out_ft = held;
+    /*  A coast that was predicting (nothing contradicted it) ends where the
+     *  prediction got to; a CONTRADICTED coast was already holding, and keeps
+     *  exactly the value it held — moving it now would be the very motion the
+     *  hold refused to fabricate.                                            */
+    if (!f->contradicted) {
+        float coast = f->since_accept_s;
+        if (coast > RF_COAST_MAX_S) {
+            coast = RF_COAST_MAX_S;
+        }
+        float held = f->trk.x + f->trk.v * coast;
+        if (isfinite(held)) {
+            f->out_ft = held;
+        }
     }
     f->out_rate_fps = 0.0f;
     f->state        = RF_LOST;
@@ -356,6 +394,7 @@ static void rf_adopt(range_filter_t *f, bool brk, bool reentry,
     f->since_accept_s = f->c_age_s;            /* 0: confirmed on a member     */
     f->unacc_void     = 0;
     f->unacc_real     = 0;
+    f->contradicted   = false;
     f->state          = RF_TRACK;
     f->have_out       = true;
 
@@ -538,7 +577,7 @@ static void rf_process_sample(range_filter_t *f, float h, float z,
         rf_kf_t kp = kf_predicted(&f->trk, f->since_accept_s);
         float   nu, s;
         if (kf_gate(&kp, z, &nu, &s)) {
-            if (kf_update(&kp, nu, s)) {
+            if (kf_update(&kp, z, f->since_accept_s, nu, s)) {
                 f->trk = kp;
             } else {
                 /* Numerically beyond repair (never seen; defensive): restart
@@ -548,6 +587,7 @@ static void rf_process_sample(range_filter_t *f, float h, float z,
             f->since_accept_s = 0.0f;
             f->unacc_void     = 0;
             f->unacc_real     = 0;
+            f->contradicted   = false;
             f->state          = RF_TRACK;
             st->accepted      = true;
 
@@ -574,13 +614,20 @@ static void rf_process_sample(range_filter_t *f, float h, float z,
     rf_kf_t cp = kf_predicted(&f->cand, f->c_age_s);
     float   nu, s;
     if (kf_gate(&cp, z, &nu, &s)) {
-        if (!kf_update(&cp, nu, s)) {
+        if (!kf_update(&cp, z, f->c_age_s, nu, s)) {
             cand_seed(f, z);                 /* defensive: never carry a NaN   */
             return;
         }
         f->cand    = cp;
         f->c_age_s = 0.0f;
         count_up(&f->c_n);
+        /*  A coherent competing surface: the live track must stop predicting
+         *  (see RF_CONTRADICT_MEMBERS). Set before the confirmation check,
+         *  which may adopt the candidate and clear it again.                */
+        if ((f->state == RF_TRACK || f->state == RF_COAST) &&
+            f->c_n >= RF_CONTRADICT_MEMBERS) {
+            f->contradicted = true;
+        }
         rf_try_confirm(f, st);
     } else {
         /*  A miss. Once misses outnumber members the candidate is a poorer
@@ -837,12 +884,18 @@ bool rf_finalize(range_filter_t *f, float dt_s, float *range_ft, bool *fresh_val
 
         /*  The estimate is kept at its last accepted sample; publish it
          *  predicted to NOW so a trailing run of rejected samples does not
-         *  make the published range lag the aircraft.                       */
-        float now_ft = f->trk.x + f->trk.v * f->since_accept_s;
-        if (isfinite(now_ft)) {
-            f->out_ft = now_ft;
+         *  make the published range lag the aircraft — unless those samples
+         *  formed a competing surface, in which case HOLD what was published
+         *  (see RF_CONTRADICT_MEMBERS): no motion is invented toward a rung. */
+        if (!f->contradicted || !f->have_out) {
+            float now_ft = f->trk.x + f->trk.v * f->since_accept_s;
+            if (isfinite(now_ft)) {
+                f->out_ft = now_ft;
+            }
         }
-        f->out_rate_fps = clamp_rate(f->trk.v);
+        /*  The rate drives the callout lead, which may extrapolate only a
+         *  MEASURED state: none while coasting (see RF_CONTRADICT_MEMBERS). */
+        f->out_rate_fps = (f->state == RF_TRACK) ? clamp_rate(f->trk.v) : 0.0f;
     } else {
         f->out_rate_fps = 0.0f;                  /* an inference carries none  */
     }

@@ -89,12 +89,15 @@ class FaultInjector:
                             wake-edge signature. The output must HOLD through
                             each burst and resume cleanly.
       * STUCK  (toggle)    : report one fixed wrong value continuously. This is
-                            the correlated-corruption worst case: the filter's
-                            re-acquire logic will (BY DESIGN) accept it after
-                            RANGE_REACQUIRE_N agreeing polls, exactly as it
-                            must accept a genuine terrain step. Expect the box
-                            to follow it after ~3 polls -- the test proves the
-                            re-acquire threshold, not silence.
+                            the correlated-corruption worst case. The v1.64
+                            tracker coasts, then HOLDS, while the value is
+                            beyond the 35 ft continuous reach; after RF_BREAK_S
+                            (1 s) of persistence it adopts it as a SILENT track
+                            break (the ladder re-anchors, nothing is spoken),
+                            exactly as it must accept a genuine terrain step.
+                            A stuck value within reach is followed after
+                            ~0.1 s. The test proves the break timing, not
+                            silence.
 
     All attributes are plain floats/bools tuned live from the GUI thread; the
     stream thread only reads them (same GIL contract as SimEngine's knobs).

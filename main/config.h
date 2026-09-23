@@ -125,15 +125,23 @@
  *  across a gap and tightens again once the track is re-established.
  *
  *  sigma_a is the manoeuvre the model must follow without losing the target:
- *  a round-out from a 4000 fpm descent to a flare is ~10-20 ft/s^2.
+ *  a round-out from a 4000 fpm descent to a flare is ~10-20 ft/s^2 (a 0.8 g
+ *  push-over lags by ~0.4 ft at the 78 Hz sample rate).
  *  sigma_m is the FLOOR of the measurement noise (the SF30's +/-5 cm plus a
- *  little surface texture); the actual R is estimated online from the accepted
- *  innovations and bounded by RF_SIGMA_MEAS_MAX_FT, so the gate adapts to real
- *  grass/tarmac texture without ever opening wide enough to admit junk.       */
+ *  little surface texture). The actual R is estimated online, bounded by
+ *  RF_SIGMA_MEAS_MAX_FT, so the gate adapts to real grass/tarmac texture
+ *  without ever opening wide enough to admit junk — and it is estimated from
+ *  the SECOND DIFFERENCE of consecutive accepted samples, never from the
+ *  innovations. Innovations also carry the model's own lag during a
+ *  manoeuvre: a follower fed by them read a push-over as "noisy surface",
+ *  inflated R to its ceiling, cut the gain, and grew the lag to 6 ft (found by
+ *  the cadence-invariance test during the v1.64 rewrite). The second
+ *  difference cancels any constant velocity exactly and a constant
+ *  acceleration to ~0.1%, leaving the white measurement noise alone.       */
 #define RF_SIGMA_ACCEL_FPS2    15.0f  /* white-noise acceleration (ft/s^2)      */
 #define RF_SIGMA_MEAS_FT       0.25f  /* measurement noise floor (ft)           */
 #define RF_SIGMA_MEAS_MAX_FT   2.0f   /* adaptive measurement noise ceiling (ft)*/
-#define RF_R_ADAPT_ALPHA       0.02f  /* innovation-variance follower gain      */
+#define RF_R_ADAPT_ALPHA       0.02f  /* measurement-noise follower gain        */
 #define RF_GATE_SIGMA          5.0f   /* innovation gate, in sigmas (PX4: 5)    */
 
 /*  Sample-and-hold repeats. The SF30/C's measurement rate (#R) and serial
@@ -155,8 +163,31 @@
 /*  COAST: no accepted sample for up to this long (a dark patch, a wet spot) and
  *  the track keeps predicting from its measured rate, so the tone and callouts
  *  keep moving on time — at 4000 fpm a 0.3 s freeze would be ~20 ft of callout
- *  lateness. Beyond it the track is LOST and the output holds.               */
+ *  lateness. Beyond it the track is LOST and the output holds.
+ *
+ *  ...unless the sensor is plainly SEEING SOMETHING ELSE. Prediction is
+ *  justified only while nothing contradicts it (no-returns, scattered junk).
+ *  Once RF_CONTRADICT_MEMBERS rejected returns agree with EACH OTHER (a
+ *  candidate track has formed) a competing surface is being measured — the
+ *  far edge of a tree line, a ditch, a hangar roof — and predicting motion
+ *  relative to the old surface fabricates it: the A/B matrix caught v1.64's
+ *  first cut calling "fifty" 40 ft high as the beam left a canopy, because the
+ *  coast kept descending toward the rung over trees that were no longer
+ *  there. The output then HOLDS (v1.63's behaviour, which never did this)
+ *  until the candidate is handed over or the track breaks. Two members is
+ *  ~13-26 ms of a coherent new surface; a scattered junk sample lands inside
+ *  a candidate's ~2 ft statistical gate ~1% of the time, so junk almost never
+ *  freezes a genuine coast through a dark patch.
+ *
+ *  And the published RATE is zero while coasting: the callout lead (see
+ *  CALLOUT_LEAD_S) extrapolates a MEASURED state, never a predicted one. The
+ *  same A/B found a coast prediction plus the 0.2 s lead — ~7 ft of unmeasured
+ *  extrapolation at 2000 fpm — calling "one hundred" on the very first poll
+ *  after the beam left a canopy, before two samples of the new surface
+ *  existed. A rung crossed DURING a coast still fires on the prediction
+ *  itself, just without the extra anticipation on top.                      */
 #define RF_COAST_MAX_S         0.3f   /* longest predicted-only stretch (s)     */
+#define RF_CONTRADICT_MEMBERS  2u     /* candidate members that stop the coast  */
 
 /* ---- Candidate track: M-of-N initiation --------------------------------- */
 /*  Lock-on, re-entry into range, and a genuine terrain step all go through a
@@ -209,10 +240,10 @@
  *      parked): resumed continuously on the ordinary evidence.
  *    - Any other stationary candidate — the shape of a stuck byte pattern —
  *      needs RF_BREAK_S. Breaks are silent, so this latency costs nothing
- *      audible, while every stuck pattern shorter than coast + RF_BREAK_S
- *      (1.3 s) never moves the output at all. (v1.63 needed 1.5 s at the slow
- *      cadences but only 12 polls = 0.3 s at the fast one; the time rule is
- *      now the same at every cadence.)
+ *      audible, while every stuck pattern shorter than RF_BREAK_S (counted
+ *      from its first sample, alongside the coast) never moves the output at
+ *      all. (v1.63 needed 1.5 s at the slow cadences but only 12 polls =
+ *      0.3 s at the fast one; the time rule is now the same at every cadence.)
  *  A break is a RE-ENTRY for the late-rung window (see CALLOUT_LATE_TOL_*)
  *  only when the candidate is descending, the aircraft could physically have
  *  flown from its last MEASURED position to the new level in the elapsed time,

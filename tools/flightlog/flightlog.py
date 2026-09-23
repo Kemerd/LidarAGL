@@ -339,8 +339,7 @@ def decode(bin_path, sessions_wanted):
                     tl.write(f"{fmt_t(t)}  ! clip for '{callout_name(a)}' has NO AUDIO DATA\n")
                 elif code == 10:
                     tl.write(f"{fmt_t(t)}  ! skipped stale '{callout_name(a)}' -> "
-                             f"'{callout_name(b)}' (descending faster than words)
-")
+                             f"'{callout_name(b)}' (descending faster than words)\n")
                 elif code == 8:
                     drops += a
                     tl.write(f"{fmt_t(t)}  ! recorder dropped {a} bytes (RAM ring full)\n")

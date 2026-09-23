@@ -653,7 +653,10 @@ main/
   config.h          all profile-independent tunables (pins, dB, tone band, timing)
   sensor_profile.*  the SF30/C & SF30/D profiles (callout ladders, cruise, range)
   lwnx.*            LightWare LWNX binary protocol (build/parse + hand-rolled CRC)
-  sf30c.*           UART driver, ASCII+binary parse, cm→ft, EMA, autodetect, sensor task
+  sf30c.*           UART driver, ASCII+binary parse, autodetect, sensor task
+  range_filter.*    per-sample Kalman range tracker: validity gates, innovation gate,
+                    M-of-N candidate tracks, SEARCH/TRACK/COAST/LOST, track breaks (pure)
+  flightlog*        flight recorder (flash ring) + its pure record codec
   robust.*          median/MAD outlier filter (pure)
   boot_buffer.*     NVS ground-reference + audio-config store, in-flight-reboot recovery, reset/config button
   state_machine.*   states, arming, edge-trigger callouts, hysteresis, poll profile (pure)
